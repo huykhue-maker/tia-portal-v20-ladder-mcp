@@ -78,6 +78,11 @@ function parseBlock(src) {
 }
 
 // ---------------------------------------------------------------- type resolution
+function stripArrayType(t, hasIdx) {
+  if (!t || !hasIdx) return t;
+  const m = /^Array\s*\[[^\]]+\]\s*of\s+(.+)$/i.exec(t.trim());
+  return m ? m[1].trim().replace(/^"|"$/g, '') : t;
+}
 function makeResolver(b, tags, dbs) {
   const findLocal = nm => { for (const sec of Object.keys(b.interface)) { const m = b.interface[sec].find(x => x.name === nm); if (m) return m.type; } return null; };
   const instMember = (type, pin) => {
@@ -86,17 +91,18 @@ function makeResolver(b, tags, dbs) {
     return null;
   };
   return op => {
+    const hasIdx = !!(op.idx && Object.keys(op.idx).length);
     if (op.k === 'local') {
-      const full = findLocal(op.path.join('.')); if (full) return full;
+      const full = findLocal(op.path.join('.')); if (full) return stripArrayType(full, hasIdx);
       if (op.path.length === 2) { const it = findLocal(op.path[0]); return instMember(it, op.path[1]); }
       return null;
     }
     if (op.k === 'global') {
-      if (op.path.length === 1 && tags && tags[op.path[0]]) return tags[op.path[0]].type;
+      if (op.path.length === 1 && tags && tags[op.path[0]]) return stripArrayType(tags[op.path[0]].type, hasIdx);
       const db = dbs && dbs[op.path[0]];
       if (db && op.path.length > 1) {
         const nm = op.path.slice(1).join('.');
-        for (const sec of Object.keys(db)) { const m = db[sec].find(x => x.name === nm); if (m) return m.type; }
+        for (const sec of Object.keys(db)) { const m = db[sec].find(x => x.name === nm); if (m) return stripArrayType(m.type, hasIdx); }
       }
     }
     return null;
@@ -379,7 +385,7 @@ function createBlockXml(spec, ctx) {
   for (const d of (spec.declare || [])) if (!Object.values(sections).flat().find(m => m.name === d.name)) { (sections[d.section] = sections[d.section] || []).push(d); }
   const memberNode = m => E('Member', { Name: m.name, Datatype: m.type }, m.comment ? [E('Comment', {}, E('MultiLanguageText', { Lang: culture }, m.comment))] : []);
   const secNodes = SECTION_ORDER.filter(s => sections[s]).map(s => E('Section', { Name: s }, sections[s].map(memberNode)));
-  const attrs = [E('Interface', {}, E('Sections', { xmlns: IF_NS }, secNodes)), E('MemoryLayout', {}, spec.memoryLayout || 'Optimized'), E('Name', {}, spec.name)];
+  const attrs = [E('Interface', {}, E('Sections', { xmlns: IF_NS }, secNodes)), E('MemoryLayout', {}, spec.memoryLayout || 'Optimized'), E('Name', {}, spec.name), E('Namespace', {})];
   if (spec.number) attrs.push(E('Number', {}, String(spec.number))); else attrs.push(E('AutoNumber', {}, 'true'));
   attrs.push(E('ProgrammingLanguage', {}, 'LAD'));
   if (type === 'OB') attrs.push(E('SecondaryType', {}, spec.secondaryType || 'ProgramCycle'));

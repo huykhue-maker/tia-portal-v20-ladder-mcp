@@ -65,11 +65,13 @@ function actionText(a) {
   switch (a.t) {
     case 'coil': return ({ COIL: '( ', NCOIL: '(/ ', SET: '(S ', RESET: '(R ' })[a.kind] + O.text(a.op) + ' )';
     case 'move': return '[MOVE ' + O.text(a.src) + ' => ' + a.dst.map(O.text).join(',') + ']';
-    case 'math': return '[' + a.fn + ' ' + O.text(a.a) + ' ' + C.MATH_SYM[a.fn] + ' ' + O.text(a.b) + ' => ' + O.text(a.dst) + ']';
+    case 'math': return '[' + a.fn + ' ' + O.text(a.a) + ' ' + (C.MATH_SYM[a.fn] || ',') + ' ' + O.text(a.b) + ' => ' + O.text(a.dst) + ']';
+    case 'unary': return '[' + a.fn + ' ' + O.text(a.src) + ' => ' + O.text(a.dst) + ']';
+    case 'conv': return '[' + a.fn + ' ' + a.ins.map(O.text).join(', ') + ' => ' + O.text(a.out) + ']';
     case 'box': {
       const B = C.BOXES[a.name]; const ps = [];
-      for (const k of [...B.valIn, ...B.flowIn, ...B.valOut, ...B.boolOut]) if (a.params[k]) ps.push(k + '=' + paramText(a.params[k]));
-      return '[' + a.name + ' ' + O.text(a.inst) + (ps.length ? ' ' + ps.join(' ') : '') + ']';
+      for (const k of [...B.valIn, ...(B.optIn || []), ...B.flowIn, ...B.valOut, ...B.boolOut]) if (a.params[k]) ps.push(k + '=' + paramText(a.params[k]));
+      return '[' + (B.partName || a.name) + ' ' + O.text(a.inst) + (ps.length ? ' ' + ps.join(' ') : '') + ']';
     }
     case 'call': return '[CALL ' + a.name + (a.inst ? ' ' + O.text(a.inst) : '') + ']';
     default: return '[' + (a.label || a.t) + ']';

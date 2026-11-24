@@ -1,35 +1,50 @@
 'use strict';
 // Walk helpers over the Ladder AST.
 //   f(op, mode, node) with mode: 'r' read, 'w' write, 'rw', 'inst' (timer/counter/FB instance), 'mem' (edge memory)
+const C = require('./catalog');
+
+function walkOp(op, mode, node, f) {
+  if (!op) return;
+  if (op.idx) {
+    for (const dims of Object.values(op.idx)) {
+      for (const idxOp of (dims || [])) walkOp(idxOp, 'r', node, f);
+    }
+  }
+  f(op, mode, node);
+}
+
 function walkCond(n, f) {
   if (!n) return;
   switch (n.t) {
-    case 'contact': f(n.op, 'r', n); break;
-    case 'rtrig': case 'ftrig': f(n.mem, 'mem', n); break;
-    case 'cmp': f(n.a, 'r', n); f(n.b, 'r', n); break;
+    case 'contact': walkOp(n.op, 'r', n, f); break;
+    case 'rtrig': case 'ftrig': walkOp(n.mem, 'mem', n, f); break;
+    case 'cmp': walkOp(n.a, 'r', n, f); walkOp(n.b, 'r', n, f); break;
     case 'and': case 'or': n.items.forEach(x => walkCond(x, f)); break;
     default:
   }
 }
 function walkParam(P, mode, f) {
   if (!P) return;
-  if (P.v === 'op') f(P.op, mode, P); else walkCond(P.cond, f);
+  if (P.v === 'op') walkOp(P.op, mode, P, f); else walkCond(P.cond, f);
 }
 function walkAction(a, f) {
   switch (a.t) {
-    case 'coil': f(a.op, 'w', a); break;
-    case 'move': f(a.src, 'r', a); a.dst.forEach(d => f(d, 'w', a)); break;
-    case 'math': f(a.a, 'r', a); f(a.b, 'r', a); f(a.dst, 'w', a); break;
+    case 'coil': walkOp(a.op, 'w', a, f); break;
+    case 'move': walkOp(a.src, 'r', a, f); a.dst.forEach(d => walkOp(d, 'w', a, f)); break;
+    case 'math': walkOp(a.a, 'r', a, f); walkOp(a.b, 'r', a, f); walkOp(a.dst, 'w', a, f); break;
+    case 'unary': walkOp(a.src, 'r', a, f); walkOp(a.dst, 'w', a, f); break;
+    case 'conv': a.ins.forEach(x => walkOp(x, 'r', a, f)); walkOp(a.out, 'w', a, f); break;
     case 'box': {
-      f(a.inst, 'inst', a);
+      walkOp(a.inst, 'inst', a, f);
       for (const k of Object.keys(a.params)) {
-        const out = ['ET', 'CV', 'Q', 'QU', 'QD'].includes(k);
-        walkParam(a.params[k], out ? 'w' : 'r', f);
+        const out = ['ET', 'CV', 'Q', 'QU', 'QD'].includes(k) || C.MOTION_OUT_PINS.has(k);
+        const mode = k === 'Axis' ? 'rw' : (out ? 'w' : 'r');
+        walkParam(a.params[k], mode, f);
       }
       break;
     }
     case 'call': {
-      if (a.inst) f(a.inst, 'inst', a);
+      if (a.inst) walkOp(a.inst, 'inst', a, f);
       for (const k of Object.keys(a.args)) walkParam(a.args[k], 'rw', f);
       break;
     }

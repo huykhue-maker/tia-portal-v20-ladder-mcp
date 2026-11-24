@@ -1,13 +1,13 @@
 'use strict';
-// Ladder AST -> SimaticML FlgNet XML (network source for LAD blocks).
-// UIds, Parts, Access nodes and Wires are generated deterministically; nets are built with a
-// union-find so fan-out / OR-joins always end up in exactly one <Wire> (as TIA writes them).
+// Ladder AST -> SimaticML FlgNet XML (network source for TIA Portal V20 LAD blocks).
+// UIds, Parts, Access nodes and Wires are generated deterministically; OR branches emit <Part Name="O">
+// as required by TIA Portal V20 SimaticML.
 
 const { E, ser } = require('./xml');
 const C = require('./catalog');
 const O = require('./operand');
 
-const FLG_NS = 'http://www.siemens.com/automation/Openness/SW/NetworkSource/FlgNet/v4';
+const FLG_NS = 'http://www.siemens.com/automation/Openness/SW/NetworkSource/FlgNet/v5';
 class GenError extends Error { constructor(msg, code) { super(msg); this.name = 'GenError'; this.code = code || 'E_GEN'; } }
 
 const KNOWN_TYPES = ['Bool', 'Byte', 'Word', 'DWord', 'LWord', 'SInt', 'Int', 'DInt', 'LInt', 'USInt', 'UInt', 'UDInt', 'ULInt', 'Real', 'LReal', 'Time', 'LTime', 'Char', 'WChar', 'String', 'S5Time'];
@@ -37,6 +37,7 @@ class Gen {
   PWR() { return this.reg('PWR', { role: 'src', kind: 'pwr', rank: 0 }); }
   pin(uid, pin, role) { return this.reg('P:' + uid + ':' + pin, { role, kind: 'name', uid, pin, rank: 2 }); }
   ident(uid, role) { return this.reg('I:' + uid, { role, kind: 'ident', uid, rank: 1 }); }
+  openPin(role) { const uid = this.nid(); return this.reg('O:' + uid, { role, kind: 'open', uid, rank: 3 }); }
   connect(srcs, dst) { for (const s of srcs) this.union(s, dst); }
   need(key, label) { this.needs.push({ key, label }); }
   decl(section, name, type) {
@@ -51,33 +52,43 @@ class Gen {
     const r = this.ctx.resolveType ? this.ctx.resolveType(op) : null;
     return r ? canonType(r) : null;
   }
-  inferType(ops, explicit, where) {
+  inferType(ops, explicit, where, fallback) {
     if (explicit) return canonType(explicit);
     for (const o of ops) { const t = this.typeOf(o); if (t) return t; }
     const lits = ops.filter(o => o && o.k === 'lit' && o.type === 'auto');
     if (lits.length) return lits.some(l => l.real) ? 'Real' : 'Int';
+    if (fallback) return canonType(fallback);
     throw new GenError('Cannot infer the data type for ' + where + ' (' + ops.map(O.text).join(', ') + '). Add the type as the last argument, e.g. ' + where + '(..., Int), or declare the variable in the block interface / tag table.', 'E_TYPE');
   }
+  componentNodes(op) {
+    return op.path.map((n, i) => {
+      const dims = op.idx && op.idx[i];
+      if (!dims || !dims.length) return E('Component', { Name: n });
+      return E('Component', { Name: n, AccessModifier: 'Array' }, dims.map(d => this.accessNode(d, undefined, 'DInt')));
+    });
+  }
   accessNode(op, uid, hint) {
+    const attrs = uid !== undefined ? { Scope: '', UId: uid } : { Scope: '' };
     switch (op.k) {
       case 'local':
       case 'global':
-        return E('Access', { Scope: op.k === 'local' ? 'LocalVariable' : 'GlobalVariable', UId: uid },
-          E('Symbol', {}, op.path.map(n => E('Component', { Name: n }))));
+        attrs.Scope = op.k === 'local' ? 'LocalVariable' : 'GlobalVariable';
+        return E('Access', attrs, E('Symbol', {}, this.componentNodes(op)));
       case 'abs':
-        return E('Access', { Scope: 'Address', UId: uid }, E('Address', { Area: op.area, Type: op.type, BitOffset: op.bitOffset }));
+        attrs.Scope = 'Address';
+        return E('Access', attrs, E('Address', { Area: op.area, Type: op.type, BitOffset: op.bitOffset }));
       case 'lit': {
         let type = op.type;
         if (type === 'auto') {
           if (/^\d+#/.test(op.value)) type = hint && /Word|Byte|Int/.test(hint) ? hint : 'Word';
           else type = hint || (op.real ? 'Real' : 'Int');
         }
-        return E('Access', { Scope: 'LiteralConstant', UId: uid }, E('Constant', {}, [E('ConstantType', {}, canonType(type)), E('ConstantValue', {}, op.value)]));
+        attrs.Scope = 'LiteralConstant';
+        return E('Access', attrs, E('Constant', {}, [E('ConstantType', {}, canonType(type)), E('ConstantValue', {}, op.value)]));
       }
       default: throw new GenError('unsupported operand ' + JSON.stringify(op));
     }
   }
-  // role: 'read' -> access feeds pin; 'write' -> pin feeds access
   bind(op, pinKey, mode, hint) {
     const uid = this.nid();
     this.items.push(this.accessNode(op, uid, hint));
@@ -85,7 +96,7 @@ class Gen {
   }
   instanceNode(op) {
     return E('Instance', { Scope: op.k === 'local' ? 'LocalVariable' : 'GlobalVariable', UId: this.nid() },
-      op.path.map(n => E('Component', { Name: n })));
+      this.componentNodes(op));
   }
   partNode(name, uid, o) {
     o = o || {};
@@ -98,14 +109,33 @@ class Gen {
   addPart(name, o) { const uid = this.nid(); this.items.push(this.partNode(name, uid, o)); return uid; }
 
   // ---------------------------------------------------------------- conditions
+  mergeOr(outs) {
+    if (outs.length <= 1) return outs;
+    if (outs.includes('PWR')) return ['PWR'];
+    const uid = this.addPart('O', {
+      version: C.versionFor('O', this.ctx.learned),
+      templates: C.templatesFor('O', { card: outs.length }, this.ctx.learned),
+    });
+    outs.forEach((srcKey, i) => {
+      const kin = this.pin(uid, 'in' + (i + 1), 'dst');
+      this.connect([srcKey], kin);
+      this.need(kin, 'O.in' + (i + 1));
+    });
+    return [this.pin(uid, 'out', 'src')];
+  }
+
   cond(n, srcs) {
     switch (n.t) {
       case 'true': return srcs;
       case 'and': { let cur = srcs; for (const it of n.items) cur = this.cond(it, cur); return cur; }
       case 'or': {
         const outs = [];
-        for (const it of n.items) for (const k of this.cond(it, srcs)) if (!outs.includes(k)) outs.push(k);
-        return outs;
+        for (const it of n.items) {
+          const branchOuts = this.cond(it, srcs);
+          const single = this.mergeOr(branchOuts);
+          for (const k of single) if (!outs.includes(k)) outs.push(k);
+        }
+        return this.mergeOr(outs);
       }
       case 'contact': {
         const uid = this.addPart('Contact', { negated: n.neg ? ['operand'] : [], version: C.versionFor('Contact', this.ctx.learned) });
@@ -138,7 +168,7 @@ class Gen {
       default: throw new GenError('cannot generate condition node of type ' + n.t);
     }
   }
-  noteMem(op) { if (op.k === 'local' && op.path.length === 1) this.decl('Static', op.path[0], 'Bool'); }
+  noteMem(op) { if (op.k === 'local' && op.path.length === 1 && !op.idx) this.decl('Static', op.path[0], 'Bool'); }
 
   // ---------------------------------------------------------------- actions
   flow(f, srcs) {
@@ -179,12 +209,39 @@ class Gen {
         this.bind(a.dst, this.pin(uid, 'out', 'src'), 'write');
         return this.nextFlows(a, this.pin(uid, 'eno', 'src'));
       }
+      case 'unary': {
+        const defT = ['SIN', 'COS', 'TAN', 'ASIN', 'ACOS', 'ATAN', 'SQRT', 'EXP', 'LN'].includes(a.fn) ? 'Real' : null;
+        const type = this.inferType([a.src, a.dst], a.type, a.fn, defT);
+        const nm = C.UNARY_MATH[a.fn];
+        const uid = this.addPart(nm, { version: C.versionFor(nm, this.ctx.learned), templates: C.templatesFor(nm, { type }, this.ctx.learned) });
+        this.connect(srcs, this.pin(uid, 'en', 'dst'));
+        this.bind(a.src, this.pin(uid, 'in', 'dst'), 'read', type);
+        this.bind(a.dst, this.pin(uid, 'out', 'src'), 'write');
+        return this.nextFlows(a, this.pin(uid, 'eno', 'src'));
+      }
+      case 'conv': {
+        const info = C.CONV_OPS[a.fn];
+        const srcType = this.inferType(a.ins, a.srcType, a.fn, info.defSrc);
+        const destType = info.dualType ? this.inferType([a.out], a.destType, a.fn, info.defDest) : srcType;
+        const uid = this.addPart(info.part, {
+          version: C.versionFor(info.part, this.ctx.learned),
+          templates: C.templatesFor(info.part, { type: srcType, destType }, this.ctx.learned),
+        });
+        this.connect(srcs, this.pin(uid, 'en', 'dst'));
+        info.ins.forEach((pinName, i) => {
+          const hint = (a.fn === 'NORM_X' || a.fn === 'SCALE_X') && pinName !== 'value' ? (a.fn === 'SCALE_X' ? destType : srcType) : srcType;
+          this.bind(a.ins[i], this.pin(uid, pinName, 'dst'), 'read', hint);
+        });
+        this.bind(a.out, this.pin(uid, 'out', 'src'), 'write');
+        return this.nextFlows(a, this.pin(uid, 'eno', 'src'));
+      }
       case 'call': return this.call(a, srcs);
       default: throw new GenError('cannot generate action of type ' + a.t);
     }
   }
   box(a, srcs) {
     const B = C.BOXES[a.name];
+    const partName = B.partName || a.name;
     let type = a.type || B.defType;
     if (B.kind === 'counter' && !a.type) {
       const t = a.params.PV && a.params.PV.v === 'op' ? this.typeOf(a.params.PV.op) : null;
@@ -192,23 +249,39 @@ class Gen {
     }
     type = canonType(type);
     const instNode = this.instanceNode(a.inst);
-    const uid = this.addPart(a.name, {
-      version: C.versionFor(a.name, this.ctx.learned), instance: instNode,
-      templates: C.templatesFor(a.name, { type }, this.ctx.learned),
+    const uid = this.addPart(partName, {
+      version: C.versionFor(partName, this.ctx.learned), instance: instNode,
+      templates: C.templatesFor(partName, { type }, this.ctx.learned),
     });
-    const kmain = this.pin(uid, B.main, 'dst'); this.connect(srcs, kmain); this.need(kmain, a.name + '.' + B.main);
+    const kmain = this.pin(uid, B.main, 'dst'); this.connect(srcs, kmain); this.need(kmain, partName + '.' + B.main);
     for (const k of B.valIn) {
       const P = a.params[k];
-      if (!P) throw new GenError(a.name + ' needs ' + k + '=..., e.g. ' + a.name + '(' + O.text(a.inst) + ', ' + k + '=' + (B.kind === 'timer' ? 'T#3s' : '10') + ')', 'E_PARAM');
-      const kp = this.pin(uid, k, 'dst'); this.paramPin(P, kp, B.kind === 'timer' ? 'Time' : type); this.need(kp, a.name + '.' + k);
+      if (!P) throw new GenError(partName + ' needs ' + k + '=..., e.g. ' + partName + '(' + O.text(a.inst) + ', ' + k + '=' + (B.kind === 'timer' ? 'T#3s' : B.kind === 'motion' ? '"Truc_X"' : '10') + ')', 'E_PARAM');
+      const kp = this.pin(uid, k, 'dst'); this.paramPin(P, kp, B.kind === 'timer' ? 'Time' : (B.kind === 'motion' ? undefined : type)); this.need(kp, partName + '.' + k);
     }
-    for (const k of B.flowIn) if (a.params[k]) this.paramPin(a.params[k], this.pin(uid, k, 'dst'), 'Bool');
+    for (const k of (B.optIn || [])) {
+      const kp = this.pin(uid, k, 'dst');
+      if (a.params[k]) {
+        const hint = /Position|Distance|Velocity/.test(k) ? 'Real' : (/Mode|Direction/.test(k) ? 'Int' : 'Bool');
+        this.paramPin(a.params[k], kp, hint);
+      } else if (B.kind === 'motion') {
+        this.union(this.openPin('src'), kp);
+      }
+    }
+    for (const k of B.flowIn) {
+      if (a.params[k]) this.paramPin(a.params[k], this.pin(uid, k, 'dst'), 'Bool');
+      else if (B.kind === 'motion') this.union(this.openPin('src'), this.pin(uid, k, 'dst'));
+    }
     for (const k of [...B.valOut, ...B.boolOut]) {
-      const P = a.params[k]; if (!P) continue;
-      if (P.v !== 'op') throw new GenError(a.name + '.' + k + ' is an output; give it a variable (e.g. ' + k + '=#var) or chain with "=>"', 'E_PARAM');
+      const P = a.params[k];
+      if (!P) {
+        if (B.kind === 'motion') this.union(this.pin(uid, k, 'src'), this.openPin('dst'));
+        continue;
+      }
+      if (P.v !== 'op') throw new GenError(partName + '.' + k + ' is an output; give it a variable (e.g. ' + k + '=#var) or chain with "=>"', 'E_PARAM');
       this.bind(P.op, this.pin(uid, k, 'src'), 'write');
     }
-    if (a.inst.k === 'local' && a.inst.path.length === 1) this.decl('Static', a.inst.path[0], C.boxInstanceType(a.name, type));
+    if (a.inst.k === 'local' && a.inst.path.length === 1 && !a.inst.idx) this.decl('Static', a.inst.path[0], C.boxInstanceType(a.name, type));
     else if (a.inst.k === 'global') this.dbInstances.push({ name: a.inst.path[0], type: C.boxInstanceType(a.name, type) });
     return this.nextFlows(a, this.pin(uid, B.flowOut, 'src'));
   }
@@ -221,9 +294,9 @@ class Gen {
     const uid = this.nid();
     const info = [];
     if (cat.blockType === 'FB') {
-      if (!a.inst) throw new GenError('CALL("' + a.name + '") is an FB: pass inst=\"InstanceDB\" or inst=#MultiInstance', 'E_CALL');
+      if (!a.inst) throw new GenError('CALL("' + a.name + '") is an FB: pass inst="InstanceDB" or inst=#MultiInstance', 'E_CALL');
       info.push(this.instanceNode(a.inst));
-      if (a.inst.k === 'local' && a.inst.path.length === 1) this.decl('Static', a.inst.path[0], '"' + a.name + '"');
+      if (a.inst.k === 'local' && a.inst.path.length === 1 && !a.inst.idx) this.decl('Static', a.inst.path[0], '"' + a.name + '"');
       else if (a.inst.k === 'global') this.dbInstances.push({ name: a.inst.path[0], type: a.name, fb: true });
     }
     for (const p of cat.params) info.push(E('Parameter', { Name: p.name, Section: p.section, Type: p.type }));
@@ -266,6 +339,7 @@ class Gen {
         const i = this.info.get(k);
         if (i.kind === 'pwr') return E('Powerrail');
         if (i.kind === 'ident') return E('IdentCon', { UId: i.uid });
+        if (i.kind === 'open') return E('OpenCon', { UId: i.uid });
         return E('NameCon', { UId: i.uid, Name: i.pin });
       }));
     }

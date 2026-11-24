@@ -1,6 +1,7 @@
-# Build outputs (TiaBridge.exe can be built anytime via build.ps1)
-bridge/TiaBridge.exe
+# Build outputs & proprietary binaries (TiaBridge.exe can be built anytime via build.ps1)
+bridge/*.exe
 bridge/*.pdb
+*.dll
 
 # Personal project backups and temporary exports
 backups/*
@@ -19,8 +20,9 @@ exports/*
 node_modules/
 npm-debug.log*
 
-# Windows
+# Windows & local tool configs
 Thumbs.db
 ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
+opencode.json

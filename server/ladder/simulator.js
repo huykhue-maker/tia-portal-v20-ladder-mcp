@@ -1,11 +1,12 @@
 'use strict';
 // Scan-cycle simulator for the Ladder AST (dry-run in RAM, no PLC needed).
-// Semantics follow IEC 61131-3 / TIA: sequential rung evaluation, RLO folding through series/parallel
-// groups, edge memory bits, IEC timers (TON/TOF/TP/TONR) driven by simulated time, IEC counters,
-// MOVE / math with ENO, and calls to other LAD blocks (FC/FB with instance state).
+// Supports IEC 61131-3 contacts/coils, OR/AND RLO, edge triggers, IEC timers/counters,
+// dynamic array indexing, math/trig/analog scaling (NORM_X/SCALE_X/CONV/LIMIT),
+// FC/FB calls, and S7-1200/1500 TO_PositioningAxis Motion Control (MC_Power/Reset/Home/Move*/Halt)!
 
 const D = require('./dsl');
 const O = require('./operand');
+const C = require('./catalog');
 
 const RANGES = {
   SInt: [-128, 127], Int: [-32768, 32767], DInt: [-2147483648, 2147483647], USInt: [0, 255], UInt: [0, 65535], UDInt: [0, 4294967295],
@@ -40,27 +41,60 @@ class Simulator {
     this.program = program; this.entry = opts.entry; this.scanMs = opts.scanMs || 10;
     this.time = 0; this.scans = 0;
     this.globals = new Map(); this.gTimers = new Map(); this.gCounters = new Map(); this.gInst = new Map();
+    this.axes = new Map(); // axisKey -> { pos, vel, enabled, homed, error, activeMove }
+    this.mcInst = new Map(); // mcInstKey -> { execPrev, busy, done, aborted, error, target, speed }
     this.root = new Frame(); this.warnings = new Set(); this.types = opts.types || (() => null);
     this.prev = new Map(); this.timeline = [];
   }
-  // ---------------------------------------------------------------- state access
+
+  // Resolve dynamic array indices e.g. #Arr[#i] -> #Arr[2]
+  resolveKey(op, f) {
+    if (!op.idx || !Object.keys(op.idx).length) return O.text(op);
+    const resolvedIdx = {};
+    for (const [compIdx, dims] of Object.entries(op.idx)) {
+      resolvedIdx[compIdx] = dims.map(d => O.lit('DInt', String(Math.trunc(num(this.read(d, f))))));
+    }
+    const copy = op.k === 'local' ? O.local(op.path, resolvedIdx) : O.global(op.path, resolvedIdx);
+    return O.text(copy);
+  }
+
+  getAxis(axisName) {
+    if (!this.axes.has(axisName)) {
+      this.axes.set(axisName, { pos: 0.0, vel: 0.0, enabled: false, homed: false, error: false, owner: null, target: 0.0, speed: 0.0 });
+    }
+    return this.axes.get(axisName);
+  }
+  syncAxisToGlobals(axisName, ax) {
+    const q = '"' + axisName + '"';
+    this.globals.set(q + '.ActualPosition', ax.pos);
+    this.globals.set(q + '.Position', ax.pos);
+    this.globals.set(q + '.ActualVelocity', ax.vel);
+    this.globals.set(q + '.Velocity', ax.vel);
+    this.globals.set(q + '.StatusBits.Enable', ax.enabled);
+    this.globals.set(q + '.StatusBits.HomingDone', ax.homed);
+    this.globals.set(q + '.StatusBits.Error', ax.error);
+    this.globals.set(q + '.StatusBits.Standstill', Math.abs(ax.vel) < 1e-9);
+  }
+
   mapOf(op, f) { return op.k === 'local' ? f.locals : this.globals; }
   storeOf(op, f) { return op.k === 'local' ? { timers: f.timers, counters: f.counters } : { timers: this.gTimers, counters: this.gCounters }; }
   read(op, f) {
     if (op.k === 'lit') return litValue(op);
-    if (op.path && op.path.length >= 2) {
+    if (op.path && op.path.length >= 2 && (!op.idx || !Object.keys(op.idx).length)) {
       const base = { k: op.k, path: op.path.slice(0, -1) }, field = op.path[op.path.length - 1];
       const st = this.storeOf(base, f), bk = O.text(base);
       const t = st.timers.get(bk);
       if (t) return ({ ET: t.et, Q: t.q, PT: t.pt, IN: t.inp })[field];
       const c = st.counters.get(bk);
       if (c) return ({ CV: c.cv, QU: c.qu, QD: c.qd, PV: c.pv })[field];
+      const mc = this.mcInst.get(bk);
+      if (mc && field in mc.pins) return mc.pins[field];
     }
-    return this.mapOf(op, f).get(O.text(op));
+    return this.mapOf(op, f).get(this.resolveKey(op, f));
   }
   write(op, v, f) {
     if (op.k === 'lit') return;
-    const key = O.text(op);
+    const key = this.resolveKey(op, f);
     if (typeof v === 'number' && this.types(op) === 'Bool') v = v !== 0;
     this.mapOf(op, f).set(key, v);
   }
@@ -79,7 +113,7 @@ class Simulator {
       case 'contact': { const v = !!num(this.read(n.op, f)); return rlo && (n.neg ? !v : v); }
       case 'not': return !rlo;
       case 'rtrig': case 'ftrig': {
-        const memKey = O.text(n.mem), map = this.mapOf(n.mem, f); const old = !!map.get(memKey);
+        const memKey = this.resolveKey(n.mem, f), map = this.mapOf(n.mem, f); const old = !!map.get(memKey);
         map.set(memKey, rlo);
         return n.t === 'rtrig' ? (rlo && !old) : (!rlo && old);
       }
@@ -102,6 +136,18 @@ class Simulator {
     for (const a of fl.then) this.action(a, rlo, f);
   }
   next(a, sig, f) { for (const fl of (a.next || [])) this.flow(fl, sig, f); }
+  storeNumber(dst, r, type, fnLabel, f) {
+    if (!Number.isFinite(r)) return false;
+    if (INTEGER.has(type)) r = Math.trunc(r);
+    const rg = RANGES[type];
+    if (rg && (r < rg[0] || r > rg[1])) {
+      this.warnings.add('overflow in ' + fnLabel + ' -> ' + O.text(dst) + ' (' + type + '); ENO=0, result not stored');
+      return false;
+    }
+    this.write(dst, r, f);
+    return true;
+  }
+
   action(a, rlo, f) {
     switch (a.t) {
       case 'coil': {
@@ -120,19 +166,70 @@ class Simulator {
         let eno = rlo;
         if (rlo) {
           const x = num(this.read(a.a, f)), y = num(this.read(a.b, f));
-          const type = a.type || this.types(a.dst) || 'Int';
+          const type = a.type || this.types(a.dst) || (Number.isInteger(x) && Number.isInteger(y) ? 'Int' : 'Real');
           let r;
           switch (a.fn) {
-            case 'ADD': r = x + y; break; case 'SUB': r = x - y; break; case 'MUL': r = x * y; break;
+            case 'ADD': r = x + y; break;
+            case 'SUB': r = x - y; break;
+            case 'MUL': r = x * y; break;
             case 'DIV': if (y === 0) { eno = false; break; } r = INTEGER.has(type) ? Math.trunc(x / y) : x / y; break;
             case 'MOD': if (y === 0) { eno = false; break; } r = x % y; break;
+            case 'MIN': r = Math.min(x, y); break;
+            case 'MAX': r = Math.max(x, y); break;
             default:
           }
-          if (eno) {
-            const rg = RANGES[type];
-            if (rg && (r < rg[0] || r > rg[1])) { eno = false; this.warnings.add('overflow in ' + a.fn + ' -> ' + O.text(a.dst) + ' (' + type + '); ENO=0, result not stored'); }
-            else this.write(a.dst, r, f);
+          if (eno) eno = this.storeNumber(a.dst, r, type, a.fn, f);
+        }
+        return this.next(a, eno, f);
+      }
+      case 'unary': {
+        let eno = rlo;
+        if (rlo) {
+          const x = num(this.read(a.src, f));
+          const type = a.type || this.types(a.dst) || 'Real';
+          let r;
+          switch (a.fn) {
+            case 'SIN': r = Math.sin(x); break;
+            case 'COS': r = Math.cos(x); break;
+            case 'TAN': r = Math.tan(x); break;
+            case 'ASIN': if (x < -1 || x > 1) eno = false; else r = Math.asin(x); break;
+            case 'ACOS': if (x < -1 || x > 1) eno = false; else r = Math.acos(x); break;
+            case 'ATAN': r = Math.atan(x); break;
+            case 'SQRT': if (x < 0) eno = false; else r = Math.sqrt(x); break;
+            case 'SQR': r = x * x; break;
+            case 'ABS': r = Math.abs(x); break;
+            case 'EXP': r = Math.exp(x); break;
+            case 'LN': if (x <= 0) eno = false; else r = Math.log(x); break;
+            case 'TRUNC': r = Math.trunc(x); break;
+            case 'ROUND': r = Math.round(x); break;
+            case 'CEIL': r = Math.ceil(x); break;
+            case 'FLOOR': r = Math.floor(x); break;
+            default: eno = false;
           }
+          if (eno) eno = this.storeNumber(a.dst, r, type, a.fn, f);
+        }
+        return this.next(a, eno, f);
+      }
+      case 'conv': {
+        let eno = rlo;
+        if (rlo) {
+          const destType = a.destType || a.srcType || this.types(a.out) || 'Real';
+          let r;
+          if (a.fn === 'CONV') {
+            r = num(this.read(a.ins[0], f));
+            if (INTEGER.has(destType)) r = Math.round(r);
+          } else if (a.fn === 'NORM_X') {
+            const mn = num(this.read(a.ins[0], f)), val = num(this.read(a.ins[1], f)), mx = num(this.read(a.ins[2], f));
+            if (mx === mn) eno = false; else r = (val - mn) / (mx - mn);
+          } else if (a.fn === 'SCALE_X') {
+            const mn = num(this.read(a.ins[0], f)), val = num(this.read(a.ins[1], f)), mx = num(this.read(a.ins[2], f));
+            r = val * (mx - mn) + mn;
+            if (INTEGER.has(destType)) r = Math.round(r);
+          } else if (a.fn === 'LIMIT') {
+            const mn = num(this.read(a.ins[0], f)), val = num(this.read(a.ins[1], f)), mx = num(this.read(a.ins[2], f));
+            if (mn > mx) eno = false; else r = Math.min(Math.max(val, mn), mx);
+          }
+          if (eno) eno = this.storeNumber(a.out, r, destType, a.fn, f);
         }
         return this.next(a, eno, f);
       }
@@ -141,9 +238,106 @@ class Simulator {
       default: this.warnings.add('cannot simulate action ' + a.t);
     }
   }
+  motionBox(a, rlo, f, B) {
+    const instKey = this.resolveKey(a.inst, f);
+    let mc = this.mcInst.get(instKey);
+    if (!mc) {
+      mc = { execPrev: false, pins: { Status: false, Done: false, Busy: false, Error: false, CommandAborted: false, InVelocity: false, ErrorID: 0, ErrorInfo: 0 } };
+      this.mcInst.set(instKey, mc);
+    }
+    if (!rlo) return this.next(a, false, f);
+    const axisOp = a.params.Axis && a.params.Axis.op;
+    const axisName = axisOp ? axisOp.path[0] : 'Axis';
+    const ax = this.getAxis(axisName);
+    const dtSec = this.scanMs / 1000.0;
+
+    if (a.name === 'MC_POWER') {
+      const en = a.params.Enable ? this.paramBool(a.params.Enable, f) : false;
+      ax.enabled = en && !ax.error;
+      if (!ax.enabled && ax.owner) { ax.vel = 0; ax.owner = null; }
+      mc.pins.Status = ax.enabled;
+      mc.pins.Busy = en;
+      mc.pins.Error = ax.error;
+    } else if (a.name === 'MC_RESET') {
+      const ex = a.params.Execute ? this.paramBool(a.params.Execute, f) : false;
+      if (ex && !mc.execPrev) { ax.error = false; mc.pins.Done = true; mc.pins.Error = false; }
+      else if (!ex) { mc.pins.Done = false; mc.pins.Busy = false; }
+      mc.execPrev = ex;
+    } else if (a.name === 'MC_HOME') {
+      const ex = a.params.Execute ? this.paramBool(a.params.Execute, f) : false;
+      const pos = a.params.Position ? num(this.paramVal(a.params.Position, f)) : 0.0;
+      if (ex && !mc.execPrev) {
+        if (!ax.enabled) { mc.pins.Error = true; mc.pins.Done = false; }
+        else { ax.pos = pos; ax.vel = 0; ax.homed = true; ax.owner = null; mc.pins.Done = true; mc.pins.Error = false; }
+      } else if (!ex) { mc.pins.Done = false; mc.pins.Error = false; }
+      mc.execPrev = ex;
+    } else if (a.name === 'MC_MOVEABSOLUTE' || a.name === 'MC_MOVERELATIVE') {
+      const ex = a.params.Execute ? this.paramBool(a.params.Execute, f) : false;
+      const vel = Math.abs(a.params.Velocity ? num(this.paramVal(a.params.Velocity, f)) : 10.0) || 10.0;
+      if (ex && !mc.execPrev) {
+        if (!ax.enabled || (a.name === 'MC_MOVEABSOLUTE' && !ax.homed)) {
+          mc.pins.Error = true; mc.pins.Busy = false; mc.pins.Done = false;
+        } else {
+          const distOrPos = a.name === 'MC_MOVEABSOLUTE'
+            ? (a.params.Position ? num(this.paramVal(a.params.Position, f)) : 0.0)
+            : ax.pos + (a.params.Distance ? num(this.paramVal(a.params.Distance, f)) : 0.0);
+          ax.owner = instKey; ax.target = distOrPos; ax.speed = vel;
+          mc.pins.Busy = true; mc.pins.Done = false; mc.pins.CommandAborted = false; mc.pins.Error = false;
+        }
+      }
+      if (mc.pins.Busy) {
+        if (ax.owner !== instKey || !ax.enabled) {
+          mc.pins.Busy = false; mc.pins.CommandAborted = true;
+        } else {
+          const diff = ax.target - ax.pos;
+          const step = ax.speed * dtSec;
+          if (Math.abs(diff) <= step + 1e-9) {
+            ax.pos = ax.target; ax.vel = 0; ax.owner = null;
+            mc.pins.Busy = false; mc.pins.Done = true;
+          } else {
+            ax.pos += Math.sign(diff) * step;
+            ax.vel = Math.sign(diff) * ax.speed;
+          }
+        }
+      } else if (!ex) {
+        mc.pins.Done = false; mc.pins.CommandAborted = false; mc.pins.Error = false;
+      }
+      mc.execPrev = ex;
+    } else if (a.name === 'MC_MOVEVELOCITY' || a.name === 'MC_MOVEJOG') {
+      const vel = a.params.Velocity ? num(this.paramVal(a.params.Velocity, f)) : 10.0;
+      let active = false, dir = 1;
+      if (a.name === 'MC_MOVEJOG') {
+        const jf = a.params.JogForward ? this.paramBool(a.params.JogForward, f) : false;
+        const jb = a.params.JogBackward ? this.paramBool(a.params.JogBackward, f) : false;
+        if (jf && !jb) { active = true; dir = 1; } else if (jb && !jf) { active = true; dir = -1; }
+      } else {
+        active = a.params.Execute ? this.paramBool(a.params.Execute, f) : false;
+      }
+      if (active && ax.enabled) {
+        ax.owner = instKey; ax.vel = dir * vel; ax.pos += ax.vel * dtSec;
+        mc.pins.Busy = true; mc.pins.InVelocity = true;
+      } else {
+        if (ax.owner === instKey) { ax.vel = 0; ax.owner = null; }
+        mc.pins.Busy = false; mc.pins.InVelocity = false;
+      }
+    } else if (a.name === 'MC_HALT') {
+      const ex = a.params.Execute ? this.paramBool(a.params.Execute, f) : false;
+      if (ex && !mc.execPrev) { ax.vel = 0; ax.owner = null; mc.pins.Done = true; }
+      else if (!ex) mc.pins.Done = false;
+      mc.execPrev = ex;
+    }
+
+    this.syncAxisToGlobals(axisName, ax);
+    for (const k of [...B.valOut, ...B.boolOut]) {
+      if (a.params[k] && a.params[k].v === 'op') this.write(a.params[k].op, mc.pins[k], f);
+    }
+    return this.next(a, true, f);
+  }
+
   box(a, rlo, f) {
-    const st = this.storeOf(a.inst, f), key = O.text(a.inst);
-    const B = require('./catalog').BOXES[a.name];
+    const B = C.BOXES[a.name];
+    if (B.kind === 'motion') return this.motionBox(a, rlo, f, B);
+    const st = this.storeOf(a.inst, f), key = this.resolveKey(a.inst, f);
     if (B.kind === 'timer') {
       let t = st.timers.get(key);
       if (!t) { t = { kind: a.name, inp: false, q: false, et: 0, pt: 0, start: 0, running: false, acc: 0 }; st.timers.set(key, t); }
@@ -198,7 +392,7 @@ class Simulator {
     if (!callee) { this.warnings.add('CALL "' + a.name + '" not simulated (block not loaded); its outputs stay unchanged'); return this.next(a, true, f); }
     let child;
     if (callee.type === 'FB' && a.inst) {
-      const st = a.inst.k === 'local' ? f.inst : this.gInst; const k = O.text(a.inst);
+      const st = a.inst.k === 'local' ? f.inst : this.gInst; const k = this.resolveKey(a.inst, f);
       if (!st.has(k)) st.set(k, new Frame());
       child = st.get(k);
     } else child = new Frame();
@@ -238,8 +432,8 @@ class Simulator {
     for (const k of this.watchKeys(this.watch)) {
       let v; try { v = this.get(k); } catch (e) { continue; }
       const old = this.prev.get(k);
-      const norm = x => (typeof x === 'boolean' ? (x ? 1 : 0) : x === undefined ? 0 : x);
-      if (!this.prev.has(k) ? norm(v) !== 0 : norm(old) !== norm(v)) this.timeline.push({ t: this.time, key: k, from: norm(old), to: norm(v) });
+      const normV = x => (typeof x === 'boolean' ? (x ? 1 : 0) : x === undefined ? 0 : x);
+      if (!this.prev.has(k) ? normV(v) !== 0 : normV(old) !== normV(v)) this.timeline.push({ t: this.time, key: k, from: normV(old), to: normV(v) });
       this.prev.set(k, v);
     }
   }
@@ -256,6 +450,13 @@ function buildProgram(blockReads, entry) {
     };
   }
   return { blocks, entry };
+}
+
+function approxEq(a, b, tol) {
+  if (typeof a === 'number' && typeof b === 'number' && (!Number.isInteger(a) || !Number.isInteger(b))) {
+    return Math.abs(a - b) <= (tol || 1e-3);
+  }
+  return a === b;
 }
 
 function runScenario(program, scenario, types) {
@@ -275,13 +476,15 @@ function runScenario(program, scenario, types) {
     if (st.until) {
       const [k, v] = Object.entries(st.until)[0]; const limit = parseTime(st.timeout || '10s'); const t0 = sim.time;
       let hit = false;
-      while (sim.time - t0 <= limit) { sim.scan(); const cur = sim.get(k); if (norm(cur) === norm(v)) { hit = true; break; } }
+      while (sim.time - t0 <= limit) { sim.scan(); const cur = sim.get(k); if (approxEq(norm(cur), norm(v), st.tolerance)) { hit = true; break; } }
       results.expects.push({ step: stepNo, key: k, expected: v, actual: sim.get(k), ok: hit, t: sim.time, note: hit ? 'reached after ' + (sim.time - t0) + ' ms' : 'timeout after ' + limit + ' ms' });
       if (!hit) results.ok = false;
     }
     if (st.expect) {
       for (const [k, v] of Object.entries(st.expect)) {
-        const actual = sim.get(k); const ok = norm(actual) === norm(typeof v === 'string' && /^L?T#/i.test(v) ? parseTime(v) : v);
+        const actual = sim.get(k);
+        const expectedVal = norm(typeof v === 'string' && /^L?T#/i.test(v) ? parseTime(v) : v);
+        const ok = approxEq(norm(actual), expectedVal, st.tolerance);
         results.expects.push({ step: stepNo, key: k, expected: v, actual: actual === undefined ? 0 : actual, ok, t: sim.time });
         if (!ok) results.ok = false;
       }

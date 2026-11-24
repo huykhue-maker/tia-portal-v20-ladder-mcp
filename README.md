@@ -1,9 +1,9 @@
-# TIA Portal V20 Ladder MCP Server
+# TIA Portal V20 MCP Server (Ladder & SCL)
 
-Bộ công cụ Model Context Protocol (MCP) dành cho **Siemens TIA Portal V20** (S7-1200 / S7-1500), được phát triển chuyên biệt và **hiện tại chỉ hỗ trợ ngôn ngữ Ladder Logic (LAD)**.
+Bộ công cụ Model Context Protocol (MCP) dành cho **Siemens TIA Portal V20** (S7-1200 / S7-1500), tối ưu sâu cho ngôn ngữ **Ladder Logic (LAD)** và hỗ trợ đọc/ghi nguồn văn bản **SCL**, quản lý **Watch Table**, cấu hình phần cứng/mạng PROFINET, **Cross-Reference**, mô phỏng khép kín **S7-PLCSIM V20** và **Escape Hatch** phản chiếu động Openness.
 
 > [!IMPORTANT]
-> **Phạm vi hỗ trợ hiện tại:** Máy chủ MCP này tập trung tối ưu sâu cho việc đọc hiểu, phân tích, sinh mã và mô phỏng chu kỳ quét đối với khối lệnh **Ladder (LAD)**. Các ngôn ngữ SCL, FBD hay Graph hiện chưa được hỗ trợ.
+> **Phạm vi hỗ trợ hiện tại:** Tối ưu chuyên sâu cho **Ladder (LAD)** (DSL 2 chiều, phân tích tĩnh, mô phỏng chu kỳ quét trong RAM gồm cả Toán học/Lượng giác, Analog `NORM_X`/`SCALE_X`/`CONV`, Mảng và Motion `MC_*`) cùng hỗ trợ xuất/nhập **SCL** qua External Sources. Các ngôn ngữ FBD và GRAPH hiện chưa có DSL chuyên biệt.
 
 ---
 
@@ -20,33 +20,36 @@ Bộ công cụ Model Context Protocol (MCP) dành cho **Siemens TIA Portal V20*
 
 ```text
 TIA_Portal_V20_MCP/
-├── bridge/            # Cầu nối C# (.NET Framework 4.8 x64) gọi Siemens.Engineering.dll
-│   ├── TiaBridge.cs   # Mã nguồn C# giao tiếp Openness API
-│   └── TiaBridge.exe  # File thực thi cầu nối (biên dịch qua build.ps1)
-├── server/            # Máy chủ MCP chạy trên Node.js (giao thức stdio JSON-RPC)
-│   ├── index.js       # Khởi tạo 22 MCP tools
-│   └── ladder/        # Bộ biên dịch DSL Ladder, AST, Analyzer và Simulator
-├── skill/             # File hướng dẫn tích hợp Skill cho AI Agent
+├── bridge/                        # Cầu nối C# (.NET Framework 4.8 x64) gọi TIA Openness V20
+│   ├── TiaBridge.cs               # Lõi Openness, dự án, block, tags, biên dịch, download
+│   ├── TiaBridge.WatchAndScl.cs   # Watch Table, ShowInEditor, SCL External Source, Cross-Reference
+│   ├── TiaBridge.HardwareAndNet.cs# Phần cứng (Catalog, CPU, Module, TO) & Mạng (IP, PROFINET, OPC UA)
+│   ├── TiaBridge.PlcsimAndEscape.cs# Điều khiển S7-PLCSIM Runtime & Escape Hatch phản chiếu động
+│   └── TiaBridge.exe              # File thực thi cầu nối (biên dịch qua build.ps1)
+├── server/                        # Máy chủ MCP chạy trên Node.js (giao thức stdio JSON-RPC)
+│   ├── index.js                   # Khởi tạo 30 MCP tools
+│   └── ladder/                    # Bộ biên dịch DSL Ladder V20, AST, Analyzer và Simulator
+├── skill/                         # File hướng dẫn tích hợp Skill cho AI Agent
 │   └── SKILL.md
-├── tests/             # Bộ kiểm thử tự động toàn diện
+├── tests/                         # Bộ kiểm thử tự động toàn diện (6 nhóm test)
 │   └── run_all.js
-├── build.ps1          # Script biên dịch TiaBridge.exe bằng csc.exe có sẵn trên Windows
+├── build.ps1                      # Script biên dịch TiaBridge.exe bằng csc.exe có sẵn trên Windows
 ├── package.json
 └── README.md
 ```
 
 ---
 
-## 3. Danh sách 22 MCP Tools (Chuyên biệt cho Ladder)
+## 3. Danh sách 30 MCP Tools
 
-1. **Quản lý phiên & Dự án:**
+1. **Quản lý phiên & Dự án (5 tools):**
    - `tia_status`: Kiểm tra kết nối TIA Portal V20 và quyền Openness.
    - `tia_connect`: Gắn vào tiến trình TIA Portal đang mở hoặc khởi chạy mới.
    - `tia_open_project`: Mở file dự án `.ap20`.
    - `tia_save_project`: Lưu dự án.
    - `tia_close_project`: Đóng dự án.
 
-2. **Dữ liệu & Cấu trúc:**
+2. **Dữ liệu & Cấu trúc (6 tools):**
    - `tia_project_blueprint`: Đọc sơ đồ tổng thể PLC, Blocks, DB, TO, Tags.
    - `tia_list_blocks`: Liệt kê các khối OB, FB, FC, DB.
    - `tia_read_tags`: Đọc bảng PLC Tags.
@@ -54,20 +57,32 @@ TIA_Portal_V20_MCP/
    - `tia_read_db_udt`: Đọc cấu trúc Global DB hoặc UDT.
    - `tia_edit_db_udt`: Chỉnh sửa biến trong DB/UDT.
 
-3. **Thao tác khối Ladder (LAD):**
+3. **Thao tác khối Ladder (7 tools):**
    - `tia_read_ladder`: Đọc khối LAD dưới dạng DSL ngắn gọn hoặc ASCII rungs.
-   - `tia_patch_ladder_network`: Chỉnh sửa, thay thế hoặc thêm từng Network bậc thang.
+   - `tia_patch_ladder_network`: Chỉnh sửa, thay thế hoặc thêm từng Network bậc thang (hỗ trợ cổng `O` V20, `SUB`, `CONV`, `SIN`, `COS`, `NORM_X`, `SCALE_X`, `LIMIT`, Mảng, `MC_*`).
    - `tia_create_ladder_block`: Tạo mới khối OB, FB, FC dạng LAD.
    - `tia_edit_block_interface`: Chỉnh sửa khai báo biến Input, Output, Temp, Static.
    - `tia_analyze_ladder`: Kiểm tra tĩnh (Double coil, Timer overlap, Cross-reference).
    - `tia_rollback_block`: Khôi phục khối từ bản lưu XML tự động.
    - `tia_export_raw`: Xuất SimaticML XML gốc khi cần tra cứu sâu.
 
-4. **Biên dịch & Kiểm thử mô phỏng:**
+4. **Biên dịch & Kiểm thử mô phỏng cơ bản (4 tools):**
    - `tia_dry_run_ladder`: Mô phỏng chu kỳ quét PLC trong RAM không cần bật TIA.
    - `tia_compile`: Biên dịch Software / Hardware (báo cáo lỗi chi tiết).
    - `tia_sim_prepare`: Khởi động S7-PLCSIM V20 và xuất bảng SIM Table CSV.
-   - `tia_download_and_online`: Kết nối Online/Offline và nạp xuống CPU ảo.
+   - `tia_download_and_online`: Kết nối Online/Offline và nạp xuống CPU ảo/PLC thật.
+
+5. **Watch Table, SCL, Cross-Reference & Giao diện TIA (4 tools mới):**
+   - `tia_watch_table`: Tạo, đọc, cập nhật, xóa, xuất/nhập Watch Table (và liệt kê Force Table) trực tiếp trong TIA Portal, hỗ trợ mở thẳng lên màn hình bằng `ShowInEditor`.
+   - `tia_show_in_editor`: Mở nhanh khối lệnh, Watch Table, Tag Table, UDT hoặc khung nhìn phần cứng/mạng ngay trên giao diện TIA Portal V20.
+   - `tia_scl_source`: Xuất khối/DB/UDT ra mã nguồn văn bản `.scl`/`.db`/`.udt` hoặc nhập mã nguồn SCL để sinh khối mới trực tiếp trong project.
+   - `tia_cross_reference`: Tra cứu chéo (Cross-Reference) toàn dự án hoặc theo khối để biết chính xác biến/DB/UDT đang được đọc/ghi ở đâu.
+
+6. **Phần cứng, Mạng công nghiệp, PLCSIM Runtime & Escape Hatch (4 tools mới):**
+   - `tia_hardware_config`: Tra cứu Hardware Catalog, xem preset mã đặt hàng, thêm CPU PLC, cắm module mở rộng vào slot, cấu hình System/Clock Memory Byte, PUT/GET và tạo Technological Object (`TO_PositioningAxis`, `PID_Compact`...).
+   - `tia_network_config`: Kiểm tra giao diện mạng, đặt IP/Subnet Mask/Router, kết nối Subnet, tạo PROFINET IO-System và cấu hình OPC UA Server.
+   - `tia_plcsim_runtime`: Điều khiển vòng lặp khép kín S7-PLCSIM V20 / PLCSIM Advanced Runtime (đăng ký/gắn CPU ảo, Power/Run/Stop, đọc/ghi tín hiệu trực tiếp và chạy kịch bản test theo thời gian thực).
+   - `tia_escape_hatch`: Công cụ phản chiếu động vạn năng trên `IEngineeringObject` — cho phép soi thuộc tính/composition/service/method (`inspect`), đọc/ghi thuộc tính động (`get`/`set`), gọi phương thức (`invoke`) và quản lý handle `obj:N`.
 
 ---
 

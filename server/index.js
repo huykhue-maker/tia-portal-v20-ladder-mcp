@@ -47,6 +47,17 @@ async function exportBlockXml(blockName, plcName) {
   return { xml, meta: res };
 }
 
+function fmtValue(v) {
+  if (v === undefined) return 'undefined';
+  if (v === null) return 'null';
+  if (typeof v === 'object') return JSON.stringify(v);
+  return String(v);
+}
+
+function plural(n, singular, pluralForm) {
+  return n + ' ' + (n === 1 ? singular : (pluralForm || singular + 's'));
+}
+
 function annotateTags(text, tagsMap) {
   if (!tagsMap || !Object.keys(tagsMap).length) return text;
   const used = new Set();
@@ -503,6 +514,204 @@ const TOOLS = [
         targetInterfaceIndex: { type: 'integer', description: 'Index of target interface (default: 0).' },
         includeHardware: { type: 'boolean', description: 'Download Hardware + Software (default: true).' },
         startAfterDownload: { type: 'boolean', description: 'Start CPU modules after download (default: true).' },
+      },
+    },
+  },
+
+  // --- Group 5: Watch & Force Tables, SCL External Sources, Cross-Reference, GUI Focus ---
+  {
+    name: 'tia_watch_table',
+    description: 'Create, read, update, delete, export or import PLC Watch Tables (and list Force Tables) in TIA Portal V20. Can auto-create the table and open it in the TIA Portal editor with ShowInEditor.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'read', 'upsert', 'create', 'delete', 'export', 'import'], description: 'Default: list.' },
+        name: { type: 'string', description: 'Watch table name (default: Watch_Table_MCP).' },
+        plcName: { type: 'string' },
+        entries: {
+          type: 'array',
+          description: 'Entries for upsert/create. Address is written before Name on V20 CPUs.',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: 'Symbolic tag name or DB member.' },
+              address: { type: 'string', description: 'Absolute address, e.g. %I0.0, %QW10, %DB1.DBX0.0.' },
+              displayFormat: { type: 'string', description: 'Bool, Float, Hex, Bin, Dec, Signed, Unsigned, Time, Date, String...' },
+              modifyValue: { type: 'string', description: 'Optional modify value.' },
+              comment: { type: 'string' },
+            },
+          },
+        },
+        clearExisting: { type: 'boolean', description: 'Delete and recreate the table before upsert (default: false).' },
+        showInEditor: { type: 'boolean', description: 'Call ShowInEditor after create/read/import (default: false).' },
+        path: { type: 'string', description: 'XML path for export/import. Export defaults to exports/<name>.xml.' },
+      },
+    },
+  },
+  {
+    name: 'tia_show_in_editor',
+    description: 'Open a block, watch table, tag table, PLC data type, device, network or topology view in the TIA Portal V20 GUI.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', enum: ['block', 'watch_table', 'tag_table', 'type', 'device', 'network', 'topology'], description: 'Default: block.' },
+        name: { type: 'string', description: 'Object name (omit for the default tag table or device view).' },
+        plcName: { type: 'string' },
+      },
+    },
+  },
+  {
+    name: 'tia_scl_source',
+    description: 'Export a block/DB/UDT as SCL/DB/UDT external text source, or import SCL source code/file to generate blocks (with optional group placement and keeping the external source).',
+    inputSchema: {
+      type: 'object',
+      required: ['action'],
+      properties: {
+        action: { type: 'string', enum: ['export', 'read', 'import', 'write'], description: 'export/read = generate source; import/write = compile source into blocks.' },
+        plcName: { type: 'string' },
+        blockName: { type: 'string', description: 'Block to export (must support source generation).' },
+        typeName: { type: 'string', description: 'PLC data type (UDT) to export.' },
+        outPath: { type: 'string', description: 'Optional output path for export (default: exports/<name>.scl or .udt).' },
+        withDependencies: { type: 'boolean', description: 'Include dependent objects in generated source (default: false).' },
+        maxChars: { type: 'integer', description: 'Max source characters to return (default: 20000).' },
+        sourceCode: { type: 'string', description: 'SCL/DB/UDT source text for import/write.' },
+        filePath: { type: 'string', description: 'Existing source file for import/write (alternative to sourceCode).' },
+        sourceName: { type: 'string', description: 'External source name (default: MCP_Generated_Source).' },
+        group: { type: 'string', description: 'Destination block group for generated blocks.' },
+        keepExternalSource: { type: 'boolean', description: 'Keep the external source after generation (default: false).' },
+      },
+    },
+  },
+  {
+    name: 'tia_cross_reference',
+    description: 'Query project-wide or block-level TIA Portal Cross-Reference: where each tag/DB/UDT is read or written, with source paths and locations.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        plcName: { type: 'string' },
+        filter: { type: 'string', enum: ['used', 'all', 'unused', 'without_references'], description: 'Default: used (objects with references).' },
+        symbol: { type: 'string', description: 'Optional substring filter on symbol name or address.' },
+        blockName: { type: 'string', description: 'Optional block to scope the cross-reference to.' },
+        limit: { type: 'integer', description: 'Max source objects (default: 200).' },
+      },
+    },
+  },
+
+  // --- Group 6: Hardware/Network, PLCSIM Runtime, Universal Escape Hatch ---
+  {
+    name: 'tia_hardware_config',
+    description: 'Zero-to-project hardware configuration: list presets, search the hardware catalog, add a PLC/device, plug modules, set CPU memory/startup/PUT-GET properties, or create a technological object.',
+    inputSchema: {
+      type: 'object',
+      required: ['action'],
+      properties: {
+        action: { type: 'string', enum: ['presets', 'search_catalog', 'add_plc', 'add_device', 'plug_module', 'cpu_properties', 'create_tech_object'] },
+        plcName: { type: 'string' },
+        stationName: { type: 'string' },
+        typeIdentifier: { type: 'string', description: 'Preset key (e.g. CPU_1214C_DC_DC_DC) or order number / TypeIdentifier.' },
+        query: { type: 'string', description: 'Hardware catalog search text (default: 6ES7 214).' },
+        filter: { type: 'string', description: 'Optional catalog result filter.' },
+        limit: { type: 'integer' },
+        moduleName: { type: 'string' },
+        slot: { type: 'integer', description: 'Slot number (S7-1200 expansion slots start at 2; Signal Board 1; Comm modules 101-103).' },
+        enableSystemMemory: { type: 'boolean' },
+        systemMemoryAddress: { type: 'integer' },
+        enableClockMemory: { type: 'boolean' },
+        clockMemoryAddress: { type: 'integer' },
+        permitPutGet: { type: 'boolean' },
+        attributes: { type: 'object', description: 'Raw CPU attribute overrides for cpu_properties.' },
+        name: { type: 'string', description: 'Technological object name (default: Axis_1).' },
+        type: { type: 'string', description: 'Technological object type (default: TO_PositioningAxis).' },
+        version: { type: 'string', description: 'Technological object version (default: 8.0).' },
+        parameters: { type: 'object', description: 'Technological object parameter values.' },
+      },
+    },
+  },
+  {
+    name: 'tia_network_config',
+    description: 'Inspect subnets/PROFINET interfaces, set PLC IP address/subnet mask/router, connect a PLC to a subnet, create an IO system, or toggle OPC UA server settings.',
+    inputSchema: {
+      type: 'object',
+      required: ['action'],
+      properties: {
+        action: { type: 'string', enum: ['inspect', 'set_ip', 'connect_subnet', 'opcua'] },
+        plcName: { type: 'string' },
+        interfaceName: { type: 'string', description: 'Optional network interface name filter.' },
+        ipAddress: { type: 'string' },
+        subnetMask: { type: 'string' },
+        routerAddress: { type: 'string' },
+        subnetName: { type: 'string', description: 'Subnet to create/connect (default: PN/IE_1).' },
+        createIoSystem: { type: 'boolean', description: 'Create an IO system when connecting (default: false).' },
+        enableServer: { type: 'boolean', description: 'Enable/disable OPC UA server.' },
+        port: { type: 'integer', description: 'OPC UA port (default: 4840).' },
+      },
+    },
+  },
+  {
+    name: 'tia_plcsim_runtime',
+    description: 'Closed-loop S7-PLCSIM V20 / PLCSIM Advanced runtime control: inspect/register virtual PLC instances, power/run/stop, list tags, read/write signals (absolute or symbolic), and run timed test sequences with assertions and samples.',
+    inputSchema: {
+      type: 'object',
+      required: ['action'],
+      properties: {
+        action: { type: 'string', enum: ['status', 'register', 'control', 'list_tags', 'read', 'write', 'run_sequence'] },
+        instanceName: { type: 'string' },
+        articleNumber: { type: 'string', description: 'CPU article number for register (alternative to cpuType).' },
+        cpuType: { type: 'string', description: 'ECPUType name for register (default: CPU1500_Unspecified).' },
+        powerOn: { type: 'boolean', description: 'Power on after register (default: true).' },
+        run: { type: 'boolean', description: 'Run CPU after register (default: false).' },
+        ipAddress: { type: 'string' },
+        subnetMask: { type: 'string' },
+        gateway: { type: 'string' },
+        operation: { type: 'string', enum: ['power_on', 'power_off', 'run', 'stop', 'memory_reset', 'unregister'], description: 'For action=control.' },
+        timeoutMs: { type: 'integer', description: 'Operation timeout in ms (default: 30000).' },
+        search: { type: 'string', description: 'Tag name filter for list_tags.' },
+        limit: { type: 'integer', description: 'Max tags (default: 200).' },
+        refreshTagList: { type: 'boolean', description: 'Refresh the tag list before read/write.' },
+        signals: { type: 'array', items: { type: 'string' }, description: 'Signals to read, e.g. ["%I0.0", "\\"MyTag\\""].' },
+        values: { type: 'object', description: 'Signals to write: { "%Q0.0": true, "\\"Speed\\"": 12.5 }.' },
+        watch: { type: 'array', items: { type: 'string' }, description: 'Signals sampled during run_sequence.' },
+        steps: {
+          type: 'array',
+          description: 'Timed steps for run_sequence.',
+          items: {
+            type: 'object',
+            properties: {
+              write: { type: 'object' },
+              pulse: { type: 'string', description: 'Signal to pulse true then false.' },
+              pulseMs: { type: 'integer' },
+              waitMs: { type: 'integer' },
+              expect: { type: 'object' },
+              tolerance: { type: 'number' },
+            },
+          },
+        },
+        sampleIntervalMs: { type: 'integer', description: 'Sampling interval for run_sequence (default: 50).' },
+      },
+    },
+  },
+  {
+    name: 'tia_escape_hatch',
+    description: 'Universal Openness reflection escape hatch: inspect attributes/compositions/services/methods on any project object, get/set attributes, invoke methods, and manage object handles (obj:N).',
+    inputSchema: {
+      type: 'object',
+      required: ['action'],
+      properties: {
+        action: { type: 'string', enum: ['inspect', 'get', 'set', 'invoke', 'list_handles', 'release_handles'] },
+        target: { type: 'string', description: 'project, tia, cpu, device, software, block:<Name>, to:<Name>, watch:<Name>, tagtable:<Name>, type:<Name>, or obj:N. Default: project.' },
+        plcName: { type: 'string' },
+        filter: { type: 'string', description: 'Attribute name filter for inspect.' },
+        includeValues: { type: 'boolean', description: 'Read attribute values during inspect (default: true).' },
+        attribute: { type: 'string' },
+        value: { description: 'Value for set (number, boolean, string, or obj:N handle).' },
+        attributes: { type: 'object', description: 'Multiple attributes to set.' },
+        composition: { type: 'string', description: 'Composition to enumerate for get.' },
+        findName: { type: 'string', description: 'Find a composition child by Name.' },
+        index: { type: 'integer', description: 'Find a composition child by index.' },
+        service: { type: 'string', description: 'Service type full name or short name to resolve.' },
+        method: { type: 'string', description: 'Method name for invoke.' },
+        methodArgs: { type: 'array', items: {}, description: 'Positional method arguments for invoke.' },
+        handle: { type: 'string', description: 'Handle to release (obj:N) or empty to release all.' },
       },
     },
   },
@@ -990,6 +1199,425 @@ async function handleTool(name, args) {
         pcInterface: args.pcInterface || 'PLCSIM',
       });
       return { text: 'PLC "' + r.plc + '" Online State: ' + r.state, json: r };
+    }
+
+    case 'tia_watch_table': {
+      const action = args.action || 'list';
+      const tableName = args.name || 'Watch_Table_MCP';
+      const payload = {
+        action,
+        plcName: args.plcName || '',
+        name: tableName,
+        clearExisting: !!args.clearExisting,
+        showInEditor: !!args.showInEditor,
+      };
+      if (args.entries) payload.entries = args.entries;
+      if (action === 'export') payload.path = args.path || bridge.exportFilePath(tableName, '.xml');
+      if (action === 'import') {
+        if (!args.path) throw new Error('path is required for watch_table action="import".');
+        payload.path = args.path;
+      }
+
+      const r = await bridge.call('watch_table', payload);
+      if (action === 'list') {
+        const lines = ['PLC "' + r.plc + '" WATCH/FORCE TABLES:'];
+        lines.push('  WATCH TABLES (' + (r.watchTables || []).length + '):');
+        if (!r.watchTables || !r.watchTables.length) lines.push('    (none)');
+        for (const w of (r.watchTables || [])) {
+          lines.push('    "' + w.name + '"' + (w.group ? ' @' + w.group : '') + ' — ' + plural(w.entryCount, 'entry', 'entries') + (w.isConsistent ? '' : ' [INCONSISTENT]'));
+        }
+        lines.push('  FORCE TABLES (' + (r.forceTables || []).length + '):');
+        if (!r.forceTables || !r.forceTables.length) lines.push('    (none)');
+        for (const f of (r.forceTables || [])) {
+          lines.push('    "' + f.name + '"' + (f.group ? ' @' + f.group : '') + ' — ' + plural(f.entryCount, 'entry', 'entries'));
+        }
+        return { text: lines.join('\n'), json: r };
+      }
+      if (action === 'read') {
+        const lines = ['WATCH TABLE "' + r.table + '" — ' + plural(r.entryCount, 'entry', 'entries')];
+        for (const e of (r.entries || [])) {
+          lines.push('  ' + (e.name || '(no name)') + (e.address ? ' @ ' + e.address : '') + ' [' + e.displayFormat + ']' +
+            (e.modifyValue ? ' modify=' + e.modifyValue : '') + (e.comment ? ' // ' + e.comment : ''));
+        }
+        return { text: lines.join('\n'), json: r };
+      }
+      if (action === 'delete') {
+        return { text: 'Deleted watch table "' + r.deleted + '".', json: r };
+      }
+      if (action === 'export') {
+        return { text: 'Exported watch table "' + r.table + '" to ' + r.path, json: r };
+      }
+      if (action === 'import') {
+        return {
+          text: 'Imported watch table(s): ' + ((r.imported || []).join(', ') || '(none)') + (r.shownInEditor ? ' (shown in editor)' : ''),
+          json: r,
+        };
+      }
+      const lines = ['Watch table "' + r.table + '" now has ' + plural(r.entryCount, 'entry', 'entries') + (r.shownInEditor ? ' (shown in editor)' : '')];
+      for (const c of (r.changes || [])) lines.push('  ' + c);
+      return { text: lines.join('\n'), json: r };
+    }
+
+    case 'tia_show_in_editor': {
+      const r = await bridge.call('show_in_editor', {
+        plcName: args.plcName || '',
+        kind: args.kind || 'block',
+        name: args.name || '',
+      });
+      const kind = r.kind || r.view || 'object';
+      return { text: 'Opened ' + kind + ' "' + r.shown + '" in the TIA Portal editor.', json: r };
+    }
+
+    case 'tia_scl_source': {
+      const action = args.action || 'export';
+      const payload = {
+        action,
+        plcName: args.plcName || '',
+        blockName: args.blockName || '',
+        typeName: args.typeName || '',
+        outPath: args.outPath || '',
+        withDependencies: !!args.withDependencies,
+        filePath: args.filePath || '',
+        sourceName: args.sourceName || 'MCP_Generated_Source',
+        group: args.group || '',
+        keepExternalSource: !!args.keepExternalSource,
+      };
+      if (args.sourceCode !== undefined) payload.sourceCode = args.sourceCode;
+
+      if (action === 'export' || action === 'read') {
+        if (!args.blockName && !args.typeName) throw new Error('Provide blockName or typeName for SCL export.');
+        if (!payload.outPath) {
+          const label = args.blockName || args.typeName;
+          payload.outPath = bridge.exportFilePath(label, args.typeName ? '.udt' : '.scl');
+        }
+      } else if (action === 'import' || action === 'write') {
+        if (!args.sourceCode && !args.filePath) throw new Error('Provide sourceCode or filePath for SCL import.');
+      }
+
+      const r = await bridge.call('scl_source', payload, 120000);
+      if (action === 'export' || action === 'read') {
+        const maxChars = args.maxChars || 20000;
+        const code = r.sourceCode || '';
+        return {
+          text: 'Generated source "' + r.name + '" -> ' + r.path + ' (' + code.length + ' chars):\n' +
+            code.slice(0, maxChars) + (code.length > maxChars ? '\n... (truncated)' : ''),
+          json: { name: r.name, path: r.path, length: code.length },
+        };
+      }
+      return {
+        text: 'Imported SCL/DB/UDT source -> generated: ' + ((r.generatedObjects || []).join(', ') || '(none)') +
+          '\nFile: ' + r.filePath,
+        json: r,
+      };
+    }
+
+    case 'tia_cross_reference': {
+      const r = await bridge.call('cross_reference', {
+        plcName: args.plcName || '',
+        filter: args.filter || 'used',
+        symbol: args.symbol || '',
+        blockName: args.blockName || '',
+        limit: args.limit || 200,
+      }, 120000);
+      const lines = ['CROSS-REFERENCE PLC "' + r.plc + '" — filter=' + r.filter +
+        (r.symbolFilter ? ' symbol~"' + r.symbolFilter + '"' : '') + ' — ' + plural(r.count, 'source object')];
+      for (const s of (r.sources || [])) {
+        lines.push('  "' + s.name + '"' + (s.address ? ' @ ' + s.address : '') + (s.typeName ? ' : ' + s.typeName : '') +
+          ' — ' + plural(s.referenceCount, 'reference'));
+        for (const ref of (s.references || [])) {
+          const locs = (ref.locations || []).map(l =>
+            (l.location || '') + (l.access ? ' [' + l.access + ']' : '') + (l.address ? ' @ ' + l.address : '')
+          ).join('; ');
+          lines.push('    <- ' + (ref.referencedIn || '(unknown)') + (ref.type ? ' (' + ref.type + ')' : '') +
+            (ref.path ? ' ' + ref.path : '') + (locs ? ': ' + locs : ''));
+        }
+      }
+      return { text: lines.join('\n'), json: r };
+    }
+
+    case 'tia_hardware_config': {
+      const action = args.action || 'presets';
+      const payload = {
+        action,
+        attributes: args.attributes || {},
+        parameters: args.parameters || {},
+      };
+      if (args.plcName) payload.plcName = args.plcName;
+      if (args.typeIdentifier) payload.typeIdentifier = args.typeIdentifier;
+      if (args.stationName) payload.stationName = args.stationName;
+      if (args.moduleName) payload.moduleName = args.moduleName;
+      if (args.slot !== undefined) payload.slot = args.slot;
+      if (args.query) payload.query = args.query;
+      if (args.filter) payload.filter = args.filter;
+      if (args.limit !== undefined) payload.limit = args.limit;
+      if (args.name) payload.name = args.name;
+      if (args.type) payload.type = args.type;
+      if (args.version) payload.version = args.version;
+      for (const k of ['enableSystemMemory', 'systemMemoryAddress', 'enableClockMemory', 'clockMemoryAddress', 'permitPutGet']) {
+        if (args[k] !== undefined) payload[k] = args[k];
+      }
+
+      const r = await bridge.call('hardware_config', payload, 120000);
+      if (action === 'presets') {
+        const keys = Object.keys(r.presets || {}).sort();
+        const lines = ['HARDWARE PRESETS (' + keys.length + '):'];
+        for (const k of keys) lines.push('  ' + k.padEnd(24) + ' -> ' + r.presets[k]);
+        return { text: lines.join('\n'), json: r };
+      }
+      if (action === 'search_catalog') {
+        const lines = ['HARDWARE CATALOG "' + r.query + '" — ' + plural(r.count, 'entry', 'entries') + ':'];
+        for (const e of (r.entries || [])) {
+          lines.push('  ' + e.typeIdentifier + ' | ' + e.articleNumber + ' / ' + e.version + ' | ' + e.description);
+          if (e.catalogPath) lines.push('    path: ' + e.catalogPath);
+        }
+        return { text: lines.join('\n'), json: r };
+      }
+      if (action === 'add_plc' || action === 'add_device') {
+        const lines = ['Created station "' + r.stationName + '" with PLC "' + r.plcName + '" (' + r.typeIdentifier + ').'];
+        const dev = r.device || {};
+        for (const it of (dev.items || [])) {
+          lines.push('  - ' + it.name + ' [' + it.typeIdentifier + ']' + (it.isPlc ? ' (PLC software: ' + it.plcSoftwareName + ')' : ''));
+        }
+        return { text: lines.join('\n'), json: r };
+      }
+      if (action === 'plug_module') {
+        return { text: 'Plugged "' + r.name + '" into slot ' + r.slot + ' (' + r.typeIdentifier + ').', json: r };
+      }
+      if (action === 'cpu_properties') {
+        const lines = ['CPU "' + r.plc + '" property changes:'];
+        if (!(r.applied || []).length) lines.push('  (none)');
+        for (const a of (r.applied || [])) lines.push('  ' + a);
+        const keys = Object.keys(r.keyAttributes || {}).sort();
+        if (keys.length) {
+          lines.push('KEY ATTRIBUTES:');
+          for (const k of keys) lines.push('  ' + k + ' = ' + fmtValue(r.keyAttributes[k]));
+        }
+        return { text: lines.join('\n'), json: r };
+      }
+      if (action === 'create_tech_object') {
+        const lines = ['Technological object "' + r.name + '" #' + r.number + ' (' + r.type + ' v' + r.version + ').'];
+        if (!(r.parameterChanges || []).length) lines.push('  (no parameter changes)');
+        for (const p of (r.parameterChanges || [])) lines.push('  ' + p);
+        return { text: lines.join('\n'), json: r };
+      }
+      return { text: JSON.stringify(r, null, 2), json: r };
+    }
+
+    case 'tia_network_config': {
+      const action = args.action || 'inspect';
+      const payload = {
+        action,
+        plcName: args.plcName || '',
+        interfaceName: args.interfaceName || '',
+        ipAddress: args.ipAddress || '',
+        subnetMask: args.subnetMask || '',
+        routerAddress: args.routerAddress || '',
+        subnetName: args.subnetName || '',
+      };
+      if (args.createIoSystem !== undefined) payload.createIoSystem = !!args.createIoSystem;
+      if (args.enableServer !== undefined) payload.enableServer = !!args.enableServer;
+      if (args.port !== undefined) payload.port = args.port;
+
+      const r = await bridge.call('network_config', payload, 120000);
+      if (action === 'inspect') {
+        const lines = ['SUBNETS (' + (r.subnets || []).length + '):'];
+        if (!r.subnets || !r.subnets.length) lines.push('  (none)');
+        for (const s of (r.subnets || [])) {
+          lines.push('  "' + s.name + '" [' + s.typeIdentifier + ']' + ((s.ioSystems || []).length ? ' IO systems: ' + s.ioSystems.join(', ') : ''));
+        }
+        lines.push('NETWORK INTERFACES (' + (r.interfaces || []).length + '):');
+        if (!r.interfaces || !r.interfaces.length) lines.push('  (none)');
+        for (const i of (r.interfaces || [])) {
+          lines.push('  ' + i.device + ' / ' + i.interfaceItem + ' [' + i.interfaceType + ', ' + i.operatingMode + ']');
+          for (const n of (i.nodes || [])) {
+            const details = [];
+            if (n.Address) details.push('IP ' + n.Address);
+            if (n.SubnetMask) details.push('mask ' + n.SubnetMask);
+            if (n.PnDeviceName) details.push('PN name ' + n.PnDeviceName);
+            const useRouter = n.UseRouter === true || n.UseRouter === 'True' || n.UseRouter === 1;
+            if (useRouter) details.push('router ' + (n.RouterAddress || '?'));
+            lines.push('    node "' + n.name + '" (' + n.nodeType + ')' +
+              (n.connectedSubnet ? ' -> subnet "' + n.connectedSubnet + '"' : '') +
+              (details.length ? ' — ' + details.join(', ') : ''));
+          }
+        }
+        return { text: lines.join('\n'), json: r };
+      }
+      if (action === 'opcua') {
+        const lines = ['OPC UA settings on PLC "' + r.plc + '":'];
+        if (!(r.changes || []).length) lines.push('  (no changes)');
+        for (const c of (r.changes || [])) lines.push('  ' + c);
+        return { text: lines.join('\n'), json: r };
+      }
+      const lines = ['PLC "' + r.plc + '" via interface "' + r.interface + '":'];
+      if (!(r.changes || []).length) lines.push('  (no changes)');
+      for (const c of (r.changes || [])) lines.push('  ' + c);
+      return { text: lines.join('\n'), json: r };
+    }
+
+    case 'tia_plcsim_runtime': {
+      const action = args.action || 'status';
+      const payload = {
+        action,
+        cpuType: args.cpuType || 'CPU1500_Unspecified',
+        articleNumber: args.articleNumber || '',
+        operation: args.operation || 'run',
+        timeoutMs: args.timeoutMs !== undefined ? args.timeoutMs : 30000,
+        search: args.search || '',
+        limit: args.limit || 200,
+        signals: args.signals || [],
+        values: args.values || {},
+        watch: args.watch || [],
+        steps: args.steps || [],
+        sampleIntervalMs: args.sampleIntervalMs !== undefined ? args.sampleIntervalMs : 50,
+      };
+      if (args.instanceName) payload.instanceName = args.instanceName;
+      if (args.powerOn !== undefined) payload.powerOn = !!args.powerOn;
+      if (args.run !== undefined) payload.run = !!args.run;
+      if (args.refreshTagList !== undefined) payload.refreshTagList = !!args.refreshTagList;
+      if (args.ipAddress !== undefined) payload.ipAddress = args.ipAddress;
+      if (args.subnetMask !== undefined) payload.subnetMask = args.subnetMask;
+      if (args.gateway !== undefined) payload.gateway = args.gateway;
+      if (action === 'read' && !payload.signals.length) throw new Error('signals[] is required for plcsim_runtime action="read".');
+      if (action === 'write' && !Object.keys(payload.values).length) throw new Error('values{} is required for plcsim_runtime action="write".');
+
+      const r = await bridge.call('plcsim_runtime', payload, 300000);
+      if (action === 'status') {
+        const lines = ['S7-PLCSIM V20 RUNTIME STATUS:'];
+        lines.push('  GUI running: ' + r.plcsimV20GuiRunning);
+        lines.push('  VPLC host running: ' + r.vplcHostRunning);
+        lines.push('  Runtime available: ' + r.runtimeAvailable + (r.runtimeInitialized !== undefined ? ' (initialized: ' + r.runtimeInitialized + ')' : ''));
+        if (r.networkMode) lines.push('  Network mode: ' + r.networkMode);
+        if (r.runtimeNote) lines.push('  NOTE: ' + r.runtimeNote);
+        lines.push('  INSTANCES (' + (r.instances || []).length + '):');
+        if (!r.instances || !r.instances.length) lines.push('    (none)');
+        for (const i of (r.instances || [])) {
+          lines.push('    - "' + i.name + '" (id ' + i.id + ')' +
+            (i.operatingState ? ' state=' + i.operatingState : '') +
+            (i.communicationInterface ? ' comm=' + i.communicationInterface : '') +
+            (i.ips !== undefined ? ' ip=' + fmtValue(i.ips) : ''));
+        }
+        return { text: lines.join('\n'), json: r };
+      }
+      if (action === 'register') {
+        return {
+          text: 'Registered PLCSIM instance "' + r.instanceName + '" (id ' + r.id + ') state=' + r.operatingState +
+            ' ip=' + fmtValue(r.ips),
+          json: r,
+        };
+      }
+      if (action === 'control') {
+        if (r.unregistered) return { text: 'Unregistered PLCSIM instance.', json: r };
+        return { text: 'PLCSIM instance "' + r.instanceName + '" -> ' + r.operatingState, json: r };
+      }
+      if (action === 'list_tags') {
+        const lines = ['PLCSIM INSTANCE "' + r.instanceName + '" — ' + plural(r.count, 'tag') + ':'];
+        for (const t of (r.tags || [])) {
+          lines.push('  ' + t.name + ' [' + t.area + '] ' + t.dataType + ' (primitive ' + t.primitiveType + ') @ offset ' + t.offset + '.' + t.bit);
+        }
+        return { text: lines.join('\n'), json: r };
+      }
+      if (action === 'read') {
+        const lines = ['PLCSIM INSTANCE "' + r.instanceName + '" state=' + r.operatingState + ':'];
+        for (const k of Object.keys(r.values || {})) lines.push('  ' + k + ' = ' + fmtValue(r.values[k]));
+        return { text: lines.join('\n'), json: r };
+      }
+      if (action === 'write') {
+        const lines = ['PLCSIM INSTANCE "' + r.instanceName + '" written:'];
+        for (const w of (r.written || [])) lines.push('  ' + w);
+        return { text: lines.join('\n'), json: r };
+      }
+      if (action === 'run_sequence') {
+        const lines = ['PLCSIM RUN SEQUENCE on "' + r.instanceName + '" — ' + (r.passed ? 'PASS' : 'FAIL') +
+          ' in ' + r.elapsedMs + ' ms, ' + plural((r.assertions || []).length, 'assertion') + ', ' + plural(r.sampleCount, 'sample') + ':'];
+        if (!(r.assertions || []).length) lines.push('  (no assertions)');
+        for (const a of (r.assertions || [])) {
+          lines.push('  ' + (a.ok ? 'PASS' : 'FAIL') + ' step ' + a.step + ' @' + a.tMs + 'ms ' + a.signal +
+            ': expected ' + fmtValue(a.expected) + ', actual ' + fmtValue(a.actual));
+        }
+        return { text: lines.join('\n'), json: r };
+      }
+      return { text: JSON.stringify(r, null, 2), json: r };
+    }
+
+    case 'tia_escape_hatch': {
+      const action = args.action || 'inspect';
+      const payload = {
+        action,
+        target: args.target || 'project',
+        plcName: args.plcName || '',
+        filter: args.filter || '',
+        includeValues: args.includeValues !== false,
+        attribute: args.attribute || '',
+        composition: args.composition || '',
+        service: args.service || '',
+        findName: args.findName || '',
+        index: args.index !== undefined ? args.index : -1,
+        attributes: args.attributes || {},
+        method: args.method || '',
+        methodArgs: args.methodArgs || [],
+        handle: args.handle || '',
+      };
+      if (args.value !== undefined) payload.value = args.value;
+
+      const r = await bridge.call('escape_hatch', payload, 120000);
+      if (action === 'list_handles') {
+        const lines = ['ESCAPE HATCH HANDLES (' + r.count + '):'];
+        for (const h of (r.handles || [])) lines.push('  ' + h.handle + '  ' + (h.name || '') + '  [' + h.type + ']');
+        return { text: lines.join('\n'), json: r };
+      }
+      if (action === 'release_handles') {
+        return {
+          text: r.released !== undefined ? 'Released handle ' + r.released + '.' : 'Released all ' + r.releasedAll + ' handle(s).',
+          json: r,
+        };
+      }
+      if (action === 'inspect') {
+        const lines = ['ESCAPE HATCH — ' + r.clrType + ' (' + r.handle + ')'];
+        const attrs = r.attributes || [];
+        lines.push('ATTRIBUTES (' + attrs.length + '):');
+        for (const a of attrs.slice(0, 100)) {
+          const types = (a.types || []).length ? ' {' + a.types.join('|') + '}' : '';
+          lines.push('  ' + a.name + ' [' + a.access + ']' + types + (a.value !== undefined ? ' = ' + fmtValue(a.value) : ''));
+        }
+        if (attrs.length > 100) lines.push('  ... (+' + (attrs.length - 100) + ' more)');
+        const comps = r.compositions || [];
+        lines.push('COMPOSITIONS (' + comps.length + '):');
+        for (const c of comps) lines.push('  ' + c.name + ' (count=' + c.count + ')');
+        const services = r.services || [];
+        lines.push('SERVICES (' + services.length + '):');
+        for (const s of services) lines.push('  ' + s);
+        const methods = r.methods || [];
+        lines.push('CLR METHODS (' + methods.length + '):');
+        for (const m of methods.slice(0, 40)) lines.push('  ' + m);
+        if (methods.length > 40) lines.push('  ... (+' + (methods.length - 40) + ' more)');
+        return { text: lines.join('\n'), json: r };
+      }
+      if (action === 'get') {
+        if (r.attribute !== undefined) return { text: r.attribute + ' = ' + fmtValue(r.value), json: r };
+        if (r.property !== undefined) return { text: r.property + ' = ' + fmtValue(r.value), json: r };
+        if (r.composition !== undefined) {
+          const lines = ['COMPOSITION "' + r.composition + '" — ' + plural(r.count, 'item') + ':'];
+          for (const it of (r.items || [])) {
+            lines.push('  [' + it.index + '] ' + (it.name || '(no name)') + ' [' + it.type + '] -> ' + it.handle);
+          }
+          return { text: lines.join('\n'), json: r };
+        }
+        if (r.compositionHandle !== undefined) return { text: 'Composition handle: ' + r.compositionHandle, json: r };
+        if (r.service !== undefined) return { text: 'Resolved service ' + r.service + ' -> ' + r.handle, json: r };
+        if (r.handle !== undefined) return { text: 'Found "' + (r.name || '') + '" [' + (r.type || '') + '] -> ' + r.handle, json: r };
+        return { text: JSON.stringify(r, null, 2), json: r };
+      }
+      if (action === 'set') {
+        const lines = ['Updated ' + r.handle + ':'];
+        if (!(r.updated || []).length) lines.push('  (no changes)');
+        for (const u of (r.updated || [])) lines.push('  ' + u);
+        return { text: lines.join('\n'), json: r };
+      }
+      if (action === 'invoke') {
+        return { text: 'Invoked ' + r.invoked + ' -> ' + fmtValue(r.result), json: r };
+      }
+      return { text: JSON.stringify(r, null, 2), json: r };
     }
 
     default:

@@ -16,7 +16,9 @@ const S = require('../server/ladder/simulator');
 const X = require('../server/ladder/xml');
 
 let passed = 0;
+let total = 0;
 function test(name, fn) {
+  total++;
   return Promise.resolve().then(fn).then(() => {
     passed++;
     console.log('  [PASS]', name);
@@ -182,12 +184,46 @@ async function main() {
       assert.strictEqual(init.result.serverInfo.name, 'tia-portal-v20-mcp');
 
       const listed = await rpc('tools/list', {});
-      assert.strictEqual(listed.result.tools.length, 22, 'Expected 22 MCP tools, got ' + listed.result.tools.length);
+      assert.strictEqual(listed.result.tools.length, 30, 'Expected 30 MCP tools, got ' + listed.result.tools.length);
+      const toolNames = new Set(listed.result.tools.map(t => t.name));
+      const newTools = [
+        'tia_watch_table',
+        'tia_show_in_editor',
+        'tia_scl_source',
+        'tia_cross_reference',
+        'tia_hardware_config',
+        'tia_network_config',
+        'tia_plcsim_runtime',
+        'tia_escape_hatch',
+      ];
+      for (const nt of newTools) {
+        assert(toolNames.has(nt), 'Missing newly added MCP tool in tools/list: ' + nt);
+      }
 
       // Call live tia_status (spawns real compiled TiaBridge.exe!)
       const st = await rpc('tools/call', { name: 'tia_status', arguments: {} });
       assert(!st.result.isError, 'tia_status error: ' + st.result.content[0].text);
       assert(st.result.content[0].text.includes('OPENNESS ACCESSIBLE: true'), 'Expected TiaBridge opennessAccessible=true');
+
+      // Smoke test new bridge tools that do not require an open TIA project
+      const eh = await rpc('tools/call', { name: 'tia_escape_hatch', arguments: { action: 'list_handles' } });
+      assert(!eh.result.isError, 'tia_escape_hatch(list_handles) failed: ' + eh.result.content[0].text);
+
+      const simRt = await rpc('tools/call', { name: 'tia_plcsim_runtime', arguments: { action: 'status' } });
+      assert(!simRt.result.isError, 'tia_plcsim_runtime(status) failed: ' + simRt.result.content[0].text);
+
+      // Smoke test new tools wired in server/index.js (when disconnected/no project, should return clean MCP error without crashing server)
+      for (const probe of [
+        { name: 'tia_watch_table', arguments: { action: 'list' } },
+        { name: 'tia_show_in_editor', arguments: { kind: 'block', name: 'Main' } },
+        { name: 'tia_scl_source', arguments: { action: 'export', blockName: 'Main' } },
+        { name: 'tia_cross_reference', arguments: { filter: 'used' } },
+        { name: 'tia_hardware_config', arguments: { action: 'presets' } },
+        { name: 'tia_network_config', arguments: { action: 'inspect' } },
+      ]) {
+        const res = await rpc('tools/call', probe);
+        assert(res && res.result && Array.isArray(res.result.content) && res.result.content.length > 0, 'Malformed MCP response from ' + probe.name);
+      }
 
       // Offline create -> read -> patch -> analyze -> dry_run via MCP tools!
       const tmpXml = path.join(os.tmpdir(), 'tia_mcp_test_fb.xml');
@@ -232,7 +268,91 @@ async function main() {
     }
   });
 
-  console.log('\n=== SUMMARY: ' + passed + '/5 test groups passed ===');
+  // 6. New Ladder V20 features: <Part Name="O"> parallel OR, Sub without Card, SIN/COS/CONV/NORM_X/SCALE_X/LIMIT, Array & Motion
+  await test('6. Ladder V20 features (O-gate OR, Sub without Card, CONV, SIN, COS, NORM_X, SCALE_X, Array, Motion) roundtrip & dry-run', () => {
+    // 6a. Verify Sub has NO Card template and OR emits <Part Name="O"> with Card="3"
+    const subXml = G.generateFlgNet(D.parseNetwork('NO(#En) => SUB(#A, #B, #Diff, Real)').flows, {}).xml;
+    assert(subXml.includes('<Part Name="Sub"'), 'Expected Sub part');
+    assert(!subXml.includes('Name="Card"'), 'Sub in TIA V20 must NOT have a Card TemplateValue!');
+
+    const orXml = G.generateFlgNet(D.parseNetwork('(NO(#M1) | NO(#M2) | NC(#M3)) => COIL(#Out)').flows, {}).xml;
+    assert(orXml.includes('<Part Name="O"'), 'Parallel OR in TIA V20 must emit <Part Name="O">');
+    assert(orXml.includes('<TemplateValue Name="Card" Type="Cardinality">3</TemplateValue>'), 'OR gate must have Card=3');
+
+    // 6b. Roundtrip all new Ladder DSL constructs
+    const cases = [
+      'NO(#M1) | NO(#M2) | NC(#M3) => COIL(#Out)',
+      'NO(#En) => SUB(#A, #B, #Diff, Real)',
+      'NO(#En) => CONV(#RawInt, #ValReal, Int, Real)',
+      'NO(#En) => COS(#Angle, #CosVal, Real), SIN(#Angle, #SinVal, Real)',
+      'NO(#En) => NORM_X(0, #RawInt, 27648, #NormVal, Int, Real) => SCALE_X(0.0, #NormVal, 100.0, #TempC, Real, Real)',
+      'NO(#En) => LIMIT(0.0, #TempC, 100.0, #Clamped, Real)',
+      'NO(#En) => MOVE(#Arr[#Idx], #OutVal)',
+      'MC_Power("MC_Power_DB", Axis="Truc_X", Enable=NO(#ServoOn), Status=#ServoOk)',
+      'MC_MoveAbsolute("MC_Move_DB", Axis="Truc_X", Position=40.0, Velocity=20.0, Execute=NO(#Go), Done=#Done)',
+    ];
+    for (const dsl of cases) {
+      const flows = D.parseNetwork(dsl).flows;
+      const gen = G.generateFlgNet(flows, {});
+      const back = R.readFlgNet(X.parse(gen.xml));
+      assert.strictEqual(back.complete, true, 'Expected complete roundtrip for: ' + dsl + ' notes=' + JSON.stringify(back.notes));
+      assert.strictEqual(back.dsl, dsl, 'Roundtrip mismatch:\n  in : ' + dsl + '\n  out: ' + back.dsl);
+    }
+
+    // 6c. In-RAM scan-cycle simulation of CONV, NORM_X, SCALE_X, SIN, COS, SUB & OR
+    const mathBlock = B.createBlockXml({
+      type: 'FB',
+      name: 'FB_MathAnalog',
+      interface: {
+        Input: [
+          { name: 'En1', type: 'Bool' },
+          { name: 'En2', type: 'Bool' },
+          { name: 'RawAnalog', type: 'Int' },
+          { name: 'Angle', type: 'Real' },
+        ],
+        Output: [
+          { name: 'Active', type: 'Bool' },
+          { name: 'ConvReal', type: 'Real' },
+          { name: 'NormVal', type: 'Real' },
+          { name: 'TempC', type: 'Real' },
+          { name: 'CosOut', type: 'Real' },
+          { name: 'SinOut', type: 'Real' },
+          { name: 'DiffOut', type: 'Real' },
+        ],
+      },
+      networks: [
+        { title: 'OR Enable', dsl: '(NO(#En1) | NO(#En2)) => COIL(#Active)' },
+        { title: 'Analog NORM_X + SCALE_X + CONV', dsl: 'NO(#Active) => CONV(#RawAnalog, #ConvReal, Int, Real), NORM_X(0, #RawAnalog, 27648, #NormVal, Int, Real) => SCALE_X(0.0, #NormVal, 100.0, #TempC, Real, Real)' },
+        { title: 'Trig COS/SIN & SUB', dsl: 'NO(#Active) => COS(#Angle, #CosOut, Real), SIN(#Angle, #SinOut, Real), SUB(#TempC, 10.0, #DiffOut, Real)' },
+      ],
+    }, {});
+
+    const read = B.readBlock(mathBlock.xml, { format: 'dsl' });
+    const prog = S.buildProgram([read], 'FB_MathAnalog');
+    const sim = S.runScenario(prog, {
+      scanMs: 10,
+      init: { '#En1': 0, '#En2': 1, '#RawAnalog': 13824, '#Angle': 0.0 },
+      watch: ['#Active', '#ConvReal', '#NormVal', '#TempC', '#CosOut', '#SinOut', '#DiffOut'],
+      steps: [
+        {
+          run: 1,
+          tolerance: 0.01,
+          expect: {
+            '#Active': 1,
+            '#ConvReal': 13824.0,
+            '#NormVal': 0.5,
+            '#TempC': 50.0,
+            '#CosOut': 1.0,
+            '#SinOut': 0.0,
+            '#DiffOut': 40.0,
+          },
+        },
+      ],
+    });
+    assert.strictEqual(sim.ok, true, 'Math/Analog/OR simulation failed:\n' + S.formatResults(sim));
+  });
+
+  console.log('\n=== SUMMARY: ' + passed + '/' + total + ' test groups passed ===');
 }
 
 main();

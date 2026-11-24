@@ -1,15 +1,5 @@
 'use strict';
 // Ladder DSL: tokenizer, parser (text -> AST) and canonical printer (AST -> text).
-//
-//   rung   := [ cond '=>' ] actions
-//   cond   := or ;  or := and ('|' and)* ;  and := unary ('&' unary)*
-//   unary  := '!'? primary
-//   primary:= '(' or ')' | NO(x) | NC(x) | NOT() | RTRIG(mem) | FTRIG(mem) | GT(a,b[,Type]) | TRUE | operand
-//   actions:= action (',' action)*         (fan-out from the same power point)
-//   action := COIL(x) | NCOIL(x) | SET(x) | RESET(x) | MOVE(src,dst..) | ADD(a,b,dst[,Type])
-//           | TON(inst, PT=..,ET=..) | CTU(inst, PV=.., R=..) | CALL("Blk", inst=.., P=..)
-//             [ '=>' flow | '=>' '{' flow (';' flow)* '}' ]       (power continues from Q / ENO)
-//   operand:= #Local.Member | "Tag"."Member" | BareTag | %I0.0 | %QW64 | 5 | 2.5 | T#3s | TRUE | FALSE
 
 const { local, global, lit, abs, text } = require('./operand');
 const C = require('./catalog');
@@ -30,8 +20,9 @@ const ID_START = /[A-Za-z_]/, ID_CH = /[A-Za-z0-9_]/;
 function tokenize(src) {
   const toks = []; let i = 0; const n = src.length;
   const push = (t, pos, extra) => toks.push(Object.assign({ t, pos }, extra || {}));
+  const skipWs = () => { while (i < n && /\s/.test(src[i])) i++; };
+
   function readName(pos0) {
-    // after '#' or a quote-less start: either "quoted" or ident
     if (src[i] === '"') {
       const e = src.indexOf('"', i + 1);
       if (e < 0) throw new DslError('unterminated quoted name', src, pos0);
@@ -41,11 +32,61 @@ function tokenize(src) {
     let j = i; while (j < n && ID_CH.test(src[j])) j++;
     const name = src.slice(i, j); i = j; return name;
   }
-  function readMembers(pathArr, pos0) {
-    while (src[i] === '.' && (ID_START.test(src[i + 1] || '') || src[i + 1] === '"')) { i++; pathArr.push(readName(pos0)); }
-    if (src[i] === '[') throw new DslError('array indexing is not supported in the DSL yet (use a scalar alias or keep the network raw)', src, i);
+
+  function readIndexOperand() {
+    skipWs();
+    const pos0 = i;
+    let m;
+    if ((m = /^-?\d+/.exec(src.slice(i)))) {
+      i += m[0].length;
+      return lit('DInt', m[0]);
+    }
+    if (src[i] === '#') {
+      i++;
+      const p = [readName(pos0)]; const idx = {};
+      readSubscript(p, idx, pos0);
+      readMembers(p, idx, pos0);
+      return local(p, idx);
+    }
+    if (src[i] === '"') {
+      const p = [readName(pos0)]; const idx = {};
+      readSubscript(p, idx, pos0);
+      readMembers(p, idx, pos0);
+      return global(p, idx);
+    }
+    if (ID_START.test(src[i] || '')) {
+      const p = [readName(pos0)]; const idx = {};
+      readSubscript(p, idx, pos0);
+      readMembers(p, idx, pos0);
+      return global(p, idx);
+    }
+    throw new DslError('invalid array index expression', src, i);
+  }
+
+  function readSubscript(pathArr, idxMap, pos0) {
+    if (src[i] !== '[') return;
+    const dims = [];
+    while (src[i] === '[') {
+      i++; // consume '['
+      do {
+        dims.push(readIndexOperand());
+        skipWs();
+      } while (src[i] === ',' && (i++, true));
+      if (src[i] !== ']') throw new DslError('expected "]" after array index', src, pos0);
+      i++; // consume ']'
+    }
+    idxMap[pathArr.length - 1] = dims;
+  }
+
+  function readMembers(pathArr, idxMap, pos0) {
+    while (src[i] === '.' && (ID_START.test(src[i + 1] || '') || src[i + 1] === '"')) {
+      i++;
+      pathArr.push(readName(pos0));
+      readSubscript(pathArr, idxMap, pos0);
+    }
     return pathArr;
   }
+
   while (i < n) {
     const c = src[i];
     if (/\s/.test(c)) { i++; continue; }
@@ -54,8 +95,21 @@ function tokenize(src) {
     const pos = i;
     if (c === '=' && src[i + 1] === '>') { push('=>', pos); i += 2; continue; }
     if ('(),;&|!{}='.includes(c)) { push(c, pos); i++; continue; }
-    if (c === '#') { i++; const p = [readName(pos)]; readMembers(p, pos); push('op', pos, { op: local(p) }); continue; }
-    if (c === '"') { const p = [readName(pos)]; readMembers(p, pos); push('op', pos, { op: global(p) }); continue; }
+    if (c === '#') {
+      i++;
+      const p = [readName(pos)]; const idx = {};
+      readSubscript(p, idx, pos);
+      readMembers(p, idx, pos);
+      push('op', pos, { op: local(p, idx) });
+      continue;
+    }
+    if (c === '"') {
+      const p = [readName(pos)]; const idx = {};
+      readSubscript(p, idx, pos);
+      readMembers(p, idx, pos);
+      push('op', pos, { op: global(p, idx) });
+      continue;
+    }
     if (c === '%') {
       const m = /^%([IQMiqm])([BWDbwd]?)(\d+)(?:\.([0-7]))?(?::([A-Za-z]+))?/.exec(src.slice(i));
       if (!m) throw new DslError('bad absolute address (use %I0.0, %Q0.1, %M10.0, %MW20, %QD4, %IW64:Int)', src, i);
@@ -81,8 +135,28 @@ function tokenize(src) {
       push('op', pos, { op: o }); i += m[0].length; continue;
     }
     if (ID_START.test(c)) {
-      m = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*/.exec(src.slice(i));
-      push('id', pos, { v: m[0] }); i += m[0].length; continue;
+      m = /^[A-Za-z_][A-Za-z0-9_]*/.exec(src.slice(i));
+      const head = m[0];
+      const nextCh = src[i + head.length];
+      if (nextCh === '[') {
+        i += head.length;
+        const p = [head]; const idx = {};
+        readSubscript(p, idx, pos);
+        readMembers(p, idx, pos);
+        push('op', pos, { op: global(p, idx) });
+        continue;
+      }
+      const full = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*/.exec(src.slice(i))[0];
+      if (src[i + full.length] === '[') {
+        const segs = full.split('.');
+        i += full.length;
+        const idx = {};
+        readSubscript(segs, idx, pos);
+        readMembers(segs, idx, pos);
+        push('op', pos, { op: global(segs, idx) });
+        continue;
+      }
+      push('id', pos, { v: full }); i += full.length; continue;
     }
     throw new DslError('unexpected character "' + c + '"', src, i);
   }
@@ -98,9 +172,27 @@ const mkAnd = items => {
 };
 const mkOr = items => {
   const out = [];
-  for (const it of items) { if (it.t === 'or') out.push(...it.items); else out.push(it); }
-  return out.length === 1 ? out[0] : { t: 'or', items: out };
+  for (const it of items) {
+    // A parallel branch that is always TRUE (power rail bypass) makes the whole
+    // OR TRUE. Keeping it as "TRUE | X" makes the DSL fail the exact roundtrip
+    // test and marks real TIA networks containing a bypass as READ-ONLY.
+    if (it.t === 'true') return { t: 'true' };
+    if (it.t === 'or') out.push(...it.items); else out.push(it);
+  }
+  if (out.length === 0) return { t: 'true' };
+  const uniq = [];
+  const seen = new Set();
+  for (const it of out) {
+    const k = JSON.stringify(it);
+    if (seen.has(k)) continue;
+    seen.add(k); uniq.push(it);
+  }
+  return uniq.length === 1 ? uniq[0] : { t: 'or', items: uniq };
 };
+
+function cleanTypeArg(op) {
+  return op.k === 'global' ? op.path.join('.') : text(op).replace(/^"|"$/g, '');
+}
 
 class Parser {
   constructor(src) { this.src = src; this.toks = tokenize(src); this.p = 0; }
@@ -210,7 +302,6 @@ class Parser {
     }
     this.err('expected a contact, operand or "(" but found ' + this.describe(t));
   }
-  // after '(' has been consumed; returns {pos:[P], named:{K:P}}
   parseArgsRest() {
     const args = { pos: [], named: {} };
     if (this.accept(')')) return args;
@@ -244,12 +335,15 @@ class Parser {
       case 'RTRIG': case 'FTRIG':
         if (args.pos.length !== 1) this.err(up + '(mem_bit) takes exactly 1 memory-bit operand', tok);
         return { t: up === 'RTRIG' ? 'rtrig' : 'ftrig', mem: this.needOp(args.pos[0], up + ' memory bit', tok) };
-      default: { // comparison
+      default: {
         if (args.pos.length < 2 || args.pos.length > 3) this.err(up + '(a, b[, Type]) takes 2 operands and an optional type', tok);
         const a = this.needOp(args.pos[0], up + ' first operand', tok), b = this.needOp(args.pos[1], up + ' second operand', tok);
         let type = null;
-        if (args.pos[2]) { const o = this.needOp(args.pos[2], 'type', tok); type = o.k === 'global' ? o.path.join('.') : text(o); }
-        if (args.named.TYPE || args.named.type) { const P = args.named.TYPE || args.named.type; type = text(this.needOp(P, 'type', tok)).replace(/^"|"$/g, ''); }
+        if (args.pos[2]) type = cleanTypeArg(this.needOp(args.pos[2], 'type', tok));
+        if (args.named.TYPE || args.named.type || args.named.Type) {
+          const P = args.named.TYPE || args.named.type || args.named.Type;
+          type = cleanTypeArg(this.needOp(P, 'type', tok));
+        }
         return { t: 'cmp', rel: up, a, b, type };
       }
     }
@@ -282,23 +376,54 @@ class Parser {
       if (args.pos.length < 3 || args.pos.length > 4) this.err(up + '(a, b, dst[, Type]) takes 3 operands and an optional type', tok);
       const ops = args.pos.slice(0, 3).map((P, i) => this.needOp(P, up + ' argument ' + (i + 1), tok));
       let type = null;
-      if (args.pos[3]) { const o = this.needOp(args.pos[3], 'type', tok); type = o.k === 'global' ? o.path.join('.') : text(o); }
-      const P = args.named.TYPE || args.named.type; if (P) type = text(this.needOp(P, 'type', tok));
+      if (args.pos[3]) type = cleanTypeArg(this.needOp(args.pos[3], 'type', tok));
+      const P = args.named.TYPE || args.named.type || args.named.Type;
+      if (P) type = cleanTypeArg(this.needOp(P, 'type', tok));
       return { t: 'math', fn: up, a: ops[0], b: ops[1], dst: ops[2], type };
+    }
+    if (C.UNARY_MATH[up]) {
+      if (args.pos.length < 2 || args.pos.length > 3) this.err(up + '(src, dst[, Type]) takes 2 operands and an optional type', tok);
+      const src = this.needOp(args.pos[0], up + ' input', tok);
+      const dst = this.needOp(args.pos[1], up + ' output', tok);
+      let type = null;
+      if (args.pos[2]) type = cleanTypeArg(this.needOp(args.pos[2], 'type', tok));
+      const P = args.named.TYPE || args.named.type || args.named.Type;
+      if (P) type = cleanTypeArg(this.needOp(P, 'type', tok));
+      return { t: 'unary', fn: up, src, dst, type };
+    }
+    if (C.CONV_OPS[up]) {
+      const info = C.CONV_OPS[up];
+      const needCount = info.ins.length + 1;
+      const maxCount = needCount + (info.dualType ? 2 : 1);
+      if (args.pos.length < needCount || args.pos.length > maxCount) {
+        this.err(up + '(' + [...info.ins, 'out', info.dualType ? 'SrcType, DestType' : 'Type'].join(', ') + ') wrong argument count', tok);
+      }
+      const ins = args.pos.slice(0, info.ins.length).map((P, i) => this.needOp(P, up + ' ' + info.ins[i], tok));
+      const out = this.needOp(args.pos[info.ins.length], up + ' out', tok);
+      let srcType = args.pos[needCount] ? cleanTypeArg(this.needOp(args.pos[needCount], 'SrcType', tok)) : null;
+      let destType = (info.dualType && args.pos[needCount + 1]) ? cleanTypeArg(this.needOp(args.pos[needCount + 1], 'DestType', tok)) : null;
+      for (const [k, P] of Object.entries(args.named)) {
+        const kl = k.toLowerCase();
+        if (kl === 'srctype' || kl === 'type') srcType = cleanTypeArg(this.needOp(P, k, tok));
+        else if (kl === 'desttype') destType = cleanTypeArg(this.needOp(P, k, tok));
+      }
+      return { t: 'conv', fn: up, ins, out, srcType, destType };
     }
     if (C.BOXES[up]) {
       const B = C.BOXES[up];
-      if (args.pos.length < 1) this.err(up + '(instance, ...) needs an instance operand first, e.g. ' + up + '(#T1, ' + B.posParams[0] + '=...)', tok);
+      if (args.pos.length < 1) this.err((B.partName || up) + '(instance, ...) needs an instance operand first', tok);
       const inst = this.needOp(args.pos[0], up + ' instance', tok);
       const params = {}; let type = null;
-      const allowed = new Set([...B.flowIn, ...B.valIn, ...B.valOut, ...B.boolOut]);
+      const allPins = [...B.valIn, ...(B.optIn || []), ...B.flowIn, ...B.valOut, ...B.boolOut];
+      const pinMap = new Map(allPins.map(p => [p.toUpperCase(), p]));
       if (args.pos[1]) params[B.posParams[0]] = args.pos[1];
-      if (args.pos.length > 2) this.err(up + ' takes the instance and at most one positional value (' + B.posParams[0] + '); use NAME=value for the rest', tok);
+      if (args.pos.length > 2) this.err((B.partName || up) + ' takes the instance and at most one positional value (' + B.posParams[0] + '); use NAME=value for the rest', tok);
       for (const k of Object.keys(args.named)) {
         const K = k.toUpperCase();
-        if (K === 'TYPE') { type = text(this.needOp(args.named[k], 'type', tok)); continue; }
-        if (!allowed.has(K)) this.err(up + ' has no pin "' + k + '". Pins: ' + [...allowed].join(', '), tok);
-        params[K] = args.named[k];
+        if (K === 'TYPE') { type = cleanTypeArg(this.needOp(args.named[k], 'type', tok)); continue; }
+        const canon = pinMap.get(K);
+        if (!canon) this.err((B.partName || up) + ' has no pin "' + k + '". Pins: ' + allPins.join(', '), tok);
+        params[canon] = args.named[k];
       }
       return { t: 'box', name: up, inst, params, type };
     }
@@ -360,13 +485,26 @@ function printAction(a) {
     case 'coil': s = a.kind + '(' + opT(a.op) + ')'; break;
     case 'move': s = 'MOVE(' + [a.src, ...a.dst].map(opT).join(', ') + ')'; break;
     case 'math': s = a.fn + '(' + [opT(a.a), opT(a.b), opT(a.dst)].concat(a.type ? [a.type] : []).join(', ') + ')'; break;
+    case 'unary': s = a.fn + '(' + [opT(a.src), opT(a.dst)].concat(a.type ? [a.type] : []).join(', ') + ')'; break;
+    case 'conv': {
+      const info = C.CONV_OPS[a.fn];
+      const args = [...a.ins.map(opT), opT(a.out)];
+      if (info && info.dualType) {
+        if (a.srcType || a.destType) args.push(a.srcType || info.defSrc, a.destType || info.defDest);
+      } else if (a.srcType) {
+        args.push(a.srcType);
+      }
+      s = a.fn + '(' + args.join(', ') + ')';
+      break;
+    }
     case 'box': {
       const B = C.BOXES[a.name];
-      const order = [...B.valIn, ...B.flowIn, ...B.valOut, ...B.boolOut];
+      const order = [...B.valIn, ...(B.optIn || []), ...B.flowIn, ...B.valOut, ...B.boolOut];
       const parts = [opT(a.inst)];
       for (const k of order) if (a.params[k]) parts.push(k + '=' + printParam(a.params[k]));
-      if (a.type && a.type !== B.defType) parts.push('Type=' + a.type);
-      s = a.name + '(' + parts.join(', ') + ')'; break;
+      if (a.type && B.kind !== 'motion' && a.type !== B.defType) parts.push('Type=' + a.type);
+      s = (B.partName || a.name) + '(' + parts.join(', ') + ')';
+      break;
     }
     case 'call': {
       const parts = ['"' + a.name + '"'];

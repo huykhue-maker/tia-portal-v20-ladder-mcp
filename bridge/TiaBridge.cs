@@ -29,6 +29,7 @@ namespace TiaBridge
     public static class Program
     {
         private static string PublicApiDir = @"C:\Program Files\Siemens\Automation\Portal V20\PublicAPI\V20";
+        private static string PlcsimRuntimeDir = @"C:\Program Files\Siemens\Automation\PLCSIM_V20\resources\bin\wwwroot\assets\lib\runtime";
 
         [STAThread]
         public static int Main(string[] args)
@@ -38,6 +39,12 @@ namespace TiaBridge
             {
                 PublicApiDir = envDir;
             }
+            string envSimDir = Environment.GetEnvironmentVariable("TIA_PLCSIM_RUNTIME_DIR");
+            if (!string.IsNullOrEmpty(envSimDir) && Directory.Exists(envSimDir))
+            {
+                PlcsimRuntimeDir = envSimDir;
+            }
+            PrependNativePaths();
             AppDomain.CurrentDomain.AssemblyResolve += ResolveOpennessAssembly;
 
             Console.InputEncoding = new UTF8Encoding(false);
@@ -55,6 +62,28 @@ namespace TiaBridge
             }
         }
 
+        private static void PrependNativePaths()
+        {
+            string[] extraDirs = new string[]
+            {
+                PlcsimRuntimeDir,
+                @"C:\Program Files\Siemens\Automation\PLCSIM_V20\resources\bin\wwwroot\assets\lib\vplc",
+                @"C:\Program Files\Siemens\Automation\PLCSIM_V20\resources\bin",
+                @"C:\Program Files\Common Files\Siemens\Automation\Simatic OAM\bin",
+                @"C:\Program Files\Common Files\Siemens\Automation\PlcSim"
+            };
+            string curPath = Environment.GetEnvironmentVariable("PATH") ?? "";
+            List<string> valid = new List<string>();
+            foreach (string d in extraDirs)
+            {
+                if (!string.IsNullOrEmpty(d) && Directory.Exists(d)) valid.Add(d);
+            }
+            if (valid.Count > 0)
+            {
+                Environment.SetEnvironmentVariable("PATH", string.Join(";", valid.ToArray()) + ";" + curPath);
+            }
+        }
+
         private static Assembly ResolveOpennessAssembly(object sender, ResolveEventArgs args)
         {
             AssemblyName requested = new AssemblyName(args.Name);
@@ -63,17 +92,24 @@ namespace TiaBridge
             {
                 return Assembly.LoadFrom(candidate);
             }
+            string simCandidate = Path.Combine(PlcsimRuntimeDir, requested.Name + ".dll");
+            if (File.Exists(simCandidate))
+            {
+                return Assembly.LoadFrom(simCandidate);
+            }
             return null;
         }
     }
 
-    internal class BridgeHost
+    internal partial class BridgeHost
     {
         private readonly JavaScriptSerializer _json;
         private TiaPortal _tia;
         private Project _project;
         private bool _attachedExisting;
         private string _mode = "none";
+        private readonly Dictionary<string, object> _handles = new Dictionary<string, object>();
+        private int _nextHandleId = 1;
 
         public BridgeHost()
         {
@@ -148,7 +184,8 @@ namespace TiaBridge
                 case "connect": return CmdConnect(args);
                 case "disconnect": return CmdDisconnect(args);
                 case "open_project": return CmdOpenProject(args);
-                case "save_project": return CmdSaveProject();
+                case "create_project": return CmdCreateProject(args);
+                case "save_project": return CmdSaveProject(args);
                 case "close_project": return CmdCloseProject();
                 case "list_devices": return CmdListDevices();
                 case "list_blocks": return CmdListBlocks(args);
@@ -166,6 +203,15 @@ namespace TiaBridge
                 case "list_connections": return CmdListConnections(args);
                 case "download": return CmdDownload(args);
                 case "online": return CmdOnline(args);
+                case "station_upload": return CmdStationUpload(args);
+                case "watch_table": return CmdWatchTable(args);
+                case "show_in_editor": return CmdShowInEditor(args);
+                case "scl_source": return CmdSclSource(args);
+                case "cross_reference": return CmdCrossReference(args);
+                case "hardware_config": return CmdHardwareConfig(args);
+                case "network_config": return CmdNetworkConfig(args);
+                case "plcsim_runtime": return CmdPlcsimRuntime(args);
+                case "escape_hatch": return CmdEscapeHatch(args);
                 default: throw new InvalidOperationException("Unknown bridge command: " + cmd);
             }
         }
@@ -475,13 +521,57 @@ namespace TiaBridge
                 }
             }
 
-            _project = _tia.Projects.Open(fi);
+            bool upgrade = GetBool(args, "upgrade", false);
+            _project = upgrade ? _tia.Projects.OpenWithUpgrade(fi) : _tia.Projects.Open(fi);
             return CmdStatus();
         }
 
-        private object CmdSaveProject()
+        private object CmdCreateProject(Dictionary<string, object> args)
+        {
+            string targetDir = GetStr(args, "directory", "");
+            string name = GetStr(args, "name", "");
+            if (string.IsNullOrEmpty(targetDir) || string.IsNullOrEmpty(name))
+            {
+                throw new ArgumentException("directory and name are required.");
+            }
+            if (_tia == null)
+            {
+                CmdConnect(new Dictionary<string, object> { { "mode", GetStr(args, "mode", "auto") } });
+            }
+            if (_tia.Projects.Count > 0)
+            {
+                if (GetBool(args, "closeCurrent", false))
+                {
+                    _tia.Projects[0].Close();
+                    _project = null;
+                }
+                else
+                {
+                    throw new InvalidOperationException("Another project is already open (" + _tia.Projects[0].Name + "). Pass closeCurrent:true or close it first.");
+                }
+            }
+            DirectoryInfo di = new DirectoryInfo(targetDir);
+            if (!di.Exists) di.Create();
+            _project = _tia.Projects.Create(di, name);
+            try { _project.IsSimulationDuringBlockCompilationEnabled = true; } catch { }
+            return CmdStatus();
+        }
+
+        private object CmdSaveProject(Dictionary<string, object> args)
         {
             EnsureProject();
+            string saveAsPath = GetStr(args, "saveAsDirectory", "");
+            if (!string.IsNullOrEmpty(saveAsPath))
+            {
+                DirectoryInfo di = new DirectoryInfo(saveAsPath);
+                _project.SaveAs(di);
+                return new Dictionary<string, object>
+                {
+                    { "savedAs", true },
+                    { "project", _project.Name },
+                    { "path", _project.Path != null ? _project.Path.FullName : di.FullName }
+                };
+            }
             _project.Save();
             return new Dictionary<string, object> { { "saved", true }, { "project", _project.Name } };
         }
@@ -1043,37 +1133,72 @@ namespace TiaBridge
 
             string modeName = GetStr(args, "mode", "PN/IE");
             string pcFilter = GetStr(args, "pcInterface", "PLCSIM");
+            string targetAddrStr = GetStr(args, "targetAddress", "");
             int targetIdx = GetInt(args, "targetInterfaceIndex", 0);
             bool startAfter = GetBool(args, "startAfterDownload", true);
             bool includeHardware = GetBool(args, "includeHardware", true);
 
             ConfigurationMode mode = dp.Configuration.Modes.Find(modeName);
-            if (mode == null) throw new InvalidOperationException("Connection mode '" + modeName + "' not found.");
+            if (mode == null) throw new InvalidOperationException("Connection mode '" + modeName + "' not found. Available: " + string.Join(", ", dp.Configuration.Modes.Select(m => m.Name).ToArray()));
 
             ConfigurationPcInterface pc = mode.PcInterfaces.FirstOrDefault(p => p.Name.IndexOf(pcFilter, StringComparison.OrdinalIgnoreCase) >= 0);
             if (pc == null)
             {
                 throw new InvalidOperationException("PC interface matching '" + pcFilter + "' not found. Available: " + string.Join(", ", mode.PcInterfaces.Select(x => x.Name).ToArray()));
             }
-            if (pc.TargetInterfaces.Count == 0) throw new InvalidOperationException("No target interface on " + pc.Name);
-            ConfigurationTargetInterface target = pc.TargetInterfaces[Math.Min(targetIdx, pc.TargetInterfaces.Count - 1)];
+            if (pc.TargetInterfaces.Count == 0 && pc.Subnets.Count == 0) throw new InvalidOperationException("No target interface or subnet on " + pc.Name);
+
+            IConfiguration targetCfg = null;
+            ConfigurationAddress cfgAddr = null;
+            string targetName = "";
+
+            if (pc.TargetInterfaces.Count > 0)
+            {
+                ConfigurationTargetInterface ti = pc.TargetInterfaces[Math.Min(targetIdx, pc.TargetInterfaces.Count - 1)];
+                targetCfg = ti;
+                targetName = ti.Name;
+                if (!string.IsNullOrEmpty(targetAddrStr))
+                {
+                    cfgAddr = ti.Addresses.Find(targetAddrStr) ?? ti.Addresses.Create(targetAddrStr);
+                }
+            }
+            else if (pc.Subnets.Count > 0)
+            {
+                // ConfigurationSubnet is not an IConfiguration in the V20 Openness API, so it
+                // cannot be passed to DownloadProvider.Download. Resolve the address for logging
+                // and fall back to the first target interface when the mode exposes one.
+                ConfigurationSubnet sub = pc.Subnets[0];
+                targetName = sub.Name;
+                if (!string.IsNullOrEmpty(targetAddrStr))
+                {
+                    cfgAddr = sub.Addresses.Find(targetAddrStr) ?? sub.Addresses.Create(targetAddrStr);
+                }
+                if (pc.TargetInterfaces.Count > 0) targetCfg = pc.TargetInterfaces[0];
+                else throw new InvalidOperationException("Download through a subnet-only PC interface ('" + pc.Name + "') is not supported by TIA Openness V20. Select a PN/IE target interface instead.");
+            }
 
             List<string> log = new List<string>();
             DownloadConfigurationDelegate pre = delegate(DownloadConfiguration cfg)
             {
-                log.Add("pre: " + cfg.GetType().Name);
+                log.Add("pre: " + cfg.GetType().Name + " (" + cfg.Message + ")");
                 StopModules sm = cfg as StopModules;
                 if (sm != null) { sm.CurrentSelection = StopModulesSelections.StopAll; return; }
                 ConsistentBlocksDownload cb = cfg as ConsistentBlocksDownload;
                 if (cb != null) { cb.CurrentSelection = ConsistentBlocksDownloadSelections.ConsistentDownload; return; }
                 AllBlocksDownload ab = cfg as AllBlocksDownload;
                 if (ab != null) { ab.CurrentSelection = AllBlocksDownloadSelections.DownloadAllBlocks; return; }
+                OverwriteSystemData osd = cfg as OverwriteSystemData;
+                if (osd != null) { osd.CurrentSelection = OverwriteSystemDataSelections.Overwrite; return; }
+                AlarmTextLibrariesDownload atl = cfg as AlarmTextLibrariesDownload;
+                if (atl != null) { atl.CurrentSelection = AlarmTextLibrariesDownloadSelections.ConsistentDownload; return; }
                 CheckBeforeDownload chk = cfg as CheckBeforeDownload;
                 if (chk != null) { chk.Checked = true; return; }
+                DifferentTargetConfiguration dtc = cfg as DifferentTargetConfiguration;
+                if (dtc != null) { dtc.CurrentSelection = DifferentTargetConfigurationSelections.AcceptAll; return; }
             };
             DownloadConfigurationDelegate post = delegate(DownloadConfiguration cfg)
             {
-                log.Add("post: " + cfg.GetType().Name);
+                log.Add("post: " + cfg.GetType().Name + " (" + cfg.Message + ")");
                 StartModules st = cfg as StartModules;
                 if (st != null)
                 {
@@ -1082,14 +1207,17 @@ namespace TiaBridge
             };
 
             DownloadOptions opts = includeHardware ? (DownloadOptions.Hardware | DownloadOptions.Software) : DownloadOptions.Software;
-            DownloadResult res = dp.Download(target, pre, post, opts);
+            DownloadResult res = cfgAddr != null
+                ? dp.Download(targetCfg, cfgAddr, pre, post, opts)
+                : dp.Download(targetCfg, pre, post, opts);
             List<object> msgs = new List<object>();
             CollectDownloadMessages(res.Messages, msgs);
             return new Dictionary<string, object>
             {
                 { "plc", plc.CpuItem.Name },
                 { "pcInterface", pc.Name },
-                { "targetInterface", target.Name },
+                { "targetInterface", targetName },
+                { "targetAddress", targetAddrStr },
                 { "state", res.State.ToString() },
                 { "errorCount", res.ErrorCount },
                 { "warningCount", res.WarningCount },

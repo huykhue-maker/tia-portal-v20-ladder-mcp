@@ -1,12 +1,22 @@
 'use strict';
-// SimaticML FlgNet XML -> Ladder AST (+ canonical DSL).  The graph (Parts + Wires) is converted into
-// series/parallel condition trees and action chains.  Anything that cannot be expressed faithfully
-// is reported in `notes` and makes the network non-editable (it is then preserved untouched).
+// SimaticML FlgNet XML -> Ladder AST (+ canonical DSL).  Handles TIA V20 <Part Name="O"> OR gates,
+// array subscript <Access>, unary/trig math, conversions/scaling, and Motion Control technology boxes.
 
 const X = require('./xml');
 const C = require('./catalog');
 const O = require('./operand');
 const D = require('./dsl');
+
+function readComponents(comps, notes) {
+  const path = [];
+  const idx = {};
+  comps.forEach((c, i) => {
+    path.push(c.attrs.Name);
+    const accs = X.kids(c, 'Access');
+    if (accs.length) idx[i] = accs.map(a => readOperand(a, notes));
+  });
+  return { path, idx };
+}
 
 function readOperand(el, notes) {
   const scope = el.attrs.Scope;
@@ -14,10 +24,9 @@ function readOperand(el, notes) {
   if (sym) {
     const comps = X.kids(sym, 'Component');
     if (comps.length) {
-      const path = comps.map(c => c.attrs.Name);
-      if (comps.some(c => X.kid(c, 'Access'))) { notes.push('array index access on ' + path.join('.')); return { k: 'raw', value: path.join('.') + '[...]' }; }
+      const { path, idx } = readComponents(comps, notes);
       if (X.kids(sym, 'Address').length || X.kids(sym, 'AbsoluteOffset').length) notes.push('mixed symbolic/absolute access');
-      return (scope === 'LocalVariable' || scope === 'LocalConstant') ? O.local(path) : O.global(path);
+      return (scope === 'LocalVariable' || scope === 'LocalConstant') ? O.local(path, idx) : O.global(path, idx);
     }
   }
   const addr = X.kid(el, 'Address');
@@ -34,10 +43,11 @@ function readOperand(el, notes) {
   notes.push('unsupported access scope ' + scope);
   return { k: 'raw', value: '<' + scope + '>' };
 }
-function instOperand(inst) {
-  const path = X.kids(inst, 'Component').map(c => c.attrs.Name);
-  if (!path.length) return { k: 'raw', value: '<instance>' };
-  return inst.attrs.Scope === 'LocalVariable' ? O.local(path) : O.global(path);
+function instOperand(inst, notes) {
+  const comps = X.kids(inst, 'Component');
+  if (!comps.length) return { k: 'raw', value: '<instance>' };
+  const { path, idx } = readComponents(comps, notes || []);
+  return inst.attrs.Scope === 'LocalVariable' ? O.local(path, idx) : O.global(path, idx);
 }
 
 const andItems = n => (n.t === 'and' ? n.items : n.t === 'true' ? [] : [n]);
@@ -87,12 +97,12 @@ function readFlgNet(flg, opts) {
         uid, kind: 'part', name: el.attrs.Name, version: el.attrs.Version,
         templates: X.kids(el, 'TemplateValue').map(t => ({ name: t.attrs.Name, type: t.attrs.Type, value: X.textOf(t) })),
         negated: new Set(X.kids(el, 'Negated').map(n => n.attrs.Name)),
-        inst: inst ? instOperand(inst) : null,
+        inst: inst ? instOperand(inst, notes) : null,
       });
     } else if (el.name === 'Call') {
       const ci = X.kid(el, 'CallInfo'); const inst = ci && X.kid(ci, 'Instance');
       parts.set(uid, {
-        uid, kind: 'call', name: ci ? ci.attrs.Name : '?', blockType: ci ? ci.attrs.BlockType : 'FC', inst: inst ? instOperand(inst) : null,
+        uid, kind: 'call', name: ci ? ci.attrs.Name : '?', blockType: ci ? ci.attrs.BlockType : 'FC', inst: inst ? instOperand(inst, notes) : null,
         params: ci ? X.kids(ci, 'Parameter').map(p => ({ name: p.attrs.Name, section: p.attrs.Section, type: p.attrs.Type })) : [],
       });
     }
@@ -105,7 +115,8 @@ function readFlgNet(flg, opts) {
       if (m.name === 'Powerrail') net.members.push({ k: 'pwr' });
       else if (m.name === 'NameCon') net.members.push({ k: 'name', uid: m.attrs.UId, pin: m.attrs.Name });
       else if (m.name === 'IdentCon') net.members.push({ k: 'ident', uid: m.attrs.UId });
-      else { net.members.push({ k: 'open' }); notes.push('open/unfinished connection'); }
+      else if (m.name === 'OpenCon') net.members.push({ k: 'open' });
+      else { net.members.push({ k: 'open' }); notes.push('unknown wire connection ' + m.name); }
     }
     const idx = nets.push(net) - 1;
     for (const m of net.members) if (m.k === 'name') pinNet.set(m.uid + ':' + m.pin, idx);
@@ -117,7 +128,7 @@ function readFlgNet(flg, opts) {
       const p = part.params.find(x => x.name === pin);
       return p ? (p.section === 'Output' || p.section === 'Return') : C.isOutputPin(pin);
     }
-    return C.isOutputPin(pin);
+    return C.isOutputPin(pin, part.name);
   };
   const netOf = (uid, pin) => pinNet.get(uid + ':' + pin);
 
@@ -131,7 +142,7 @@ function readFlgNet(flg, opts) {
     const src = net.members.find(m => m.k === 'name' && isOut(parts.get(m.uid), m.pin) && !(m.uid === uid && m.pin === pin));
     if (src) {
       const sp = parts.get(src.uid);
-      if (sp && sp.inst) return sp.inst.k === 'raw' ? sp.inst : { k: sp.inst.k, path: [...sp.inst.path, src.pin] };
+      if (sp && sp.inst) return sp.inst.k === 'raw' ? sp.inst : { k: sp.inst.k, path: [...sp.inst.path, src.pin], idx: sp.inst.idx };
       notes.push('value wired directly between boxes (' + (sp ? sp.name : '?') + '#' + src.uid + '.' + src.pin + ')');
       return { k: 'raw', value: '<' + (sp ? sp.name : '?') + '#' + src.uid + '.' + src.pin + '>' };
     }
@@ -159,7 +170,18 @@ function readFlgNet(flg, opts) {
     if (outMemo.has(key)) return outMemo.get(key);
     const part = parts.get(uid);
     let res;
-    if (part && part.kind === 'part' && C.PART_KIND[part.name] === 'cond' && pin === 'out') {
+    if (part && part.kind === 'part' && part.name === 'O' && pin === 'out') {
+      const branches = [];
+      const card = parseInt(tpl(part, 'Card') || '0', 10);
+      const maxIn = Math.max(card, 16);
+      for (let i = 1; i <= maxIn; i++) {
+        const fin = netOf(uid, 'in' + i);
+        if (fin === undefined) { if (i > card) break; continue; }
+        const bSig = netSignal(fin);
+        if (bSig.t !== 'open') branches.push(bSig);
+      }
+      res = branches.length === 0 ? { t: 'open' } : mkOrFactored(branches);
+    } else if (part && part.kind === 'part' && C.PART_KIND[part.name] === 'cond' && pin === 'out') {
       const fin = netOf(uid, C.COND_FLOW_IN[part.name]);
       const inExpr = fin === undefined ? { t: 'open' } : netSignal(fin);
       res = mkAnd([inExpr, condNode(part)]);
@@ -200,14 +222,16 @@ function readFlgNet(flg, opts) {
   }
   function mainFlow(part) {
     if (part.kind === 'call') return 'en';
-    if (C.BOXES[part.name]) return C.BOXES[part.name].main;
+    const bk = C.BOX_FROM_PART[part.name];
+    if (bk) return C.BOXES[bk].main;
     if (C.ACTION_FLOW_IN[part.name]) return C.ACTION_FLOW_IN[part.name];
     return ['in', 'en', 'IN', 'pre'].find(p => netOf(part.uid, p) !== undefined) || 'in';
   }
   function flowOutPin(part) {
     if (part.kind === 'call') return 'eno';
-    if (C.BOXES[part.name]) return C.BOXES[part.name].flowOut;
-    if (['Move', 'Add', 'Sub', 'Mul', 'Div', 'Mod'].includes(part.name)) return 'eno';
+    const bk = C.BOX_FROM_PART[part.name];
+    if (bk) return C.BOXES[bk].flowOut;
+    if (part.name === 'Move' || C.MATH_FROM_PART[part.name] || C.UNARY_FROM_PART[part.name] || C.CONV_FROM_PART[part.name]) return 'eno';
     return null;
   }
   function buildAction(part) {
@@ -226,7 +250,10 @@ function readFlgNet(flg, opts) {
       case 'RCoil': return { t: 'coil', kind: 'RESET', op: dataOperand(u, 'operand') || { k: 'raw', value: '?' } };
       case 'Move': {
         const dst = [];
-        for (let i = 1; netOf(u, 'out' + i) !== undefined; i++) dst.push(dataOperand(u, 'out' + i) || { k: 'raw', value: '?' });
+        for (let i = 1; netOf(u, 'out' + i) !== undefined; i++) {
+          const d = dataOperand(u, 'out' + i);
+          if (d) dst.push(d);
+        }
         if (!dst.length) notes.push('MOVE without destination');
         return { t: 'move', src: dataOperand(u, 'in') || { k: 'raw', value: '?' }, dst };
       }
@@ -236,13 +263,24 @@ function readFlgNet(flg, opts) {
       if (netOf(u, 'in3') !== undefined) notes.push(part.name + ' with more than 2 inputs');
       return { t: 'math', fn: C.MATH_FROM_PART[part.name], a: dataOperand(u, 'in1') || { k: 'raw', value: '?' }, b: dataOperand(u, 'in2') || { k: 'raw', value: '?' }, dst: dataOperand(u, 'out') || { k: 'raw', value: '?' }, type: tpl(part, 'SrcType') };
     }
-    const B = C.BOXES[part.name];
-    if (B) {
+    if (C.UNARY_FROM_PART[part.name]) {
+      return { t: 'unary', fn: C.UNARY_FROM_PART[part.name], src: dataOperand(u, 'in') || { k: 'raw', value: '?' }, dst: dataOperand(u, 'out') || { k: 'raw', value: '?' }, type: tpl(part, 'SrcType') };
+    }
+    if (C.CONV_FROM_PART[part.name]) {
+      const fn = C.CONV_FROM_PART[part.name];
+      const info = C.CONV_OPS[fn];
+      const ins = info.ins.map(pin => dataOperand(u, pin) || { k: 'raw', value: '?' });
+      const out = dataOperand(u, 'out') || { k: 'raw', value: '?' };
+      return { t: 'conv', fn, ins, out, srcType: tpl(part, 'SrcType'), destType: tpl(part, 'DestType') };
+    }
+    const bk = C.BOX_FROM_PART[part.name];
+    if (bk) {
+      const B = C.BOXES[bk];
       const params = {};
-      for (const k of B.valIn) { const P = paramFrom(u, k, 'val'); if (P) params[k] = P; }
+      for (const k of [...B.valIn, ...(B.optIn || [])]) { const P = paramFrom(u, k, 'val'); if (P) params[k] = P; }
       for (const k of B.flowIn) { const P = paramFrom(u, k, 'flow'); if (P) params[k] = P; }
       for (const k of [...B.valOut, ...B.boolOut]) { const P = paramFrom(u, k, 'out'); if (P) params[k] = P; }
-      return { t: 'box', name: part.name, inst: part.inst || { k: 'raw', value: '?' }, params, type: tpl(part, 'value_type') || (B.kind === 'timer' ? 'Time' : 'Int') };
+      return { t: 'box', name: bk, inst: part.inst || { k: 'raw', value: '?' }, params, type: tpl(part, 'value_type') || (B.kind === 'timer' ? 'Time' : (B.kind === 'motion' ? 'Void' : 'Int')) };
     }
     notes.push('unsupported instruction ' + part.name);
     return { t: 'raw', label: part.name + '#' + u };
@@ -284,7 +322,6 @@ function readFlgNet(flg, opts) {
     }
     rungs.push(f);
   }
-  // actions whose parent is missing/invalid were rooted already; clean helper field
   const strip = f => { delete f.min; for (const a of f.then) for (const n of (a.next || [])) strip(n); };
   rungs.forEach(strip);
   const uniqNotes = [...new Set(notes)];
