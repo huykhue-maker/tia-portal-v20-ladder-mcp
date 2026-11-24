@@ -1,0 +1,26 @@
+# Build outputs (TiaBridge.exe can be built anytime via build.ps1)
+bridge/TiaBridge.exe
+bridge/*.pdb
+
+# Personal project backups and temporary exports
+backups/*
+!backups/.gitkeep
+exports/*
+!exports/.gitkeep
+
+# Siemens TIA Portal project files
+*.ap*
+*.zap*
+*.lck
+*.lock
+*.tmp
+
+# Node.js
+node_modules/
+npm-debug.log*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/

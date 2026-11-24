@@ -1,0 +1,25 @@
+{
+  "name": "tia-portal-v20-ladder-mcp",
+  "version": "1.0.0",
+  "description": "Model Context Protocol (MCP) Server for Siemens TIA Portal V20, specialized exclusively for Ladder Logic (LAD).",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "test": "node tests/run_all.js",
+    "build": "powershell -ExecutionPolicy Bypass -File build.ps1"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "siemens",
+    "tia-portal",
+    "tia-portal-v20",
+    "ladder",
+    "lad",
+    "plc",
+    "s7-1200",
+    "s7-1500"
+  ],
+  "author": "huykhue-maker",
+  "license": "MIT"
+}
