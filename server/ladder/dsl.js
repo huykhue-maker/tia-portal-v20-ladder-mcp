@@ -220,7 +220,8 @@ class Parser {
     if (t.t === 'id') {
       const up = t.v.toUpperCase(), paren = this.peek(1).t === '(';
       if (paren) return C.COND_FUNCS.has(up);
-      return up === 'NOT' || up === 'TRUE' || !C.ACTION_FUNCS.has(up);
+      // Actions always require "("; any bare identifier (even if named LIMIT/MIN/MAX/SIN) is a condition operand.
+      return true;
     }
     return false;
   }

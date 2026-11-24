@@ -129,6 +129,7 @@ class Gen {
       case 'true': return srcs;
       case 'and': { let cur = srcs; for (const it of n.items) cur = this.cond(it, cur); return cur; }
       case 'or': {
+        if (n.items.some(it => it.t === 'true')) return srcs;
         const outs = [];
         for (const it of n.items) {
           const branchOuts = this.cond(it, srcs);
@@ -221,15 +222,17 @@ class Gen {
       }
       case 'conv': {
         const info = C.CONV_OPS[a.fn];
-        const srcType = this.inferType(a.ins, a.srcType, a.fn, info.defSrc);
-        const destType = info.dualType ? this.inferType([a.out], a.destType, a.fn, info.defDest) : srcType;
+        const srcOps = a.fn === 'SCALE_X' ? [a.ins[1]] : a.ins;
+        const destOps = a.fn === 'SCALE_X' ? [a.out, a.ins[0], a.ins[2]] : [a.out];
+        const srcType = this.inferType(srcOps, a.srcType, a.fn, info.defSrc);
+        const destType = info.dualType ? this.inferType(destOps, a.destType, a.fn, info.defDest) : srcType;
         const uid = this.addPart(info.part, {
           version: C.versionFor(info.part, this.ctx.learned),
           templates: C.templatesFor(info.part, { type: srcType, destType }, this.ctx.learned),
         });
         this.connect(srcs, this.pin(uid, 'en', 'dst'));
         info.ins.forEach((pinName, i) => {
-          const hint = (a.fn === 'NORM_X' || a.fn === 'SCALE_X') && pinName !== 'value' ? (a.fn === 'SCALE_X' ? destType : srcType) : srcType;
+          const hint = a.fn === 'SCALE_X' && pinName !== 'value' ? destType : srcType;
           this.bind(a.ins[i], this.pin(uid, pinName, 'dst'), 'read', hint);
         });
         this.bind(a.out, this.pin(uid, 'out', 'src'), 'write');

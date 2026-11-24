@@ -11,23 +11,30 @@ const MATH = { ADD: 'Add', SUB: 'Sub', MUL: 'Mul', DIV: 'Div', MOD: 'Mod', MIN: 
 const MATH_FROM_PART = { Add: 'ADD', Sub: 'SUB', Mul: 'MUL', Div: 'DIV', Mod: 'MOD', Min: 'MIN', Max: 'MAX' };
 const MATH_SYM = { ADD: '+', SUB: '-', MUL: '*', DIV: '/', MOD: 'MOD', MIN: 'MIN', MAX: 'MAX' };
 
-// Unary math & trig: FN(in, out[, Type]) -> <Part Name="..."><TemplateValue Name="SrcType" Type="Type">...</TemplateValue></Part>
+// Unary math & trig (single SrcType): FN(in, out[, Type])
 const UNARY_MATH = {
   SIN: 'Sin', COS: 'Cos', TAN: 'Tan', ASIN: 'ASin', ACOS: 'ACos', ATAN: 'ATan',
   SQRT: 'Sqrt', SQR: 'Sqr', ABS: 'Abs', EXP: 'Exp', LN: 'Ln',
-  TRUNC: 'Trunc', ROUND: 'Round', CEIL: 'Ceil', FLOOR: 'Floor',
 };
 const UNARY_FROM_PART = {};
 for (const [k, v] of Object.entries(UNARY_MATH)) UNARY_FROM_PART[v] = k;
 
-// Conversion & scaling instructions
+// Conversion, rounding & scaling instructions (dualType parts emit both SrcType and DestType in SimaticML)
 const CONV_OPS = {
   CONV: { part: 'Convert', ins: ['in'], outs: ['out'], dualType: true, defSrc: 'Int', defDest: 'Real' },
+  TRUNC: { part: 'Trunc', ins: ['in'], outs: ['out'], dualType: true, defSrc: 'Real', defDest: 'DInt' },
+  ROUND: { part: 'Round', ins: ['in'], outs: ['out'], dualType: true, defSrc: 'Real', defDest: 'DInt' },
+  CEIL: { part: 'Ceil', ins: ['in'], outs: ['out'], dualType: true, defSrc: 'Real', defDest: 'DInt' },
+  FLOOR: { part: 'Floor', ins: ['in'], outs: ['out'], dualType: true, defSrc: 'Real', defDest: 'DInt' },
   NORM_X: { part: 'Normalize', ins: ['min', 'value', 'max'], outs: ['out'], dualType: true, defSrc: 'Int', defDest: 'Real' },
   SCALE_X: { part: 'Scale_X', ins: ['min', 'value', 'max'], outs: ['out'], dualType: true, defSrc: 'Real', defDest: 'Real' },
   LIMIT: { part: 'Limit', ins: ['mn', 'in', 'mx'], outs: ['out'], dualType: false, defSrc: 'Real' },
 };
-const CONV_FROM_PART = {};
+const CONV_FROM_PART = {
+  Norm_X: 'NORM_X',
+  Scale: 'SCALE_X',
+  ScaleX: 'SCALE_X',
+};
 for (const [k, v] of Object.entries(CONV_OPS)) CONV_FROM_PART[v.part] = k;
 
 const COILS = {
@@ -119,7 +126,7 @@ const PART_KIND = {
   TON: 'action', TOF: 'action', TP: 'action', TONR: 'action', CTU: 'action', CTD: 'action', CTUD: 'action',
 };
 for (const part of Object.values(UNARY_MATH)) PART_KIND[part] = 'action';
-for (const info of Object.values(CONV_OPS)) PART_KIND[info.part] = 'action';
+for (const part of Object.keys(CONV_FROM_PART)) PART_KIND[part] = 'action';
 for (const info of Object.values(BOXES)) PART_KIND[info.partName || ''] = 'action';
 delete PART_KIND[''];
 
@@ -129,10 +136,10 @@ const ACTION_FLOW_IN = {
   Add: 'en', Sub: 'en', Mul: 'en', Div: 'en', Mod: 'en', Min: 'en', Max: 'en',
 };
 for (const part of Object.values(UNARY_MATH)) ACTION_FLOW_IN[part] = 'en';
-for (const info of Object.values(CONV_OPS)) ACTION_FLOW_IN[info.part] = 'en';
+for (const part of Object.keys(CONV_FROM_PART)) ACTION_FLOW_IN[part] = 'en';
 
 // Default XML templates (overridable by learned data)
-// Note: In TIA Portal V20, Sub/Div/Mod do NOT take a Card template (only Add, Mul, Min, Max, Move, O do).
+// Note: In TIA Portal V20, Sub/Div/Mod/Limit/Convert/Round/Trunc/Ceil/Floor/Unary do NOT take a Card template (only Add, Mul, Min, Max, Move, O do).
 const DEFAULT_TEMPLATES = {
   O: [['Card', 'Cardinality']],
   Eq: [['SrcType', 'Type']], Ne: [['SrcType', 'Type']], Gt: [['SrcType', 'Type']], Lt: [['SrcType', 'Type']], Ge: [['SrcType', 'Type']], Le: [['SrcType', 'Type']],
@@ -145,6 +152,10 @@ const DEFAULT_TEMPLATES = {
   Min: [['Card', 'Cardinality'], ['SrcType', 'Type']],
   Max: [['Card', 'Cardinality'], ['SrcType', 'Type']],
   Convert: [['SrcType', 'Type'], ['DestType', 'DestType']],
+  Trunc: [['SrcType', 'Type'], ['DestType', 'DestType']],
+  Round: [['SrcType', 'Type'], ['DestType', 'DestType']],
+  Ceil: [['SrcType', 'Type'], ['DestType', 'DestType']],
+  Floor: [['SrcType', 'Type'], ['DestType', 'DestType']],
   Normalize: [['SrcType', 'Type'], ['DestType', 'DestType']],
   Scale_X: [['SrcType', 'Type'], ['DestType', 'DestType']],
   Limit: [['SrcType', 'Type']],
@@ -159,20 +170,25 @@ const DEFAULT_VERSION = {
 };
 
 // Parts that never carry a Card template in TIA Portal V20 FlgNet.
-// Sub/Div/Mod are fixed 2-input boxes; emitting Card makes the import fail.
-const NO_CARD_PARTS = new Set(['Sub', 'Div', 'Mod']);
+// Emitting Card on fixed-arity boxes makes TIA Portal XML import fail.
+const NO_CARD_PARTS = new Set([
+  'Sub', 'Div', 'Mod',
+  ...Object.values(UNARY_MATH),
+  ...Object.values(CONV_OPS).map(info => info.part),
+]);
+const DUAL_TYPE_PARTS = new Set(Object.values(CONV_OPS).filter(info => info.dualType).map(info => info.part));
 
 function templatesFor(partName, ctx, learned) {
   const L = learned && learned.parts && learned.parts[partName];
   let defs;
   if (L && L.templates && L.templates.length) {
     // Mirror what this TIA installation really writes, but never propagate a
-    // Card template onto fixed-arity Sub/Div/Mod parts (a learned Card there
-    // is a stale signature and breaks XML import).
+    // Card template onto fixed-arity parts (a stale learned Card breaks XML import).
     defs = L.templates
       .filter(t => !(NO_CARD_PARTS.has(partName) && t.name === 'Card'))
       .map(t => [t.name, t.type, t.value]);
     if (NO_CARD_PARTS.has(partName) && !defs.some(d => d[0] === 'SrcType')) defs.push(['SrcType', 'Type']);
+    if (DUAL_TYPE_PARTS.has(partName) && !defs.some(d => d[0] === 'DestType')) defs.push(['DestType', 'DestType']);
   } else {
     defs = DEFAULT_TEMPLATES[partName] || [];
   }

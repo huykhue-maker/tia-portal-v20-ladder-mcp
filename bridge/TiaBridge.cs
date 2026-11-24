@@ -484,6 +484,7 @@ namespace TiaBridge
                 catch { }
                 _tia = null;
                 _project = null;
+                _handles.Clear();
                 _mode = "none";
                 _attachedExisting = false;
             }
@@ -514,6 +515,7 @@ namespace TiaBridge
                 {
                     existing.Close();
                     _project = null;
+                    _handles.Clear();
                 }
                 else
                 {
@@ -544,6 +546,7 @@ namespace TiaBridge
                 {
                     _tia.Projects[0].Close();
                     _project = null;
+                    _handles.Clear();
                 }
                 else
                 {
@@ -582,6 +585,7 @@ namespace TiaBridge
             string name = _project.Name;
             _project.Close();
             _project = null;
+            _handles.Clear();
             return new Dictionary<string, object> { { "closed", true }, { "project", name } };
         }
 
@@ -1113,11 +1117,14 @@ namespace TiaBridge
                 {
                     List<string> targets = new List<string>();
                     foreach (ConfigurationTargetInterface ti in pc.TargetInterfaces) targets.Add(ti.Name);
+                    List<string> subnets = new List<string>();
+                    foreach (ConfigurationSubnet sub in pc.Subnets) subnets.Add(sub.Name);
                     pcs.Add(new Dictionary<string, object>
                     {
                         { "name", pc.Name },
                         { "number", pc.Number },
-                        { "targetInterfaces", targets }
+                        { "targetInterfaces", targets },
+                        { "subnets", subnets }
                     });
                 }
                 modes.Add(new Dictionary<string, object> { { "name", mode.Name }, { "pcInterfaces", pcs } });

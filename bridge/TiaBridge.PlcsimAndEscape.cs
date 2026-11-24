@@ -25,9 +25,23 @@ namespace TiaBridge
         private string RegisterHandle(object obj)
         {
             if (obj == null) return null;
+            List<string> dead = null;
             foreach (KeyValuePair<string, object> kv in _handles)
             {
-                if ( object.ReferenceEquals(kv.Value, obj) || kv.Value.Equals(obj) ) return kv.Key;
+                if (object.ReferenceEquals(kv.Value, obj)) return kv.Key;
+                try
+                {
+                    if (kv.Value != null && kv.Value.Equals(obj)) return kv.Key;
+                }
+                catch
+                {
+                    if (dead == null) dead = new List<string>();
+                    dead.Add(kv.Key);
+                }
+            }
+            if (dead != null)
+            {
+                foreach (string k in dead) _handles.Remove(k);
             }
             string id = "obj:" + (_nextHandleId++);
             _handles[id] = obj;
@@ -102,9 +116,31 @@ namespace TiaBridge
             return rawVal;
         }
 
+        private static Device FindDeviceByName(DeviceUserGroup grp, string name)
+        {
+            if (grp == null) return null;
+            foreach (Device d in grp.Devices)
+            {
+                if (string.Equals(d.Name, name, StringComparison.OrdinalIgnoreCase)) return d;
+            }
+            foreach (DeviceUserGroup sub in grp.Groups)
+            {
+                Device found = FindDeviceByName(sub, name);
+                if (found != null) return found;
+            }
+            return null;
+        }
+
         private object ResolveTargetObject(Dictionary<string, object> args)
         {
             string target = GetStr(args, "target", "project").Trim();
+            if (target.StartsWith("obj:", StringComparison.OrdinalIgnoreCase))
+            {
+                int spIdx = target.IndexOf(' ');
+                string key = spIdx > 0 ? target.Substring(0, spIdx) : target;
+                if (_handles.ContainsKey(key)) return _handles[key];
+                throw new InvalidOperationException("Object handle '" + key + "' not found or already released.");
+            }
             if (_handles.ContainsKey(target)) return _handles[target];
             if (string.Equals(target, "tia", StringComparison.OrdinalIgnoreCase)) { EnsureConnected(); return _tia; }
             if (string.Equals(target, "project", StringComparison.OrdinalIgnoreCase)) { EnsureProject(); return _project; }
@@ -113,23 +149,34 @@ namespace TiaBridge
             string kind = (colon >= 0 ? target.Substring(0, colon) : target).ToLowerInvariant();
             string arg = colon >= 0 ? target.Substring(colon + 1) : "";
 
-            PlcTarget plc = ResolvePlc(args);
+            if (kind == "device" && !string.IsNullOrEmpty(arg))
+            {
+                EnsureProject();
+                Device d = _project.Devices.FirstOrDefault(x => string.Equals(x.Name, arg, StringComparison.OrdinalIgnoreCase));
+                if (d == null)
+                {
+                    foreach (DeviceUserGroup grp in _project.DeviceGroups)
+                    {
+                        d = FindDeviceByName(grp, arg);
+                        if (d != null) break;
+                    }
+                }
+                if (d == null) throw new InvalidOperationException("Device '" + arg + "' not found.");
+                return d;
+            }
+
+            PlcTarget plc = (kind == "plc" || kind == "cpu" || kind == "software") && !string.IsNullOrEmpty(arg)
+                ? ResolvePlc(new Dictionary<string, object> { { "plcName", arg } })
+                : ResolvePlc(args);
+
             switch (kind)
             {
                 case "plc":
                 case "cpu":
-                    if (!string.IsNullOrEmpty(arg)) plc = ResolvePlc(new Dictionary<string, object> { { "plcName", arg } });
                     return plc.CpuItem;
                 case "device":
-                    if (!string.IsNullOrEmpty(arg))
-                    {
-                        EnsureProject();
-                        Device d = _project.Devices.FirstOrDefault(x => string.Equals(x.Name, arg, StringComparison.OrdinalIgnoreCase));
-                        if (d != null) return d;
-                    }
                     return plc.Device;
                 case "software":
-                    if (!string.IsNullOrEmpty(arg)) plc = ResolvePlc(new Dictionary<string, object> { { "plcName", arg } });
                     return plc.Software;
                 case "block":
                     PlcBlockGroup bOwner;
@@ -270,20 +317,44 @@ namespace TiaBridge
 
                 if (!string.IsNullOrEmpty(attr))
                 {
+                    Exception attrErr = null;
                     if (eobj != null)
                     {
-                        try { return new Dictionary<string, object> { { "handle", handle }, { "attribute", attr }, { "value", FormatSimpleValue(eobj.GetAttribute(attr)) } }; }
-                        catch { }
+                        try
+                        {
+                            object attrVal = eobj.GetAttribute(attr);
+                            Dictionary<string, object> res = new Dictionary<string, object>
+                            {
+                                { "handle", handle },
+                                { "attribute", attr },
+                                { "value", FormatSimpleValue(attrVal) }
+                            };
+                            if (attrVal != null && !IsSimpleType(attrVal.GetType()) && !(attrVal is byte[]) && !(attrVal is string[]))
+                            {
+                                res["valueHandle"] = RegisterHandle(attrVal);
+                            }
+                            return res;
+                        }
+                        catch (Exception ex) { attrErr = ex; }
                     }
                     PropertyInfo pi = obj.GetType().GetProperty(attr, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
-                    if (pi == null) throw new InvalidOperationException("Attribute or property '" + attr + "' not found on " + obj.GetType().Name);
+                    if (pi == null)
+                    {
+                        string detail = attrErr != null ? " (Openness error: " + attrErr.Message + ")" : "";
+                        throw new InvalidOperationException("Attribute or property '" + attr + "' not found on " + obj.GetType().Name + detail);
+                    }
                     object val = pi.GetValue(obj, null);
-                    return new Dictionary<string, object>
+                    Dictionary<string, object> propRes = new Dictionary<string, object>
                     {
                         { "handle", handle },
                         { "property", pi.Name },
-                        { "value", IsSimpleType(val != null ? val.GetType() : typeof(string)) ? FormatSimpleValue(val) : RegisterHandle(val) }
+                        { "value", FormatSimpleValue(val) }
                     };
+                    if (val != null && !IsSimpleType(val.GetType()) && !(val is byte[]) && !(val is string[]))
+                    {
+                        propRes["valueHandle"] = RegisterHandle(val);
+                    }
+                    return propRes;
                 }
 
                 if (!string.IsNullOrEmpty(compName) && eobj != null)
@@ -338,6 +409,10 @@ namespace TiaBridge
                 if (!string.IsNullOrEmpty(singleAttr) && args.ContainsKey("value"))
                 {
                     attrs[singleAttr] = args["value"];
+                }
+                if (attrs.Count == 0)
+                {
+                    throw new ArgumentException("Provide 'attributes' dictionary or 'attribute' + 'value' for escape_hatch set.");
                 }
                 List<string> updated = new List<string>();
                 foreach (KeyValuePair<string, object> kv in attrs)
@@ -681,7 +756,8 @@ namespace TiaBridge
 
             if (action == "read")
             {
-                if (GetBool(args, "refreshTagList", false)) targetInst.UpdateTagList(ETagListDetails.IOMCTDB, false);
+                bool refreshed = GetBool(args, "refreshTagList", false);
+                if (refreshed) targetInst.UpdateTagList(ETagListDetails.IOMCTDB, false);
                 ArrayList signals = args.ContainsKey("signals") && args["signals"] is ArrayList ? (ArrayList)args["signals"] : new ArrayList();
                 Dictionary<string, object> values = new Dictionary<string, object>();
                 foreach (object s in signals)
@@ -689,7 +765,16 @@ namespace TiaBridge
                     string sig = Convert.ToString(s);
                     if (string.IsNullOrEmpty(sig)) continue;
                     try { values[sig] = ReadSimSignal(targetInst, sig); }
-                    catch { targetInst.UpdateTagList(ETagListDetails.IOMCTDB, false); values[sig] = ReadSimSignal(targetInst, sig); }
+                    catch
+                    {
+                        if (!refreshed)
+                        {
+                            targetInst.UpdateTagList(ETagListDetails.IOMCTDB, false);
+                            refreshed = true;
+                            values[sig] = ReadSimSignal(targetInst, sig);
+                        }
+                        else throw;
+                    }
                 }
                 return new Dictionary<string, object>
                 {
@@ -701,13 +786,23 @@ namespace TiaBridge
 
             if (action == "write")
             {
-                if (GetBool(args, "refreshTagList", false)) targetInst.UpdateTagList(ETagListDetails.IOMCTDB, false);
+                bool refreshed = GetBool(args, "refreshTagList", false);
+                if (refreshed) targetInst.UpdateTagList(ETagListDetails.IOMCTDB, false);
                 Dictionary<string, object> writes = GetDict(args, "values");
                 List<string> done = new List<string>();
                 foreach (KeyValuePair<string, object> kv in writes)
                 {
                     try { WriteSimSignal(targetInst, kv.Key, kv.Value); }
-                    catch { targetInst.UpdateTagList(ETagListDetails.IOMCTDB, false); WriteSimSignal(targetInst, kv.Key, kv.Value); }
+                    catch
+                    {
+                        if (!refreshed)
+                        {
+                            targetInst.UpdateTagList(ETagListDetails.IOMCTDB, false);
+                            refreshed = true;
+                            WriteSimSignal(targetInst, kv.Key, kv.Value);
+                        }
+                        else throw;
+                    }
                     done.Add(kv.Key + "=" + Convert.ToString(kv.Value));
                 }
                 return new Dictionary<string, object>
@@ -723,9 +818,11 @@ namespace TiaBridge
                 ArrayList watchList = args.ContainsKey("watch") && args["watch"] is ArrayList ? (ArrayList)args["watch"] : new ArrayList();
                 ArrayList steps = args.ContainsKey("steps") && args["steps"] is ArrayList ? (ArrayList)args["steps"] : new ArrayList();
                 int sampleIntervalMs = Math.Max(10, GetInt(args, "sampleIntervalMs", 50));
+                int maxTotalMs = Math.Max(1000, GetInt(args, "timeoutMs", 120000));
 
                 List<object> samples = new List<object>();
                 List<object> assertions = new List<object>();
+                HashSet<string> warningSet = new HashSet<string>();
                 bool allPassed = true;
                 Stopwatch sw = Stopwatch.StartNew();
 
@@ -736,7 +833,12 @@ namespace TiaBridge
                     foreach (object w in watchList)
                     {
                         string sig = Convert.ToString(w);
-                        try { snap[sig] = ReadSimSignal(targetInst, sig); } catch { }
+                        try { snap[sig] = ReadSimSignal(targetInst, sig); }
+                        catch (Exception ex)
+                        {
+                            snap[sig] = "<error: " + ex.Message + ">";
+                            warningSet.Add("watch '" + sig + "': " + ex.Message);
+                        }
                     }
                     samples.Add(new Dictionary<string, object>
                     {
@@ -749,6 +851,10 @@ namespace TiaBridge
                 int stepIdx = 0;
                 foreach (object rawStep in steps)
                 {
+                    if (sw.ElapsedMilliseconds > maxTotalMs)
+                    {
+                        throw new TimeoutException("PLCSIM run_sequence exceeded timeoutMs (" + maxTotalMs + " ms) before step " + (stepIdx + 1) + ".");
+                    }
                     stepIdx++;
                     Dictionary<string, object> st = rawStep as Dictionary<string, object>;
                     if (st == null) continue;
@@ -761,9 +867,25 @@ namespace TiaBridge
                     {
                         int pulseMs = Math.Max(20, GetInt(st, "pulseMs", 100));
                         WriteSimSignal(targetInst, pulseSig, true);
-                        Thread.Sleep(pulseMs);
-                        takeSample();
-                        WriteSimSignal(targetInst, pulseSig, false);
+                        try
+                        {
+                            int pElapsed = 0;
+                            while (pElapsed < pulseMs)
+                            {
+                                if (sw.ElapsedMilliseconds > maxTotalMs)
+                                {
+                                    throw new TimeoutException("PLCSIM run_sequence exceeded timeoutMs (" + maxTotalMs + " ms) during pulse at step " + stepIdx + ".");
+                                }
+                                int chunk = Math.Min(sampleIntervalMs, pulseMs - pElapsed);
+                                Thread.Sleep(chunk);
+                                pElapsed += chunk;
+                            }
+                            takeSample();
+                        }
+                        finally
+                        {
+                            try { WriteSimSignal(targetInst, pulseSig, false); } catch { }
+                        }
                     }
 
                     int waitMs = GetInt(st, "waitMs", 0);
@@ -772,6 +894,10 @@ namespace TiaBridge
                         int elapsed = 0;
                         while (elapsed < waitMs)
                         {
+                            if (sw.ElapsedMilliseconds > maxTotalMs)
+                            {
+                                throw new TimeoutException("PLCSIM run_sequence exceeded timeoutMs (" + maxTotalMs + " ms) during wait at step " + stepIdx + ".");
+                            }
                             int sleepChunk = Math.Min(sampleIntervalMs, waitMs - elapsed);
                             Thread.Sleep(sleepChunk);
                             elapsed += sleepChunk;
@@ -809,7 +935,8 @@ namespace TiaBridge
                     { "elapsedMs", sw.ElapsedMilliseconds },
                     { "assertions", assertions },
                     { "sampleCount", samples.Count },
-                    { "samples", samples }
+                    { "samples", samples },
+                    { "warnings", warningSet.ToArray() }
                 };
             }
 

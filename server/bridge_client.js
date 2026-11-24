@@ -34,6 +34,7 @@ class BridgeClient {
     this.nextId = 1;
     this.pending = new Map();
     this.buf = '';
+    this.stderrBuf = '';
     this.learned = this.loadLearned();
     this.tagsCache = {}; // tagName -> { name, address, type, comment, table }
     this.dbsCache = {};  // dbName -> interface sections
@@ -63,6 +64,7 @@ class BridgeClient {
       windowsHide: true,
     });
     this.buf = '';
+    this.stderrBuf = '';
     this.proc.stdout.setEncoding('utf8');
     this.proc.stdout.on('data', chunk => {
       this.buf += chunk;
@@ -82,11 +84,15 @@ class BridgeClient {
       }
     });
     this.proc.stderr.setEncoding('utf8');
-    this.proc.stderr.on('data', () => { /* suppress stderr noise from bridge */ });
+    this.proc.stderr.on('data', chunk => {
+      this.stderrBuf = (this.stderrBuf + chunk).slice(-2048);
+    });
     this.proc.on('exit', code => {
+      const tail = this.stderrBuf.trim();
+      const suffix = tail ? ' | stderr: ' + tail : '';
       for (const [, waiter] of this.pending) {
         clearTimeout(waiter.timer);
-        waiter.reject(new Error('TiaBridge.exe exited unexpectedly (code ' + code + ')'));
+        waiter.reject(new Error('TiaBridge.exe exited unexpectedly (code ' + code + ')' + suffix));
       }
       this.pending.clear();
       this.proc = null;
@@ -96,7 +102,7 @@ class BridgeClient {
   call(cmd, args, timeoutMs) {
     this.ensureStarted();
     const id = this.nextId++;
-    const timeout = timeoutMs || (['open_project', 'compile', 'download', 'connect'].includes(cmd) ? 180000 : 60000);
+    const timeout = timeoutMs || (['open_project', 'create_project', 'save_project', 'compile', 'download', 'station_upload', 'connect'].includes(cmd) ? 180000 : 60000);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);

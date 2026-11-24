@@ -2,6 +2,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using Siemens.Engineering;
 using Siemens.Engineering.Connection;
 using Siemens.Engineering.HW;
@@ -45,13 +46,19 @@ namespace TiaBridge
 
         private object CmdHardwareConfig(Dictionary<string, object> args)
         {
-            EnsureConnected();
             string action = GetStr(args, "action", "presets").ToLowerInvariant();
 
             if (action == "presets")
             {
                 return new Dictionary<string, object> { { "presets", CommonHardwarePresets } };
             }
+
+            if (action == "create_project")
+            {
+                return CmdCreateProject(args);
+            }
+
+            EnsureConnected();
 
             if (action == "search_catalog")
             {
@@ -156,35 +163,48 @@ namespace TiaBridge
                 PlcTarget plc = ResolvePlc(args);
                 IEngineeringObject cpuObj = plc.CpuItem;
                 List<string> applied = new List<string>();
+                List<string> warnings = new List<string>();
 
                 // Clock & System Memory Bytes, Startup Mode, PUT/GET, etc.
                 if (args.ContainsKey("enableSystemMemory"))
                 {
-                    if (TrySetAttrFuzzy(cpuObj, new string[] { "SystemMemoryByte", "EnableSystemMemoryByte" }, GetBool(args, "enableSystemMemory", true)))
-                        applied.Add("SystemMemoryByte=" + GetBool(args, "enableSystemMemory", true));
+                    bool v = GetBool(args, "enableSystemMemory", true);
+                    if (TrySetAttrFuzzy(cpuObj, new string[] { "SystemMemoryByte", "EnableSystemMemoryByte" }, v))
+                        applied.Add("SystemMemoryByte=" + v);
+                    else
+                        warnings.Add("Could not set SystemMemoryByte on " + plc.CpuItem.Name + " (attribute unsupported or read-only).");
                 }
                 if (args.ContainsKey("systemMemoryAddress"))
                 {
                     ulong addr = (ulong)GetInt(args, "systemMemoryAddress", 1);
                     if (TrySetAttrFuzzy(cpuObj, new string[] { "SystemMemoryByteAddress" }, addr))
                         applied.Add("SystemMemoryByteAddress=" + addr);
+                    else
+                        warnings.Add("Could not set SystemMemoryByteAddress=" + addr + " on " + plc.CpuItem.Name + ".");
                 }
                 if (args.ContainsKey("enableClockMemory"))
                 {
-                    if (TrySetAttrFuzzy(cpuObj, new string[] { "ClockMemoryByte", "EnableClockMemoryByte" }, GetBool(args, "enableClockMemory", true)))
-                        applied.Add("ClockMemoryByte=" + GetBool(args, "enableClockMemory", true));
+                    bool v = GetBool(args, "enableClockMemory", true);
+                    if (TrySetAttrFuzzy(cpuObj, new string[] { "ClockMemoryByte", "EnableClockMemoryByte" }, v))
+                        applied.Add("ClockMemoryByte=" + v);
+                    else
+                        warnings.Add("Could not set ClockMemoryByte on " + plc.CpuItem.Name + " (attribute unsupported or read-only).");
                 }
                 if (args.ContainsKey("clockMemoryAddress"))
                 {
                     ulong addr = (ulong)GetInt(args, "clockMemoryAddress", 0);
                     if (TrySetAttrFuzzy(cpuObj, new string[] { "ClockMemoryByteAddress" }, addr))
                         applied.Add("ClockMemoryByteAddress=" + addr);
+                    else
+                        warnings.Add("Could not set ClockMemoryByteAddress=" + addr + " on " + plc.CpuItem.Name + ".");
                 }
                 if (args.ContainsKey("permitPutGet"))
                 {
                     bool allow = GetBool(args, "permitPutGet", true);
                     if (TrySetAttrDeep(plc.CpuItem, "PutGetCommunicationAllowed", allow) || TrySetAttrDeep(plc.Device, "PutGetCommunicationAllowed", allow))
                         applied.Add("PutGetCommunicationAllowed=" + allow);
+                    else
+                        warnings.Add("Could not set PutGetCommunicationAllowed=" + allow + " on " + plc.CpuItem.Name + ".");
                 }
 
                 // Arbitrary raw attributes dictionary if provided
@@ -216,6 +236,7 @@ namespace TiaBridge
                 {
                     { "plc", plc.CpuItem.Name },
                     { "applied", applied },
+                    { "warnings", warnings },
                     { "keyAttributes", current }
                 };
             }
@@ -251,6 +272,7 @@ namespace TiaBridge
 
                 Dictionary<string, object> toParams = GetDict(args, "parameters");
                 List<string> paramChanges = new List<string>();
+                List<string> warnings = new List<string>();
                 if (existing.Parameters != null)
                 {
                     foreach (KeyValuePair<string, object> kv in toParams)
@@ -261,7 +283,15 @@ namespace TiaBridge
                             tp.Value = CoerceSimple(tp.Value, kv.Value);
                             paramChanges.Add(kv.Key + "=" + Convert.ToString(tp.Value));
                         }
+                        else
+                        {
+                            warnings.Add("Parameter '" + kv.Key + "' not found on technological object '" + existing.Name + "'.");
+                        }
                     }
+                }
+                else if (toParams.Count > 0)
+                {
+                    warnings.Add("Technological object '" + existing.Name + "' exposes no Parameters collection.");
                 }
 
                 return new Dictionary<string, object>
@@ -270,7 +300,8 @@ namespace TiaBridge
                     { "number", existing.Number },
                     { "type", toType },
                     { "version", verStr },
-                    { "parameterChanges", paramChanges }
+                    { "parameterChanges", paramChanges },
+                    { "warnings", warnings }
                 };
             }
 
@@ -315,8 +346,20 @@ namespace TiaBridge
             return false;
         }
 
+        private sealed class RefEqualityComparer : IEqualityComparer<object>
+        {
+            public new bool Equals(object x, object y) { return object.ReferenceEquals(x, y); }
+            public int GetHashCode(object obj) { return RuntimeHelpers.GetHashCode(obj); }
+        }
+
         private bool TrySetAttrDeep(IEngineeringObject root, string attrName, object val)
         {
+            return TrySetAttrDeepCore(root, attrName, val, 0, 5, new HashSet<object>(new RefEqualityComparer()));
+        }
+
+        private bool TrySetAttrDeepCore(IEngineeringObject root, string attrName, object val, int depth, int maxDepth, HashSet<object> visited)
+        {
+            if (root == null || depth > maxDepth || !visited.Add(root)) return false;
             try
             {
                 EngineeringAttributeInfo info = root.GetAttributeInfos().FirstOrDefault(a => string.Equals(a.Name, attrName, StringComparison.OrdinalIgnoreCase));
@@ -325,14 +368,16 @@ namespace TiaBridge
                     root.SetAttribute(info.Name, CoerceAttributeValue(root, info.Name, val));
                     return true;
                 }
+                if (depth >= maxDepth) return false;
                 foreach (EngineeringCompositionInfo ci in root.GetCompositionInfos())
                 {
-                    IEnumerable comp = root.GetComposition(ci.Name) as IEnumerable;
+                    IEnumerable comp = null;
+                    try { comp = root.GetComposition(ci.Name) as IEnumerable; } catch { continue; }
                     if (comp == null) continue;
                     foreach (object child in comp)
                     {
                         IEngineeringObject eo = child as IEngineeringObject;
-                        if (eo != null && TrySetAttrDeep(eo, attrName, val)) return true;
+                        if (eo != null && TrySetAttrDeepCore(eo, attrName, val, depth + 1, maxDepth, visited)) return true;
                     }
                 }
             }
@@ -426,6 +471,7 @@ namespace TiaBridge
 
                 Node node = chosen.Value.Nodes[0];
                 List<string> changes = new List<string>();
+                List<string> warnings = new List<string>();
 
                 string ip = GetStr(args, "ipAddress", "");
                 string mask = GetStr(args, "subnetMask", "");
@@ -437,7 +483,8 @@ namespace TiaBridge
                 if (!string.IsNullOrEmpty(mask)) { node.SetAttribute("SubnetMask", mask); changes.Add("SubnetMask=" + mask); }
                 if (!string.IsNullOrEmpty(router))
                 {
-                    try { node.SetAttribute("UseRouter", true); node.SetAttribute("RouterAddress", router); changes.Add("RouterAddress=" + router); } catch { }
+                    try { node.SetAttribute("UseRouter", true); node.SetAttribute("RouterAddress", router); changes.Add("RouterAddress=" + router); }
+                    catch (Exception ex) { warnings.Add("RouterAddress='" + router + "' failed: " + ex.Message); }
                 }
 
                 if (!string.IsNullOrEmpty(subnetName) || action == "connect_subnet")
@@ -465,7 +512,8 @@ namespace TiaBridge
                 {
                     { "plc", plc.CpuItem.Name },
                     { "interface", chosen.Key.Name },
-                    { "changes", changes }
+                    { "changes", changes },
+                    { "warnings", warnings }
                 };
             }
 
@@ -473,19 +521,27 @@ namespace TiaBridge
             {
                 PlcTarget plc = ResolvePlc(args);
                 List<string> changes = new List<string>();
+                List<string> warnings = new List<string>();
                 if (args.ContainsKey("enableServer"))
                 {
                     bool en = GetBool(args, "enableServer", true);
-                    if (TrySetAttrDeep(plc.CpuItem, "OpcUaPurchasedLicense", 1) | TrySetAttrDeep(plc.CpuItem, "OpcUaServerActive", en) | TrySetAttrDeep(plc.CpuItem, "ActivateOpcUaServer", en))
-                        changes.Add("OpcUaServer=" + en);
+                    if (en)
+                    {
+                        if (TrySetAttrDeep(plc.CpuItem, "OpcUaPurchasedLicense", 1)) changes.Add("OpcUaPurchasedLicense=1");
+                    }
+                    bool serverSet = TrySetAttrDeep(plc.CpuItem, "OpcUaServerActive", en) || TrySetAttrDeep(plc.CpuItem, "ActivateOpcUaServer", en);
+                    if (serverSet) changes.Add("OpcUaServer=" + en);
+                    else warnings.Add("OPC UA server attribute not supported or writable on CPU '" + plc.CpuItem.Name + "'.");
                 }
                 if (args.ContainsKey("port"))
                 {
                     uint p = (uint)GetInt(args, "port", 4840);
                     if (TrySetAttrDeep(plc.CpuItem, "OpcUaPort", p) || TrySetAttrDeep(plc.CpuItem, "OpcUaServerPort", p))
                         changes.Add("Port=" + p);
+                    else
+                        warnings.Add("OPC UA port attribute not supported or writable on CPU '" + plc.CpuItem.Name + "'.");
                 }
-                return new Dictionary<string, object> { { "plc", plc.CpuItem.Name }, { "changes", changes } };
+                return new Dictionary<string, object> { { "plc", plc.CpuItem.Name }, { "changes", changes }, { "warnings", warnings } };
             }
 
             throw new ArgumentException("Unknown network_config action: " + action);

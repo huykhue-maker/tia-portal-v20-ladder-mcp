@@ -1,18 +1,21 @@
 # TIA Portal V20 MCP Server (Ladder & SCL)
 
-Bộ công cụ Model Context Protocol (MCP) dành cho **Siemens TIA Portal V20** (S7-1200 / S7-1500), tối ưu sâu cho ngôn ngữ **Ladder Logic (LAD)** và hỗ trợ đọc/ghi nguồn văn bản **SCL**, quản lý **Watch Table**, cấu hình phần cứng/mạng PROFINET, **Cross-Reference**, mô phỏng khép kín **S7-PLCSIM V20** và **Escape Hatch** phản chiếu động Openness.
-
-> [!IMPORTANT]
-> **Phạm vi hỗ trợ hiện tại:** Tối ưu chuyên sâu cho **Ladder (LAD)** (DSL 2 chiều, phân tích tĩnh, mô phỏng chu kỳ quét trong RAM gồm cả Toán học/Lượng giác, Analog `NORM_X`/`SCALE_X`/`CONV`, Mảng và Motion `MC_*`) cùng hỗ trợ xuất/nhập **SCL** qua External Sources. Các ngôn ngữ FBD và GRAPH hiện chưa có DSL chuyên biệt.
+Bộ công cụ Model Context Protocol (MCP) dành cho **Siemens TIA Portal V20** (S7-1200 / S7-1500), cung cấp khả năng tự chủ toàn diện cho AI Agent: từ tạo mới dự án, cấu hình phần cứng CPU/Module/Mạng PROFINET, lập trình chuyên sâu **Ladder Logic (LAD)** và nguồn văn bản **SCL**, quản lý **Watch Table**, **Cross-Reference**, đến mô phỏng khép kín qua **S7-PLCSIM V20 Runtime** và **Universal Escape Hatch** phản chiếu động Openness.
 
 ---
 
 ## 1. Tính năng cốt lõi
 
-- **Ngôn ngữ DSL Ladder 2 chiều:** Chuyển đổi mã XML SimaticML cồng kềnh thành cú pháp DSL ngắn gọn, tiết kiệm hơn 90% ngữ cảnh token cho AI.
-- **Mô phỏng chu kỳ quét PLC trong RAM (`tia_dry_run_ladder`):** Chạy thử nghiệm và kiểm chứng logic rơ-le, timer TON/TOF, counter CTU, cuộn dây tức thì mà không cần phần cứng hay phần mềm mô phỏng ngoài.
-- **Phân tích tĩnh (`tia_analyze_ladder`):** Phát hiện lỗi Double Coil, thiếu xung cạnh, mâu thuẫn Set/Reset trước khi nạp vào PLC.
-- **Tương tác TIA Portal V20 trực tiếp:** Kết nối qua Openness API để kiểm tra trạng thái, đọc danh sách tag phần cứng, chỉnh sửa khối dữ liệu DB, biên dịch và chuẩn bị mô phỏng với S7-PLCSIM V20.
+- **Ngôn ngữ DSL Ladder 2 chiều siêu tối ưu:** Chuyển đổi mã XML SimaticML cồng kềnh thành cú pháp DSL ngắn gọn, tiết kiệm hơn 90% ngữ cảnh token cho AI Agent. Hỗ trợ đầy đủ tiếp điểm, cuộn dây, nhánh song song cổng `O`, khối Timer/Counter, khối toán học (`SUB`, `DIV`, `MOD`), hàm lượng giác (`SIN`, `COS`, `TAN`...), ép kiểu & chuẩn hóa Analog (`CONV`, `NORM_X`, `SCALE_X`, `LIMIT`), truy cập phần tử mảng dynamic `Arr[#idx]` và tập lệnh Motion Control S7-1200/1500 (`MC_Power`, `MC_Reset`, `MC_Home`, `MC_MoveAbsolute`, `MC_MoveRelative`, `MC_MoveVelocity`, `MC_MoveJog`, `MC_Halt`).
+- **Hỗ trợ mã nguồn văn bản SCL/DB/UDT:** Xuất và biên dịch trực tiếp mã SCL vào khối chương trình trong TIA Portal qua External Text Sources (`tia_scl_source`).
+- **Quản lý Watch Table tự động:** Tự động tạo, đọc, cập nhật, xóa bảng giám sát Watch Table và mở trực tiếp lên màn hình TIA Portal (`tia_watch_table`, `tia_show_in_editor`).
+- **Tra cứu chéo Cross-Reference:** Quét toàn dự án hoặc từng khối để xác định chính xác các điểm đọc/ghi của từng biến, DB hoặc UDT (`tia_cross_reference`).
+- **Cấu hình phần cứng & Mạng tự động (Zero-to-Project):** Tạo mới project, tra cứu Hardware Catalog, thêm CPU/Module mở rộng theo preset mã đặt hàng, cấu hình System/Clock Memory, PUT/GET, IP, Subnet, PROFINET IO-System và OPC UA (`tia_hardware_config`, `tia_network_config`).
+- **Mô phỏng 2 tầng độc lập:**
+  1. *Tầng 1 (Trong RAM Node.js):* `tia_dry_run_ladder` mô phỏng chu kỳ quét PLC tức thì trong RAM không cần bật TIA Portal hay PLC thật.
+  2. *Tầng 2 (Khép kín với S7-PLCSIM V20 Runtime API):* `tia_plcsim_runtime` kết nối trực tiếp vào `Siemens.Simatic.Simulation.Runtime.Api.x64.dll` để đăng ký CPU ảo, kích hoạt RUN/STOP, đọc/ghi biến I/O/DB và chạy kịch bản kiểm thử tự động với assertions & timeline watch trace.
+- **Phân tích tĩnh (`tia_analyze_ladder`):** Phát hiện lỗi Double Coil, thiếu xung cạnh, mâu thuẫn Set/Reset, biến chưa khai báo trước khi nạp vào PLC.
+- **Universal Escape Hatch (`tia_escape_hatch`):** Cung cấp khả năng phản chiếu động (Dynamic Reflection) trên toàn bộ cây đối tượng Openness V20 (`inspect`, `get`, `set`, `invoke`, handle `obj:N`), loại bỏ hoàn toàn "vùng mù" API.
 
 ---
 
@@ -31,7 +34,7 @@ TIA_Portal_V20_MCP/
 │   └── ladder/                    # Bộ biên dịch DSL Ladder V20, AST, Analyzer và Simulator
 ├── skill/                         # File hướng dẫn tích hợp Skill cho AI Agent
 │   └── SKILL.md
-├── tests/                         # Bộ kiểm thử tự động toàn diện (6 nhóm test)
+├── tests/                         # Bộ kiểm thử tự động toàn diện (7 nhóm test)
 │   └── run_all.js
 ├── build.ps1                      # Script biên dịch TiaBridge.exe bằng csc.exe có sẵn trên Windows
 ├── package.json

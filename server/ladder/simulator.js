@@ -200,10 +200,6 @@ class Simulator {
             case 'ABS': r = Math.abs(x); break;
             case 'EXP': r = Math.exp(x); break;
             case 'LN': if (x <= 0) eno = false; else r = Math.log(x); break;
-            case 'TRUNC': r = Math.trunc(x); break;
-            case 'ROUND': r = Math.round(x); break;
-            case 'CEIL': r = Math.ceil(x); break;
-            case 'FLOOR': r = Math.floor(x); break;
             default: eno = false;
           }
           if (eno) eno = this.storeNumber(a.dst, r, type, a.fn, f);
@@ -213,11 +209,20 @@ class Simulator {
       case 'conv': {
         let eno = rlo;
         if (rlo) {
-          const destType = a.destType || a.srcType || this.types(a.out) || 'Real';
+          const info = C.CONV_OPS[a.fn];
+          const destType = a.destType || this.types(a.out) || (info && info.dualType ? info.defDest : (a.srcType || (info && info.defSrc) || 'Real'));
           let r;
           if (a.fn === 'CONV') {
             r = num(this.read(a.ins[0], f));
             if (INTEGER.has(destType)) r = Math.round(r);
+          } else if (a.fn === 'TRUNC') {
+            r = Math.trunc(num(this.read(a.ins[0], f)));
+          } else if (a.fn === 'ROUND') {
+            r = Math.round(num(this.read(a.ins[0], f)));
+          } else if (a.fn === 'CEIL') {
+            r = Math.ceil(num(this.read(a.ins[0], f)));
+          } else if (a.fn === 'FLOOR') {
+            r = Math.floor(num(this.read(a.ins[0], f)));
           } else if (a.fn === 'NORM_X') {
             const mn = num(this.read(a.ins[0], f)), val = num(this.read(a.ins[1], f)), mx = num(this.read(a.ins[2], f));
             if (mx === mn) eno = false; else r = (val - mn) / (mx - mn);

@@ -212,13 +212,16 @@ async function main() {
       const simRt = await rpc('tools/call', { name: 'tia_plcsim_runtime', arguments: { action: 'status' } });
       assert(!simRt.result.isError, 'tia_plcsim_runtime(status) failed: ' + simRt.result.content[0].text);
 
+      const hwPresets = await rpc('tools/call', { name: 'tia_hardware_config', arguments: { action: 'presets' } });
+      assert(!hwPresets.result.isError, 'tia_hardware_config(presets) should work offline without tia_connect: ' + hwPresets.result.content[0].text);
+      assert(hwPresets.result.content[0].text.includes('CPU_1214C_DC_DC_DC'), 'Expected CPU_1214C_DC_DC_DC in hardware presets');
+
       // Smoke test new tools wired in server/index.js (when disconnected/no project, should return clean MCP error without crashing server)
       for (const probe of [
         { name: 'tia_watch_table', arguments: { action: 'list' } },
         { name: 'tia_show_in_editor', arguments: { kind: 'block', name: 'Main' } },
         { name: 'tia_scl_source', arguments: { action: 'export', blockName: 'Main' } },
         { name: 'tia_cross_reference', arguments: { filter: 'used' } },
-        { name: 'tia_hardware_config', arguments: { action: 'presets' } },
         { name: 'tia_network_config', arguments: { action: 'inspect' } },
       ]) {
         const res = await rpc('tools/call', probe);
@@ -350,6 +353,102 @@ async function main() {
       ],
     });
     assert.strictEqual(sim.ok, true, 'Math/Analog/OR simulation failed:\n' + S.formatResults(sim));
+  });
+
+  // 7. Edge cases & regression tests from Senior Code Audit
+  await test('7. Edge cases: action-named tags, ROUND/TRUNC dualType, SCALE_X type inference, stale learned Card, OR bypass & nested OR', () => {
+    // 7a. Bare global tag whose name collides with action names (LIMIT, MIN, MAX, SIN)
+    const bareLim = D.parseNetwork('LIMIT & MIN => COIL(#Alarm)');
+    const genLim = G.generateFlgNet(bareLim.flows, {});
+    const backLim = R.readFlgNet(X.parse(genLim.xml));
+    assert.strictEqual(backLim.complete, true);
+    assert.strictEqual(backLim.dsl, 'NO("LIMIT") & NO("MIN") => COIL(#Alarm)');
+
+    // 7b. ROUND / TRUNC / CEIL / FLOOR emit BOTH SrcType and DestType & simulate accurately
+    for (const fn of ['ROUND', 'TRUNC', 'CEIL', 'FLOOR']) {
+      const dsl = 'NO(#En) => ' + fn + '(#X, #Y, Real, DInt)';
+      const gen = G.generateFlgNet(D.parseNetwork(dsl).flows, {});
+      assert(gen.xml.includes('<TemplateValue Name="SrcType" Type="Type">Real</TemplateValue>'), fn + ' missing SrcType');
+      assert(gen.xml.includes('<TemplateValue Name="DestType" Type="Type">DInt</TemplateValue>'), fn + ' missing DestType');
+      assert(!gen.xml.includes('Name="Card"'), fn + ' must not emit Card');
+      const back = R.readFlgNet(X.parse(gen.xml));
+      assert.strictEqual(back.complete, true, fn + ' roundtrip incomplete');
+      assert.strictEqual(back.dsl, dsl, fn + ' roundtrip mismatch');
+    }
+
+    // 7c. SCALE_X type inference: min/max/out are Int, value is Real -> SrcType=Real, DestType=Int
+    const typeMap = { '#MinInt': 'Int', '#MaxInt': 'Int', '#OutInt': 'Int', '#NormReal': 'Real' };
+    const scaleGen = G.generateFlgNet(D.parseNetwork('NO(#En) => SCALE_X(#MinInt, #NormReal, #MaxInt, #OutInt)').flows, {
+      resolveType: op => typeMap['#' + op.path[0]] || null,
+    });
+    assert(scaleGen.xml.includes('<TemplateValue Name="SrcType" Type="Type">Real</TemplateValue>'), 'SCALE_X SrcType must come from value (Real), not min (Int)');
+    assert(scaleGen.xml.includes('<TemplateValue Name="DestType" Type="Type">Int</TemplateValue>'), 'SCALE_X DestType must be Int');
+
+    // 7d. Legacy XML read alias <Part Name="Scale"> parses cleanly as SCALE_X
+    const legacyScaleXml = scaleGen.xml.replace('<Part Name="Scale_X"', '<Part Name="Scale"');
+    const legacyRead = R.readFlgNet(X.parse(legacyScaleXml));
+    assert.strictEqual(legacyRead.complete, true, 'Legacy <Part Name="Scale"> should read cleanly');
+    assert(legacyRead.dsl.includes('SCALE_X(#MinInt, #NormReal, #MaxInt, #OutInt, Real, Int)'), 'Unexpected DSL: ' + legacyRead.dsl);
+
+    // 7e. Stale learned_catalog.json with bogus Card on Sub / Limit / Round is stripped
+    const staleLearned = {
+      parts: {
+        Sub: { templates: [{ name: 'Card', type: 'Cardinality', value: '2' }, { name: 'SrcType', type: 'Type', value: 'Real' }] },
+        Limit: { templates: [{ name: 'Card', type: 'Cardinality', value: '3' }] },
+        Round: { templates: [{ name: 'Card', type: 'Cardinality', value: '1' }, { name: 'SrcType', type: 'Type', value: 'Real' }] },
+      },
+      calls: {},
+    };
+    const subClean = G.generateFlgNet(D.parseNetwork('NO(#En) => SUB(#A, #B, #C, Real)').flows, { learned: staleLearned }).xml;
+    assert(!subClean.includes('Name="Card"'), 'Stale Card must be stripped from Sub');
+    const limClean = G.generateFlgNet(D.parseNetwork('NO(#En) => LIMIT(0.0, #X, 10.0, #Y, Real)').flows, { learned: staleLearned }).xml;
+    assert(!limClean.includes('Name="Card"') && limClean.includes('Name="SrcType"'), 'Stale Card stripped and SrcType preserved on Limit');
+    const rndClean = G.generateFlgNet(D.parseNetwork('NO(#En) => ROUND(#X, #Y, Real, DInt)').flows, { learned: staleLearned }).xml;
+    assert(!rndClean.includes('Name="Card"') && rndClean.includes('Name="DestType"'), 'Stale Card stripped and DestType preserved on Round');
+
+    // 7f. Direct AST OR with TRUE bypass emits ZERO dangling Contact parts
+    const directAst = [{
+      cond: { t: 'or', items: [{ t: 'contact', op: { k: 'local', path: ['A'] }, neg: false }, { t: 'true' }] },
+      then: [{ t: 'coil', kind: 'COIL', op: { k: 'local', path: ['Y'] } }],
+    }];
+    const bypassXml = G.generateFlgNet(directAst, {}).xml;
+    assert(!bypassXml.includes('<Part Name="Contact"'), 'OR with TRUE bypass must not emit dangling Contact');
+
+    // 7g. Nested OR & OR inside CTU reset pin roundtrip cleanly
+    for (const dsl of [
+      '(NO(#A) | NO(#B)) & (NO(#C) | NO(#D)) => COIL(#Y)',
+      'NO(#Pulse) => CTU(#C1, PV=5, R=NO(#R1) | NO(#R2), CV=#Cnt) => COIL(#Done)',
+    ]) {
+      const gen = G.generateFlgNet(D.parseNetwork(dsl).flows, {});
+      const back = R.readFlgNet(X.parse(gen.xml));
+      assert.strictEqual(back.complete, true, 'Expected complete roundtrip for: ' + dsl);
+      assert.strictEqual(back.dsl, dsl, 'Roundtrip mismatch for: ' + dsl + '\n  got: ' + back.dsl);
+    }
+
+    // 7h. Simulate ROUND, TRUNC, CEIL, FLOOR end-to-end
+    const rndBlock = B.createBlockXml({
+      type: 'FB',
+      name: 'FB_Rounding',
+      interface: {
+        Input: [{ name: 'Val', type: 'Real' }],
+        Output: [
+          { name: 'OutRound', type: 'DInt' },
+          { name: 'OutTrunc', type: 'DInt' },
+          { name: 'OutCeil', type: 'DInt' },
+          { name: 'OutFloor', type: 'DInt' },
+        ],
+      },
+      networks: [
+        { title: 'Rounding', dsl: 'ROUND(#Val, #OutRound, Real, DInt), TRUNC(#Val, #OutTrunc, Real, DInt), CEIL(#Val, #OutCeil, Real, DInt), FLOOR(#Val, #OutFloor, Real, DInt)' },
+      ],
+    }, {});
+    const prog = S.buildProgram([B.readBlock(rndBlock.xml, { format: 'dsl' })], 'FB_Rounding');
+    const sim = S.runScenario(prog, {
+      scanMs: 10,
+      init: { '#Val': 3.7 },
+      steps: [{ run: 1, expect: { '#OutRound': 4, '#OutTrunc': 3, '#OutCeil': 4, '#OutFloor': 3 } }],
+    });
+    assert.strictEqual(sim.ok, true, 'Rounding simulation failed:\n' + S.formatResults(sim));
   });
 
   console.log('\n=== SUMMARY: ' + passed + '/' + total + ' test groups passed ===');

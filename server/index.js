@@ -116,13 +116,19 @@ const TOOLS = [
         path: { type: 'string', description: 'Absolute path to the .ap20 file, e.g. D:\\Kì 7\\Đồ án 2\\Do_an2_cnc_V20\\Do_an2_cnc_V20.ap20' },
         mode: { type: 'string', enum: ['auto', 'attach', 'ui', 'headless'], description: 'Connection mode if not yet connected (default: auto).' },
         closeCurrent: { type: 'boolean', description: 'Close currently open project if different (default: false).' },
+        upgrade: { type: 'boolean', description: 'Open with upgrade from an older TIA Portal version (default: false).' },
       },
     },
   },
   {
     name: 'tia_save_project',
-    description: 'Save the currently open TIA Portal V20 project.',
-    inputSchema: { type: 'object', properties: {} },
+    description: 'Save the currently open TIA Portal V20 project (or Save As to a new directory).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        saveAsDirectory: { type: 'string', description: 'Optional target directory for Save As (omit to save in place).' },
+      },
+    },
   },
   {
     name: 'tia_close_project',
@@ -502,15 +508,16 @@ const TOOLS = [
   },
   {
     name: 'tia_download_and_online',
-    description: 'Inspect connection interfaces, download Software/Hardware to S7-PLCSIM V20 or physical PLC, and switch TIA Portal Online/Offline.',
+    description: 'Inspect connection interfaces, download Software/Hardware to S7-PLCSIM V20 or physical PLC, upload a station from a physical PLC, and switch TIA Portal Online/Offline.',
     inputSchema: {
       type: 'object',
       required: ['action'],
       properties: {
-        action: { type: 'string', enum: ['list_connections', 'download', 'go_online', 'go_offline', 'online_status'] },
+        action: { type: 'string', enum: ['list_connections', 'download', 'station_upload', 'go_online', 'go_offline', 'online_status'] },
         plcName: { type: 'string' },
         mode: { type: 'string', description: 'Connection mode (default: PN/IE).' },
-        pcInterface: { type: 'string', description: 'Substring filter for PC interface (default: PLCSIM).' },
+        pcInterface: { type: 'string', description: 'Substring filter for PC interface (default: PLCSIM; optional for station_upload).' },
+        targetAddress: { type: 'string', description: 'Optional target PLC IP address (e.g. 192.168.0.1); required for station_upload.' },
         targetInterfaceIndex: { type: 'integer', description: 'Index of target interface (default: 0).' },
         includeHardware: { type: 'boolean', description: 'Download Hardware + Software (default: true).' },
         startAfterDownload: { type: 'boolean', description: 'Start CPU modules after download (default: true).' },
@@ -600,12 +607,15 @@ const TOOLS = [
   // --- Group 6: Hardware/Network, PLCSIM Runtime, Universal Escape Hatch ---
   {
     name: 'tia_hardware_config',
-    description: 'Zero-to-project hardware configuration: list presets, search the hardware catalog, add a PLC/device, plug modules, set CPU memory/startup/PUT-GET properties, or create a technological object.',
+    description: 'Zero-to-project hardware configuration: create a new TIA project, list presets, search the hardware catalog, add a PLC/device, plug modules, set CPU memory/startup/PUT-GET properties, or create a technological object.',
     inputSchema: {
       type: 'object',
       required: ['action'],
       properties: {
-        action: { type: 'string', enum: ['presets', 'search_catalog', 'add_plc', 'add_device', 'plug_module', 'cpu_properties', 'create_tech_object'] },
+        action: { type: 'string', enum: ['presets', 'create_project', 'search_catalog', 'add_plc', 'add_device', 'plug_module', 'cpu_properties', 'create_tech_object'] },
+        directory: { type: 'string', description: 'Target folder for action="create_project".' },
+        mode: { type: 'string', enum: ['auto', 'attach', 'ui', 'headless'], description: 'Connection mode if not yet connected (for create_project).' },
+        closeCurrent: { type: 'boolean', description: 'Close currently open project before create_project (default: false).' },
         plcName: { type: 'string' },
         stationName: { type: 'string' },
         typeIdentifier: { type: 'string', description: 'Preset key (e.g. CPU_1214C_DC_DC_DC) or order number / TypeIdentifier.' },
@@ -747,13 +757,19 @@ async function handleTool(name, args) {
         path: args.path,
         mode: args.mode || 'auto',
         closeCurrent: !!args.closeCurrent,
+        upgrade: !!args.upgrade,
       });
       return { text: 'Opened project "' + s.projectName + '" (' + s.projectPath + ').', json: s };
     }
 
     case 'tia_save_project': {
-      const r = await bridge.call('save_project');
-      return { text: 'Saved project "' + r.project + '".', json: r };
+      const r = await bridge.call('save_project', {
+        saveAsDirectory: args.saveAsDirectory || '',
+      });
+      return {
+        text: r.savedAs ? 'Saved project "' + r.project + '" as "' + r.path + '".' : 'Saved project "' + r.project + '".',
+        json: r,
+      };
     }
 
     case 'tia_close_project': {
@@ -1170,7 +1186,10 @@ async function handleTool(name, args) {
         for (const m of r.modes) {
           lines.push('  Mode: ' + m.name);
           for (const pc of m.pcInterfaces) {
-            lines.push('    - ' + pc.name + (pc.targetInterfaces.length ? ' -> targets: [' + pc.targetInterfaces.join(', ') + ']' : ''));
+            const parts = [];
+            if ((pc.targetInterfaces || []).length) parts.push('targets: [' + pc.targetInterfaces.join(', ') + ']');
+            if ((pc.subnets || []).length) parts.push('subnets: [' + pc.subnets.join(', ') + ']');
+            lines.push('    - ' + pc.name + (parts.length ? ' -> ' + parts.join('; ') : ''));
           }
         }
         return { text: lines.join('\n'), json: r };
@@ -1180,15 +1199,32 @@ async function handleTool(name, args) {
           plcName: args.plcName || '',
           mode: args.mode || 'PN/IE',
           pcInterface: args.pcInterface || 'PLCSIM',
+          targetAddress: args.targetAddress || '',
           targetInterfaceIndex: args.targetInterfaceIndex || 0,
           includeHardware: args.includeHardware !== false,
           startAfterDownload: args.startAfterDownload !== false,
         });
         const lines = [
-          'DOWNLOAD to "' + r.plc + '" via ' + r.pcInterface + ' (' + r.targetInterface + '): ' + r.state,
+          'DOWNLOAD to "' + r.plc + '" via ' + r.pcInterface + ' (' + r.targetInterface +
+            (r.targetAddress ? ' @ ' + r.targetAddress : '') + '): ' + r.state,
           'Errors: ' + r.errorCount + ', Warnings: ' + r.warningCount,
         ];
         for (const m of r.messages) lines.push('  [' + m.state + '] ' + m.message);
+        return { text: lines.join('\n'), json: r };
+      }
+      if (act === 'station_upload') {
+        if (!args.targetAddress) throw new Error('targetAddress (e.g. "192.168.0.1") is required for station_upload.');
+        const r = await bridge.call('station_upload', {
+          mode: args.mode || 'PN/IE',
+          pcInterface: args.pcInterface || '',
+          targetAddress: args.targetAddress,
+        }, 180000);
+        const lines = [
+          'STATION UPLOAD from ' + args.targetAddress + ': ' + r.state +
+            (r.uploadedStation ? ' -> "' + r.uploadedStation + '"' : ''),
+          'Errors: ' + r.errorCount + ', Warnings: ' + r.warningCount,
+        ];
+        for (const l of (r.configLog || [])) lines.push('  ' + l);
         return { text: lines.join('\n'), json: r };
       }
       const onlineAct = act === 'online_status' ? 'status' : act;
@@ -1255,6 +1291,10 @@ async function handleTool(name, args) {
       }
       const lines = ['Watch table "' + r.table + '" now has ' + plural(r.entryCount, 'entry', 'entries') + (r.shownInEditor ? ' (shown in editor)' : '')];
       for (const c of (r.changes || [])) lines.push('  ' + c);
+      if ((r.warnings || []).length) {
+        lines.push('WARNINGS:');
+        for (const w of r.warnings) lines.push('  ! ' + w);
+      }
       return { text: lines.join('\n'), json: r };
     }
 
@@ -1342,6 +1382,9 @@ async function handleTool(name, args) {
         attributes: args.attributes || {},
         parameters: args.parameters || {},
       };
+      if (args.directory) payload.directory = args.directory;
+      if (args.mode) payload.mode = args.mode;
+      if (args.closeCurrent !== undefined) payload.closeCurrent = !!args.closeCurrent;
       if (args.plcName) payload.plcName = args.plcName;
       if (args.typeIdentifier) payload.typeIdentifier = args.typeIdentifier;
       if (args.stationName) payload.stationName = args.stationName;
@@ -1357,12 +1400,16 @@ async function handleTool(name, args) {
         if (args[k] !== undefined) payload[k] = args[k];
       }
 
-      const r = await bridge.call('hardware_config', payload, 120000);
+      const timeout = action === 'create_project' ? 180000 : 120000;
+      const r = await bridge.call('hardware_config', payload, timeout);
       if (action === 'presets') {
         const keys = Object.keys(r.presets || {}).sort();
         const lines = ['HARDWARE PRESETS (' + keys.length + '):'];
         for (const k of keys) lines.push('  ' + k.padEnd(24) + ' -> ' + r.presets[k]);
         return { text: lines.join('\n'), json: r };
+      }
+      if (action === 'create_project') {
+        return { text: 'Created project "' + r.projectName + '" (' + r.projectPath + ').', json: r };
       }
       if (action === 'search_catalog') {
         const lines = ['HARDWARE CATALOG "' + r.query + '" — ' + plural(r.count, 'entry', 'entries') + ':'];
@@ -1387,6 +1434,10 @@ async function handleTool(name, args) {
         const lines = ['CPU "' + r.plc + '" property changes:'];
         if (!(r.applied || []).length) lines.push('  (none)');
         for (const a of (r.applied || [])) lines.push('  ' + a);
+        if ((r.warnings || []).length) {
+          lines.push('WARNINGS:');
+          for (const w of r.warnings) lines.push('  ! ' + w);
+        }
         const keys = Object.keys(r.keyAttributes || {}).sort();
         if (keys.length) {
           lines.push('KEY ATTRIBUTES:');
@@ -1398,6 +1449,10 @@ async function handleTool(name, args) {
         const lines = ['Technological object "' + r.name + '" #' + r.number + ' (' + r.type + ' v' + r.version + ').'];
         if (!(r.parameterChanges || []).length) lines.push('  (no parameter changes)');
         for (const p of (r.parameterChanges || [])) lines.push('  ' + p);
+        if ((r.warnings || []).length) {
+          lines.push('WARNINGS:');
+          for (const w of r.warnings) lines.push('  ! ' + w);
+        }
         return { text: lines.join('\n'), json: r };
       }
       return { text: JSON.stringify(r, null, 2), json: r };
@@ -1447,11 +1502,19 @@ async function handleTool(name, args) {
         const lines = ['OPC UA settings on PLC "' + r.plc + '":'];
         if (!(r.changes || []).length) lines.push('  (no changes)');
         for (const c of (r.changes || [])) lines.push('  ' + c);
+        if ((r.warnings || []).length) {
+          lines.push('WARNINGS:');
+          for (const w of r.warnings) lines.push('  ! ' + w);
+        }
         return { text: lines.join('\n'), json: r };
       }
       const lines = ['PLC "' + r.plc + '" via interface "' + r.interface + '":'];
       if (!(r.changes || []).length) lines.push('  (no changes)');
       for (const c of (r.changes || [])) lines.push('  ' + c);
+      if ((r.warnings || []).length) {
+        lines.push('WARNINGS:');
+        for (const w of r.warnings) lines.push('  ! ' + w);
+      }
       return { text: lines.join('\n'), json: r };
     }
 
@@ -1462,7 +1525,7 @@ async function handleTool(name, args) {
         cpuType: args.cpuType || 'CPU1500_Unspecified',
         articleNumber: args.articleNumber || '',
         operation: args.operation || 'run',
-        timeoutMs: args.timeoutMs !== undefined ? args.timeoutMs : 30000,
+        timeoutMs: args.timeoutMs !== undefined ? args.timeoutMs : (action === 'run_sequence' ? 120000 : 30000),
         search: args.search || '',
         limit: args.limit || 200,
         signals: args.signals || [],
@@ -1535,6 +1598,30 @@ async function handleTool(name, args) {
           lines.push('  ' + (a.ok ? 'PASS' : 'FAIL') + ' step ' + a.step + ' @' + a.tMs + 'ms ' + a.signal +
             ': expected ' + fmtValue(a.expected) + ', actual ' + fmtValue(a.actual));
         }
+        if ((r.warnings || []).length) {
+          lines.push('WARNINGS:');
+          for (const w of r.warnings) lines.push('  ! ' + w);
+        }
+        const samples = r.samples || [];
+        if (samples.length) {
+          // Print first sample, samples where watched values changed, and last sample (capped at 25 lines)
+          const notable = [];
+          let prevSig = null;
+          for (let i = 0; i < samples.length; i++) {
+            const s = samples[i];
+            const sig = JSON.stringify(s.values || {});
+            if (i === 0 || i === samples.length - 1 || sig !== prevSig) {
+              notable.push(s);
+              prevSig = sig;
+            }
+          }
+          lines.push('WATCH TRACE (' + notable.length + ' transition(s) / ' + samples.length + ' total samples):');
+          for (const s of notable.slice(0, 25)) {
+            const pairs = Object.keys(s.values || {}).map(k => k + '=' + fmtValue(s.values[k])).join(', ');
+            lines.push('  @' + s.tMs + 'ms: ' + pairs);
+          }
+          if (notable.length > 25) lines.push('  ... (+' + (notable.length - 25) + ' more transitions)');
+        }
         return { text: lines.join('\n'), json: r };
       }
       return { text: JSON.stringify(r, null, 2), json: r };
@@ -1594,8 +1681,9 @@ async function handleTool(name, args) {
         return { text: lines.join('\n'), json: r };
       }
       if (action === 'get') {
-        if (r.attribute !== undefined) return { text: r.attribute + ' = ' + fmtValue(r.value), json: r };
-        if (r.property !== undefined) return { text: r.property + ' = ' + fmtValue(r.value), json: r };
+        const vh = r.valueHandle ? ' [handle: ' + r.valueHandle + ']' : '';
+        if (r.attribute !== undefined) return { text: r.attribute + ' = ' + fmtValue(r.value) + vh, json: r };
+        if (r.property !== undefined) return { text: r.property + ' = ' + fmtValue(r.value) + vh, json: r };
         if (r.composition !== undefined) {
           const lines = ['COMPOSITION "' + r.composition + '" — ' + plural(r.count, 'item') + ':'];
           for (const it of (r.items || [])) {

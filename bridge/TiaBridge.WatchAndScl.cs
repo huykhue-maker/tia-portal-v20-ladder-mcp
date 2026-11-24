@@ -90,20 +90,30 @@ namespace TiaBridge
             return "";
         }
 
-        private static void SetMlComment(object obj, string comment)
+        private static bool SetMlComment(object obj, string comment, out string error)
         {
-            if (comment == null) return;
+            error = null;
+            if (comment == null) return false;
             try
             {
                 PropertyInfo pi = obj.GetType().GetProperty("Comment");
-                if (pi == null) return;
-                MultilingualText mt = pi.GetValue(obj, null) as MultilingualText;
+                MultilingualText mt = pi != null ? (pi.GetValue(obj, null) as MultilingualText) : null;
+                if (mt == null && obj is IEngineeringObject)
+                {
+                    mt = ((IEngineeringObject)obj).GetAttribute("Comment") as MultilingualText;
+                }
                 if (mt != null && mt.Items != null && mt.Items.Count > 0)
                 {
                     mt.Items[0].Text = comment;
+                    return true;
                 }
+                return false;
             }
-            catch { }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
         }
 
         private static PlcWatchAndForceTableDisplayFormat ParseDisplayFormat(string fmt)
@@ -158,15 +168,20 @@ namespace TiaBridge
             catch { return ""; }
         }
 
-        private static bool TrySetEntryAttr(PlcWatchTableEntry entry, string name, object value)
+        private static bool TrySetEntryAttr(PlcWatchTableEntry entry, string name, object value, out string error)
         {
+            error = null;
             if (value == null) return false;
             try
             {
                 ((IEngineeringObject)entry).SetAttribute(name, value);
                 return true;
             }
-            catch { return false; }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
         }
 
         private static string FormatEntryAttr(PlcWatchTableEntry entry, string name)
@@ -274,6 +289,7 @@ namespace TiaBridge
 
                 object rawEntries;
                 List<string> changes = new List<string>();
+                List<string> warnings = new List<string>();
                 if (args.TryGetValue("entries", out rawEntries) && rawEntries is ArrayList)
                 {
                     Dictionary<string, PlcWatchTableEntry> existingMap = new Dictionary<string, PlcWatchTableEntry>(StringComparer.OrdinalIgnoreCase);
@@ -297,6 +313,7 @@ namespace TiaBridge
                         if (string.IsNullOrEmpty(key)) continue;
 
                         PlcWatchTableEntry entry;
+                        bool isNew = false;
                         if (!existingMap.TryGetValue(key, out entry))
                         {
                             // Entries.Create() returns a PlcTableCommentEntry; in a watch table it is a PlcWatchTableEntry.
@@ -304,28 +321,56 @@ namespace TiaBridge
                             entry = created as PlcWatchTableEntry;
                             if (entry == null) throw new InvalidOperationException("Watch table entry creation returned " + created.GetType().Name + " instead of PlcWatchTableEntry.");
                             existingMap[key] = entry;
-                            changes.Add("added " + key);
-                        }
-                        else
-                        {
-                            changes.Add("updated " + key);
+                            isNew = true;
                         }
 
                         // Address must be written before the symbolic name on most V20 CPUs.
-                        if (!string.IsNullOrEmpty(eAddr)) TrySetEntryAttr(entry, "Address", eAddr);
-                        if (!string.IsNullOrEmpty(eName)) TrySetEntryAttr(entry, "Name", eName);
+                        bool idOk = false;
+                        string err;
+                        if (!string.IsNullOrEmpty(eAddr))
+                        {
+                            if (TrySetEntryAttr(entry, "Address", eAddr, out err)) idOk = true;
+                            else warnings.Add(key + ": Address='" + eAddr + "' failed (" + err + ")");
+                        }
+                        if (!string.IsNullOrEmpty(eName))
+                        {
+                            if (TrySetEntryAttr(entry, "Name", eName, out err)) idOk = true;
+                            else warnings.Add(key + ": Name='" + eName + "' failed (" + err + ")");
+                        }
+
+                        if (isNew && !idOk)
+                        {
+                            try { entry.Delete(); } catch { }
+                            existingMap.Remove(key);
+                            warnings.Add(key + ": removed empty entry because neither Address nor Name could be set");
+                            continue;
+                        }
+                        changes.Add((isNew ? "added " : "updated ") + key);
 
                         if (!string.IsNullOrEmpty(eFmt))
                         {
-                            TrySetEntryAttr(entry, "DisplayFormat", ParseDisplayFormat(eFmt));
+                            if (!TrySetEntryAttr(entry, "DisplayFormat", ParseDisplayFormat(eFmt), out err))
+                            {
+                                warnings.Add(key + ": DisplayFormat='" + eFmt + "' failed (" + err + ")");
+                            }
                         }
                         if (eMod != null)
                         {
-                            TrySetEntryAttr(entry, "ModifyValue", eMod);
+                            if (!TrySetEntryAttr(entry, "ModifyValue", eMod, out err))
+                            {
+                                warnings.Add(key + ": ModifyValue failed (" + err + ")");
+                            }
                         }
                         if (eCom != null)
                         {
-                            TrySetEntryAttr(entry, "Comment", eCom);
+                            string mlErr;
+                            if (!SetMlComment(entry, eCom, out mlErr))
+                            {
+                                if (!TrySetEntryAttr(entry, "Comment", eCom, out err))
+                                {
+                                    warnings.Add(key + ": Comment failed (" + (mlErr ?? err ?? "unsupported") + ")");
+                                }
+                            }
                         }
                     }
                 }
@@ -333,7 +378,8 @@ namespace TiaBridge
                 bool shown = false;
                 if (GetBool(args, "showInEditor", false))
                 {
-                    try { wt.ShowInEditor(); shown = true; } catch { }
+                    try { wt.ShowInEditor(); shown = true; }
+                    catch (Exception ex) { warnings.Add("ShowInEditor failed: " + ex.Message); }
                 }
 
                 return new Dictionary<string, object>
@@ -341,6 +387,7 @@ namespace TiaBridge
                     { "table", wt.Name },
                     { "entryCount", wt.Entries.Count },
                     { "changes", changes },
+                    { "warnings", warnings },
                     { "shownInEditor", shown }
                 };
             }
@@ -366,6 +413,7 @@ namespace TiaBridge
             PlcTarget plc = ResolvePlc(args);
             if (targetKind == "block")
             {
+                if (string.IsNullOrEmpty(targetName)) throw new ArgumentException("name is required for show_in_editor kind 'block'.");
                 PlcBlockGroup owner;
                 PlcBlock blk = FindBlock(plc.Software.BlockGroup, targetName, out owner);
                 if (blk == null) throw new InvalidOperationException("Block '" + targetName + "' not found.");
@@ -374,6 +422,7 @@ namespace TiaBridge
             }
             if (targetKind == "watch_table" || targetKind == "watchtable")
             {
+                if (string.IsNullOrEmpty(targetName)) throw new ArgumentException("name is required for show_in_editor kind 'watch_table'.");
                 PlcWatchAndForceTableGroup owner;
                 PlcWatchTable wt = FindWatchTable(plc.Software.WatchAndForceTableGroup, targetName, out owner);
                 if (wt == null) throw new InvalidOperationException("Watch table '" + targetName + "' not found.");
@@ -391,6 +440,7 @@ namespace TiaBridge
             }
             if (targetKind == "udt" || targetKind == "type")
             {
+                if (string.IsNullOrEmpty(targetName)) throw new ArgumentException("name is required for show_in_editor kind 'type'.");
                 PlcType pt = FindPlcType(plc.Software.TypeGroup, targetName);
                 if (pt == null) throw new InvalidOperationException("PLC data type '" + targetName + "' not found.");
                 pt.ShowInEditor();
