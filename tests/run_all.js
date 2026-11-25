@@ -17,7 +17,13 @@ const X = require('../server/ladder/xml');
 
 let passed = 0;
 let total = 0;
-function test(name, fn) {
+const suite = process.argv[2] || 'all';
+if (!['offline', 'tia', 'all'].includes(suite)) {
+  throw new Error('Expected test suite: offline, tia or all');
+}
+
+function test(name, fn, group = 'offline') {
+  if (suite !== 'all' && suite !== group) return;
   total++;
   return Promise.resolve().then(fn).then(() => {
     passed++;
@@ -26,6 +32,42 @@ function test(name, fn) {
     console.error('  [FAIL]', name, '\n       ', err && err.stack ? err.stack : err);
     process.exitCode = 1;
   });
+}
+
+async function withMcpServer(run) {
+  const serverPath = path.join(__dirname, '..', 'server', 'index.js');
+  const child = spawn(process.execPath, [serverPath], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const pending = new Map();
+  let buf = '';
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', chunk => {
+    buf += chunk;
+    let idx;
+    while ((idx = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, idx).trim();
+      buf = buf.slice(idx + 1);
+      if (!line) continue;
+      const msg = JSON.parse(line);
+      const w = pending.get(msg.id);
+      if (w) { pending.delete(msg.id); w.resolve(msg); }
+    }
+  });
+  let nextId = 1;
+  const rpc = (method, params) => new Promise((resolve, reject) => {
+    const id = nextId++;
+    const t = setTimeout(() => reject(new Error('MCP RPC timeout: ' + method)), 15000);
+    pending.set(id, { resolve: m => { clearTimeout(t); resolve(m); } });
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+  });
+
+  try {
+    const init = await rpc('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '1.0' } });
+    assert.strictEqual(init.result.serverInfo.name, 'tia-portal-v20-mcp');
+
+    await run(rpc);
+  } finally {
+    child.kill();
+  }
 }
 
 async function main() {
@@ -86,6 +128,13 @@ async function main() {
     ], {});
 
     assert(patched.xml.includes(untouchedBlock), 'Untouched NW2 MC_Power XML MUST remain byte-for-byte intact!');
+    function secondUnit(xml) {
+      const { start, end } = B.parseBlock(xml).networks[1].el;
+      return Buffer.from(xml.slice(start, end));
+    }
+    assert.deepStrictEqual(secondUnit(patched.xml), secondUnit(customXml));
+    const changedWire = secondUnit(customXml).toString().replace(/<Wire UId="\d+"/, '<Wire UId="99999"');
+    assert.notDeepStrictEqual(Buffer.from(changedWire), secondUnit(patched.xml));
     const parsed = B.parseBlock(patched.xml);
     assert.strictEqual(parsed.networks.length, 3);
     assert(parsed.interface.Static.some(m => m.name === 'T_Spindle' && m.type === 'TON_TIME'), 'Auto-declared Static T_Spindle:TON_TIME');
@@ -152,37 +201,8 @@ async function main() {
     assert.strictEqual(sim.ok, true, 'Simulation failed:\n' + S.formatResults(sim));
   });
 
-  // 5. Full Live MCP Server Stdio JSON-RPC 2.0 Integration Test
-  await test('5. MCP Server stdio JSON-RPC (initialize, tools/list, live tia_status, offline create/read/patch/analyze/dry_run)', async () => {
-    const serverPath = path.join(__dirname, '..', 'server', 'index.js');
-    const child = spawn(process.execPath, [serverPath], { stdio: ['pipe', 'pipe', 'pipe'] });
-    const pending = new Map();
-    let buf = '';
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', chunk => {
-      buf += chunk;
-      let idx;
-      while ((idx = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, idx).trim();
-        buf = buf.slice(idx + 1);
-        if (!line) continue;
-        const msg = JSON.parse(line);
-        const w = pending.get(msg.id);
-        if (w) { pending.delete(msg.id); w.resolve(msg); }
-      }
-    });
-    let nextId = 1;
-    const rpc = (method, params) => new Promise((resolve, reject) => {
-      const id = nextId++;
-      const t = setTimeout(() => reject(new Error('MCP RPC timeout: ' + method)), 15000);
-      pending.set(id, { resolve: m => { clearTimeout(t); resolve(m); } });
-      child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
-    });
-
-    try {
-      const init = await rpc('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '1.0' } });
-      assert.strictEqual(init.result.serverInfo.name, 'tia-portal-v20-mcp');
-
+  await test('Offline MCP: list tools, create, patch and simulate a timed output', async () => {
+    await withMcpServer(async rpc => {
       const listed = await rpc('tools/list', {});
       assert.strictEqual(listed.result.tools.length, 30, 'Expected 30 MCP tools, got ' + listed.result.tools.length);
       const toolNames = new Set(listed.result.tools.map(t => t.name));
@@ -200,6 +220,82 @@ async function main() {
         assert(toolNames.has(nt), 'Missing newly added MCP tool in tools/list: ' + nt);
       }
 
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tia-mcp-'));
+      const tmpXml = path.join(dir, 'FB_McpTest.xml');
+      try {
+        const created = await rpc('tools/call', {
+          name: 'tia_create_ladder_block',
+          arguments: {
+            type: 'FB', name: 'FB_McpTest', outXmlPath: tmpXml, importToTia: false,
+            interface: { Input: [{ name: 'Btn', type: 'Bool' }], Output: [{ name: 'Lamp', type: 'Bool' }] },
+            networks: [{ title: 'Light', dsl: 'NO(#Btn) => COIL(#Lamp)' }],
+          },
+        });
+        assert(!created.result.isError, created.result.content[0].text);
+
+        const original = fs.readFileSync(tmpXml);
+        const call = (name, args) => rpc('tools/call', { name, arguments: args });
+        const patch = {
+          xmlPath: tmpXml,
+          ops: [{ op: 'replace', nw: 1, dsl: 'NO(#Btn) => TON(#T1, PT=T#500ms) => COIL(#Lamp)', title: 'Delayed Light' }],
+        };
+        const preview = await call('tia_patch_ladder_network', { ...patch, previewOnly: true });
+        assert(!preview.result.isError, preview.result.content[0].text);
+        const report = preview.result.content[0].text.replace(/^PREVIEW\n/, '');
+        for (const expected of ['Before NW1: Light', 'After NW1: Delayed Light', 'TON_TIME']) assert(report.includes(expected));
+        assert.deepStrictEqual(fs.readFileSync(tmpXml), original);
+        const mixed = await call('tia_patch_ladder_network', {
+          xmlPath: tmpXml, previewOnly: true,
+          ops: [
+            { op: 'insert', nw: 1, title: 'Inserted', dsl: 'NC(#Btn) => COIL(#Lamp)' },
+            { op: 'delete', nw: 2 },
+            { op: 'set_text', nw: 1, comment: 'Check button' },
+            { op: 'append', title: 'Appended', dsl: 'NO(#Btn) => COIL(#Lamp)' },
+          ],
+        });
+        assert(!mixed.result.isError, mixed.result.content[0].text);
+        for (const expected of ['Before NW1: Light', 'After NW1: Inserted', 'Check button', 'After NW2: Appended']) {
+          assert(mixed.result.content[0].text.includes(expected));
+        }
+        assert.deepStrictEqual(fs.readFileSync(tmpXml), original);
+        const listed = await call('tia_rollback_block', { xmlPath: tmpXml });
+        assert(listed.result.content[0].text.includes('No backups found'));
+        const patched = await call('tia_patch_ladder_network', { ...patch, compact: true });
+        assert(!patched.result.isError, patched.result.content[0].text);
+        assert(patched.result.content[0].text.endsWith(report));
+        const backupFile = path.basename(/^BACKUP: (.+)$/m.exec(patched.result.content[0].text)[1]);
+
+        const sim = await rpc('tools/call', {
+          name: 'tia_dry_run_ladder',
+          arguments: {
+            entry: 'FB_McpTest', xmlPaths: [tmpXml],
+            scenario: {
+              scanMs: 50,
+              steps: [
+                { set: { '#Btn': 1 }, run: 'T#200ms', expect: { '#Lamp': 0 } },
+                { run: 'T#400ms', expect: { '#Lamp': 1 } },
+              ],
+            },
+          },
+        });
+        assert(!sim.result.isError, sim.result.content[0].text);
+        assert(sim.result.content[0].text.startsWith('PASS'), sim.result.content[0].text);
+        const other = path.join(dir, 'other', path.basename(tmpXml));
+        fs.mkdirSync(path.dirname(other));
+        fs.copyFileSync(tmpXml, other);
+        const rollback = xmlPath => call('tia_rollback_block', { xmlPath, backupFile, action: 'restore' });
+        assert((await rollback(other)).result.isError);
+        assert.deepStrictEqual(fs.readFileSync(other), fs.readFileSync(tmpXml));
+        assert(!(await rollback(tmpXml)).result.isError);
+        assert.deepStrictEqual(fs.readFileSync(tmpXml), original);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  await test('TIA MCP: Openness status and bridge smoke tests', async () => {
+    await withMcpServer(async rpc => {
       // Call live tia_status (spawns real compiled TiaBridge.exe!)
       const st = await rpc('tools/call', { name: 'tia_status', arguments: {} });
       assert(!st.result.isError, 'tia_status error: ' + st.result.content[0].text);
@@ -227,49 +323,8 @@ async function main() {
         const res = await rpc('tools/call', probe);
         assert(res && res.result && Array.isArray(res.result.content) && res.result.content.length > 0, 'Malformed MCP response from ' + probe.name);
       }
-
-      // Offline create -> read -> patch -> analyze -> dry_run via MCP tools!
-      const tmpXml = path.join(os.tmpdir(), 'tia_mcp_test_fb.xml');
-      const created = await rpc('tools/call', {
-        name: 'tia_create_ladder_block',
-        arguments: {
-          type: 'FB', name: 'FB_McpTest', outXmlPath: tmpXml, importToTia: false,
-          interface: { Input: [{ name: 'Btn', type: 'Bool' }], Output: [{ name: 'Lamp', type: 'Bool' }] },
-          networks: [{ title: 'Light', dsl: 'NO(#Btn) => COIL(#Lamp)' }],
-        },
-      });
-      assert(!created.result.isError, created.result.content[0].text);
-
-      const patched = await rpc('tools/call', {
-        name: 'tia_patch_ladder_network',
-        arguments: {
-          xmlPath: tmpXml,
-          ops: [{ op: 'replace', nw: 1, dsl: 'NO(#Btn) => TON(#T1, PT=T#500ms) => COIL(#Lamp)', title: 'Delayed Light' }],
-        },
-      });
-      assert(!patched.result.isError, patched.result.content[0].text);
-
-      const sim = await rpc('tools/call', {
-        name: 'tia_dry_run_ladder',
-        arguments: {
-          entry: 'FB_McpTest', xmlPaths: [tmpXml],
-          scenario: {
-            scanMs: 50,
-            steps: [
-              { set: { '#Btn': 1 }, run: 'T#200ms', expect: { '#Lamp': 0 } },
-              { run: 'T#400ms', expect: { '#Lamp': 1 } },
-            ],
-          },
-        },
-      });
-      assert(!sim.result.isError, sim.result.content[0].text);
-      assert(sim.result.content[0].text.startsWith('PASS'), sim.result.content[0].text);
-
-      try { fs.unlinkSync(tmpXml); } catch { }
-    } finally {
-      child.kill();
-    }
-  });
+    });
+  }, 'tia');
 
   // 6. New Ladder V20 features: <Part Name="O"> parallel OR, Sub without Card, SIN/COS/CONV/NORM_X/SCALE_X/LIMIT, Array & Motion
   await test('6. Ladder V20 features (O-gate OR, Sub without Card, CONV, SIN, COS, NORM_X, SCALE_X, Array, Motion) roundtrip & dry-run', () => {

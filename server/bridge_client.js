@@ -3,6 +3,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { spawn } = require('child_process');
 const L = require('./ladder/learn');
 
@@ -134,9 +135,9 @@ class BridgeClient {
 
   saveBackup(blockName, xmlContent) {
     ensureDir(BACKUPS_DIR);
-    const fname = safeName(blockName) + '__' + timestamp() + '.xml';
+    const fname = safeName(blockName) + '__' + timestamp() + '_' + crypto.randomBytes(6).toString('hex') + '.xml';
     const full = path.join(BACKUPS_DIR, fname);
-    fs.writeFileSync(full, xmlContent, 'utf8');
+    fs.writeFileSync(full, xmlContent, { encoding: 'utf8', flag: 'wx' });
     return full;
   }
 
@@ -151,7 +152,13 @@ class BridgeClient {
         const full = path.join(BACKUPS_DIR, f);
         const st = fs.statSync(full);
         return { file: f, path: full, size: st.size, mtime: st.mtime.toISOString() };
-      });
+      }).sort((a, b) => b.mtime.localeCompare(a.mtime));
+  }
+
+  offlineBackupLabel(xmlPath) {
+    const real = fs.realpathSync.native(xmlPath);
+    const key = process.platform === 'win32' ? real.toLowerCase() : real;
+    return path.parse(real).name + '__' + crypto.createHash('sha256').update(key).digest('hex').slice(0, 24);
   }
 
   writeSimTableCsv(name, rows) {

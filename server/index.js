@@ -7,6 +7,7 @@ const fs = require('fs');
 const path = require('path');
 const { BridgeClient, EXPORTS_DIR, ensureDir } = require('./bridge_client');
 const B = require('./ladder/block');
+const { readFlgNet } = require('./ladder/reader');
 const D = require('./ladder/dsl');
 const L = require('./ladder/learn');
 const A = require('./ladder/analyzer');
@@ -45,6 +46,33 @@ async function exportBlockXml(blockName, plcName) {
   const res = await bridge.call('export_block', { blockName, plcName: plcName || '', outPath, format: 'xml' });
   const xml = fs.readFileSync(res.path, 'utf8');
   return { xml, meta: res };
+}
+
+function patchSummary(original, patch) {
+  function units(xml) {
+    return new Map(B.parseBlock(xml).networks.map(n =>
+      [n.id, { network: n, raw: xml.slice(n.el.start, n.el.end) }]));
+  }
+  const before = units(original);
+  const after = units(patch.xml);
+  const lines = [...patch.changes, ...patch.warnings];
+  for (const db of patch.dbInstances) lines.push('DB: ' + db.name + ' (' + db.type + ')');
+  for (const id of new Set([...before.keys(), ...after.keys()])) {
+    const old = before.get(id);
+    const next = after.get(id);
+    if (old && next && old.raw === next.raw) continue;
+    for (const [label, item] of [['Before', old], ['After', next]]) {
+      if (!item) continue;
+      const n = item.network;
+      lines.push(label + ' NW' + n.index + ': ' + n.title);
+      if (n.comment) lines.push(n.comment);
+      if (n.flg) {
+        const read = readFlgNet(n.flg);
+        lines.push(read.dsl, ...(read.notes || []));
+      } else lines.push(n.lang);
+    }
+  }
+  return lines.join('\n');
 }
 
 function fmtValue(v) {
@@ -268,6 +296,8 @@ const TOOLS = [
       properties: {
         blockName: { type: 'string', description: 'Block name in TIA Portal.' },
         xmlPath: { type: 'string', description: 'Optional offline XML path (edits file in-place instead of TIA import).' },
+        previewOnly: { type: 'boolean', description: 'Preview changes in memory without applying them.' },
+        compact: { type: 'boolean', description: 'Report only changed networks after applying.' },
         plcName: { type: 'string' },
         group: { type: 'string', description: 'Block folder path if block is in a user group.' },
         declare: {
@@ -397,6 +427,7 @@ const TOOLS = [
         action: { type: 'string', enum: ['list', 'restore'], description: 'Default: list.' },
         blockName: { type: 'string', description: 'Block name to filter backups or restore.' },
         backupFile: { type: 'string', description: 'Specific backup filename from backups/ (defaults to latest backup of blockName).' },
+        xmlPath: { type: 'string', description: 'List or restore backups for this existing offline XML file. Restore requires backupFile.' },
         plcName: { type: 'string' },
         group: { type: 'string' },
       },
@@ -957,7 +988,7 @@ async function handleTool(name, args) {
       if (offline) {
         targetPath = args.xmlPath;
         xml = fs.readFileSync(targetPath, 'utf8');
-        blockLabel = path.basename(targetPath, '.xml');
+        blockLabel = bridge.offlineBackupLabel(targetPath);
       } else {
         if (!args.blockName) throw new Error('Provide blockName or xmlPath.');
         const exp = await exportBlockXml(args.blockName, args.plcName);
@@ -965,8 +996,10 @@ async function handleTool(name, args) {
         targetPath = exp.meta.path;
         blockLabel = args.blockName;
       }
-      const backup = bridge.saveBackup(blockLabel, xml);
       const patched = B.patchNetworks(xml, args.ops, getLadderCtx({ declare: args.declare }));
+      const summary = args.previewOnly || args.compact ? patchSummary(xml, patched) : '';
+      if (args.previewOnly) return { text: 'PREVIEW\n' + summary };
+      const backup = bridge.saveBackup(blockLabel, xml);
       fs.writeFileSync(targetPath, patched.xml, 'utf8');
 
       let importMsg = 'Wrote patched XML offline to ' + targetPath;
@@ -978,7 +1011,6 @@ async function handleTool(name, args) {
         });
         importMsg = 'Imported back into TIA Portal: ' + (imp.blocks || []).join(', ');
       }
-      const preview = B.readBlock(patched.xml, { format: 'dsl', ctx: getLadderCtx() });
       const lines = [
         'PATCH OK — ' + patched.changes.join('; '),
         'BACKUP: ' + backup,
@@ -996,7 +1028,7 @@ async function handleTool(name, args) {
         }
       }
       lines.push('');
-      lines.push(B.formatBlock(preview));
+      lines.push(args.compact ? summary : B.formatBlock(B.readBlock(patched.xml, { format: 'dsl', ctx: getLadderCtx() })));
       return { text: lines.join('\n') };
     }
 
@@ -1006,7 +1038,7 @@ async function handleTool(name, args) {
       if (offline) {
         targetPath = args.xmlPath;
         xml = fs.readFileSync(targetPath, 'utf8');
-        blockLabel = path.basename(targetPath, '.xml');
+        blockLabel = bridge.offlineBackupLabel(targetPath);
       } else {
         if (!args.blockName) throw new Error('Provide blockName or xmlPath.');
         const exp = await exportBlockXml(args.blockName, args.plcName);
@@ -1071,10 +1103,25 @@ async function handleTool(name, args) {
 
     case 'tia_rollback_block': {
       const action = args.action || 'list';
-      const list = bridge.listBackups(args.blockName);
+      const list = bridge.listBackups(args.xmlPath ? bridge.offlineBackupLabel(args.xmlPath) : args.blockName);
       if (action === 'list') {
         if (!list.length) return { text: 'No backups found' + (args.blockName ? ' for "' + args.blockName + '"' : '') + '.' };
         return { text: 'BACKUPS (' + list.length + '):\n' + list.slice(0, 30).map(b => '  ' + b.file + ' (' + b.size + ' B, ' + b.mtime + ')').join('\n') };
+      }
+      if (args.xmlPath) {
+        if (action !== 'restore') throw new Error('Expected list or restore.');
+        const backup = list.find(item => item.file === args.backupFile);
+        if (!backup) throw new Error('Select a backupFile listed for this xmlPath.');
+        const target = fs.realpathSync.native(args.xmlPath);
+        const dir = fs.mkdtempSync(path.join(path.dirname(target), '.tia-restore-'));
+        try {
+          const staged = path.join(dir, 'restore.xml');
+          fs.copyFileSync(backup.path, staged);
+          fs.renameSync(staged, target);
+        } finally {
+          fs.rmSync(dir, { recursive: true, force: true });
+        }
+        return { text: 'Restored ' + backup.file + ' to ' + target };
       }
       const chosen = args.backupFile
         ? list.find(b => b.file === args.backupFile) || { path: path.join(path.dirname(list[0] ? list[0].path : EXPORTS_DIR), args.backupFile), file: args.backupFile }
