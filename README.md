@@ -106,8 +106,14 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 
 ### Bước 3: Chạy kiểm thử tự động
 ```powershell
-node .\tests\run_all.js
+npm run test:offline   # Chỉ cần Node.js, có thể bỏ qua bước biên dịch bridge
+npm run test:tia       # Kiểm thử bridge trên máy Windows có TIA V20 và Openness
+npm test               # Chạy cả hai nhóm
 ```
+
+Khi sửa XML offline bằng `tia_patch_ladder_network`, truyền `xmlPath`, `ops` và `previewOnly: true` để xem DSL trước/sau, các khai báo mới và cảnh báo. Để áp dụng cùng thay đổi và nhận báo cáo rút gọn, dùng `compact: true` và bỏ `previewOnly`.
+
+Để hoàn tác, gọi `tia_rollback_block` với `action: "list"` và cùng `xmlPath`. Sau đó gọi `action: "restore"` với `xmlPath` và tên `backupFile` đã chọn. Các bản sao mới gắn với đường dẫn file gốc. Bản sao từ phiên bản cũ vẫn có thể liệt kê bằng `blockName`.
 
 ### Bước 4: Cấu hình MCP Client (Ví dụ: Claude Desktop hoặc Antigravity)
 Thêm vào file cấu hình `mcp_config.json`:
