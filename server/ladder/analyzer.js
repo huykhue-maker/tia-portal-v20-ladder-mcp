@@ -34,8 +34,10 @@ function analyze(blockReads, opts) {
         if (mode === 'w' || mode === 'rw') {
           if (op.k === 'local' && op.path.length === 1) written.add(head);
           const kind = node && node.t === 'coil' ? node.kind : 'ASSIGN';
-          if (!writes.has(key)) writes.set(key, []);
-          writes.get(key).push({ block: bname, nw: n.index, kind });
+          const scope = op.k === 'local' ? bname : null;
+          const writeKey = JSON.stringify([scope, key]);
+          if (!writes.has(writeKey)) writes.set(writeKey, []);
+          writes.get(writeKey).push({ block: bname, nw: n.index, kind, key });
           if (op.k !== 'local') { if (!globalWrite.has(key)) globalWrite.set(key, new Set()); globalWrite.get(key).add(bname); }
         }
       });
@@ -56,7 +58,8 @@ function analyze(blockReads, opts) {
     }
     if (nonLad) add('info', 'NON_LAD', nonLad + ' non-Ladder network(s) skipped in ' + bname, bname);
   }
-  for (const [key, list] of writes) {
+  for (const list of writes.values()) {
+    const key = list[0].key;
     const coils = list.filter(w => w.kind === 'COIL' || w.kind === 'NCOIL');
     const sets = list.filter(w => w.kind === 'SET'), resets = list.filter(w => w.kind === 'RESET');
     const loc = l => l.map(w => w.block + ' NW' + w.nw).join(', ');

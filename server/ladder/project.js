@@ -1,0 +1,169 @@
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const B = require('./block');
+const A = require('./analyzer');
+const D = require('./dsl');
+const S = require('./simulator');
+const X = require('./xml');
+
+function* xmlFiles(directory) {
+  for (const name of fs.readdirSync(directory).sort()) {
+    const file = path.join(directory, name);
+    const stat = fs.lstatSync(file);
+    if (stat.isDirectory()) yield* xmlFiles(file);
+    else if (stat.isFile() && path.extname(name).toLowerCase() === '.xml') yield file;
+  }
+}
+
+function* calls(flows) {
+  for (const flow of flows) for (const action of flow.then) {
+    if (action.t === 'call') yield action;
+    if (action.next) yield* calls(action.next);
+  }
+}
+
+function loadBlocks(directory) {
+  const reads = new Map();
+  const dependencies = new Map();
+  for (const file of xmlFiles(directory)) {
+    try {
+      const block = B.readBlock(fs.readFileSync(file, 'utf8'), { simulationOnly: true });
+      const name = block.block.name;
+      if (!name || !['OB', 'FB', 'FC'].includes(block.block.type)) throw new Error('Expected a named OB, FB or FC');
+      if (!block.networks.length) throw new Error(name + ': no LAD networks to simulate');
+      if (reads.has(name)) throw new Error('Duplicate block: ' + name);
+      const refs = [];
+      for (const net of block.networks) {
+        if (!net.complete) throw new Error(name + ' NW' + net.index + ': ' + (net.notes.join('; ') || 'incomplete LAD decoding'));
+        for (const call of calls(net.flows)) refs.push({ call, nw: net.index });
+      }
+      // Keep the decoded networks and interface; release the source XML and syntax tree.
+      const { doc, ...decoded } = block;
+      reads.set(name, decoded);
+      dependencies.set(name, refs);
+    } catch (error) {
+      throw new Error(path.relative(directory, file) + ': ' + error.message);
+    }
+  }
+  if (!reads.size) throw new Error('No block XML files in ' + directory);
+  const checked = new Set();
+  const active = new Set();
+  function visit(name) {
+    if (checked.has(name)) return;
+    if (active.has(name)) throw new Error('Recursive CALL: ' + [...active, name].join(' -> '));
+    active.add(name);
+    for (const { call, nw } of dependencies.get(name)) {
+      const target = call.name;
+      const callee = reads.get(target);
+      const where = name + ' NW' + nw + ': ';
+      if (!callee) throw new Error(where + 'missing CALL target ' + target);
+      if (callee.block.type !== call.blockType) throw new Error(where + 'CALL expects ' + call.blockType + ' but ' + target + ' is ' + callee.block.type);
+      const pins = ['Input', 'Output', 'InOut', 'Return'].flatMap(section => callee.interface[section] || []);
+      for (const pin of Object.keys(call.args)) {
+        if (!pins.some(p => p.name === pin)) throw new Error(where + 'unknown parameter ' + target + '.' + pin);
+      }
+      visit(target);
+    }
+    active.delete(name);
+    checked.add(name);
+  }
+  for (const name of reads.keys()) visit(name);
+  return reads;
+}
+
+function validateScenario(test, entry) {
+  if (!Array.isArray(test.steps) || !test.steps.length) throw new Error('Expected non-empty steps');
+  for (const field of Object.keys(test)) {
+    if (!['name', 'entry', 'scanMs', 'watch', 'init', 'steps'].includes(field)) throw new Error('Unknown case field ' + field);
+  }
+  if (test.init !== undefined && (!test.init || typeof test.init !== 'object' || Array.isArray(test.init))) throw new Error('init must be a variable map');
+  if (test.watch !== undefined && !Array.isArray(test.watch)) throw new Error('watch must be an array of variables');
+  const locals = new Set(Object.values(entry.interface).flat().map(member => member.name));
+  function checkKeys(keys) {
+    for (const key of keys) {
+      const op = D.parseOperandString(key);
+      if (op.k === 'lit' || op.k === 'raw') throw new Error('Expected variable name: ' + key);
+      if (op.k === 'local' && !locals.has(op.path[0])) throw new Error('Unknown local ' + key + ' in ' + entry.block.name);
+    }
+  }
+  checkKeys(Object.keys(test.init || {}));
+  checkKeys(test.watch || []);
+  for (const [i, step] of test.steps.entries()) {
+    const label = 'step ' + (i + 1);
+    if (!step || typeof step !== 'object' || Array.isArray(step)) throw new Error(label + ': expected an object');
+    for (const field of Object.keys(step)) {
+      if (!['run', 'set', 'expect', 'until', 'timeout', 'tolerance'].includes(field)) throw new Error(label + ': unknown field ' + field);
+    }
+    for (const values of [step.set, step.expect, step.until]) {
+      if (values === undefined) continue;
+      if (!values || typeof values !== 'object' || Array.isArray(values)) throw new Error(label + ': expected a variable map');
+      checkKeys(Object.keys(values));
+    }
+    if (step.run !== undefined) {
+      const duration = typeof step.run === 'string' ? S.parseTime(step.run) : null;
+      const valid = duration !== null ? duration >= 0 : Number.isSafeInteger(step.run) && step.run >= 0;
+      if (!valid) throw new Error(label + ': invalid run');
+    }
+    if (step.tolerance !== undefined && (!Number.isFinite(step.tolerance) || step.tolerance < 0)) throw new Error(label + ': invalid tolerance');
+    if (step.timeout !== undefined && !step.until) throw new Error(label + ': timeout requires until');
+  }
+}
+
+function runProject(manifestPath) {
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8').replace(/^\uFEFF/, ''));
+  if (!manifest || !Array.isArray(manifest.cases) || !manifest.cases.length) throw new Error('Expected non-empty cases in project manifest');
+  const reads = loadBlocks(path.resolve(path.dirname(manifestPath), manifest.blockDir || 'blocks'));
+  const blocks = [...reads.values()];
+  const analysis = A.analyze(blocks);
+  const program = S.buildProgram(blocks, manifest.entry);
+  const cases = [];
+  const names = new Set();
+  for (const test of manifest.cases) {
+    if (!test || typeof test.name !== 'string' || !test.name.trim() || names.has(test.name)) throw new Error('Each case needs a distinct non-empty name');
+    names.add(test.name);
+    const entry = test.entry === undefined ? manifest.entry : test.entry;
+    try {
+      if (!reads.has(entry)) throw new Error('Unknown entry block: ' + entry);
+      validateScenario(test, reads.get(entry));
+      const result = S.runScenario({ ...program, entry }, test);
+      if (!result.expects.length) throw new Error('Case needs at least one expect or until assertion');
+      cases.push({ name: test.name, entry, status: result.ok ? 'passed' : 'failed', result });
+    } catch (error) {
+      cases.push({ name: test.name, entry, status: 'error', message: error.message });
+    }
+  }
+  return { ok: !analysis.summary.error && cases.every(c => c.status === 'passed'), blocks: [...reads.keys()], analysis, cases };
+}
+
+function caseDetails(c) {
+  if (!c.result) return c.message;
+  const lines = c.result.expects.filter(e => !e.ok).map(e =>
+    'step ' + e.step + ' @' + e.t + 'ms: ' + e.key + ' expected ' + e.expected + ', got ' + e.actual);
+  return lines.concat(c.result.warnings).join('\n');
+}
+
+function formatReport(report, format = 'text') {
+  if (format === 'json') return JSON.stringify(report, null, 2);
+  if (format === 'junit') {
+    const tests = [{ name: 'Static analysis', status: report.analysis.summary.error ? 'failed' : 'passed', details: A.formatAnalysis(report.analysis) },
+      ...report.cases.map(c => ({ name: c.name, status: c.status, details: caseDetails(c) }))];
+    const count = status => tests.filter(t => t.status === status).length;
+    return '<testsuite name="LAD offline" tests="' + tests.length + '" failures="' + count('failed') + '" errors="' + count('error') + '">\n' +
+      tests.map(t => {
+        const tag = t.status === 'error' ? 'error' : t.status === 'failed' ? 'failure' : 'system-out';
+        return '  <testcase name="' + X.escAttr(t.name) + '">' + (t.details ? '<' + tag + '>' + X.esc(t.details) + '</' + tag + '>' : '') + '</testcase>';
+      }).join('\n') + '\n</testsuite>';
+  }
+  if (format !== 'text') throw new Error('Expected report format text, json or junit');
+  const lines = [(report.ok ? 'PASS' : 'FAIL') + ' | ' + report.blocks.length + ' blocks | ' + report.cases.filter(c => c.status === 'passed').length + '/' + report.cases.length + ' cases passed', A.formatAnalysis(report.analysis)];
+  for (const c of report.cases) {
+    lines.push(c.status.toUpperCase() + ' ' + c.name + ' (' + c.entry + ')' + (c.result ? ' - ' + c.result.scans + ' scans, ' + c.result.time + ' ms' : ''));
+    const details = caseDetails(c);
+    if (details) lines.push(details);
+  }
+  return lines.join('\n');
+}
+
+module.exports = { runProject, formatReport };

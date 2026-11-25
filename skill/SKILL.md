@@ -20,3 +20,5 @@ description: >-
 5. `tia_dry_run_ladder` (mô phỏng chu kỳ quét PLC tức thì trong RAM với kịch bản test)
 6. `tia_compile(enableSimulation=true)` -> sửa nếu có lỗi
 7. `tia_sim_prepare` -> `tia_download_and_online(action="download")` -> `tia_save_project`
+
+Với bộ hồi quy nhiều block XML offline, gọi `tia_test_ladder_project` với `manifestPath` trỏ đến suite JSON. Dùng `format: "json"` để kiểm tra `ok`, từng assertion và timeline. Ví dụ hoàn chỉnh ở `examples/inspection/suite.json`.
