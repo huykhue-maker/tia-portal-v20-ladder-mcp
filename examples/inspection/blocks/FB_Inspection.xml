@@ -1,0 +1,192 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Document>
+  <Engineering version="V20" />
+  <SW.Blocks.FB ID="0">
+    <AttributeList>
+      <Interface>
+        <Sections xmlns="http://www.siemens.com/automation/Openness/SW/Interface/v5">
+          <Section Name="Input">
+            <Member Name="Present" Datatype="Bool" />
+            <Member Name="Enabled" Datatype="Bool" />
+          </Section>
+          <Section Name="Output">
+            <Member Name="Eligible" Datatype="Bool" />
+            <Member Name="Ready" Datatype="Bool" />
+          </Section>
+          <Section Name="InOut" />
+          <Section Name="Static">
+            <Member Name="Delay" Datatype="&quot;FB_Delay&quot;" />
+          </Section>
+          <Section Name="Temp" />
+          <Section Name="Constant" />
+        </Sections>
+      </Interface>
+      <MemoryLayout>Optimized</MemoryLayout>
+      <Name>FB_Inspection</Name>
+      <Namespace />
+      <AutoNumber>true</AutoNumber>
+      <ProgrammingLanguage>LAD</ProgrammingLanguage>
+    </AttributeList>
+    <ObjectList>
+      <MultilingualText ID="1" CompositionName="Comment">
+        <ObjectList>
+          <MultilingualTextItem ID="2" CompositionName="Items">
+            <AttributeList>
+              <Culture>en-US</Culture>
+              <Text></Text>
+            </AttributeList>
+          </MultilingualTextItem>
+        </ObjectList>
+      </MultilingualText>
+      <MultilingualText ID="3" CompositionName="Title">
+        <ObjectList>
+          <MultilingualTextItem ID="4" CompositionName="Items">
+            <AttributeList>
+              <Culture>en-US</Culture>
+              <Text></Text>
+            </AttributeList>
+          </MultilingualTextItem>
+        </ObjectList>
+      </MultilingualText>
+      <SW.Blocks.CompileUnit ID="5" CompositionName="CompileUnits">
+        <AttributeList>
+          <NetworkSource>
+            <FlgNet xmlns="http://www.siemens.com/automation/Openness/SW/NetworkSource/FlgNet/v5">
+              <Parts>
+                <Call UId="21">
+                  <CallInfo Name="FC_Eligible" BlockType="FC">
+                    <Parameter Name="Present" Section="Input" Type="Bool" />
+                    <Parameter Name="Enabled" Section="Input" Type="Bool" />
+                    <Parameter Name="Eligible" Section="Output" Type="Bool" />
+                  </CallInfo>
+                </Call>
+                <Access Scope="LocalVariable" UId="22">
+                  <Symbol>
+                    <Component Name="Present" />
+                  </Symbol>
+                </Access>
+                <Access Scope="LocalVariable" UId="23">
+                  <Symbol>
+                    <Component Name="Enabled" />
+                  </Symbol>
+                </Access>
+                <Access Scope="LocalVariable" UId="24">
+                  <Symbol>
+                    <Component Name="Eligible" />
+                  </Symbol>
+                </Access>
+              </Parts>
+              <Wires>
+                <Wire UId="25">
+                  <Powerrail />
+                  <NameCon UId="21" Name="en" />
+                </Wire>
+                <Wire UId="26">
+                  <IdentCon UId="22" />
+                  <NameCon UId="21" Name="Present" />
+                </Wire>
+                <Wire UId="27">
+                  <IdentCon UId="23" />
+                  <NameCon UId="21" Name="Enabled" />
+                </Wire>
+                <Wire UId="28">
+                  <NameCon UId="21" Name="Eligible" />
+                  <IdentCon UId="24" />
+                </Wire>
+              </Wires>
+            </FlgNet>
+          </NetworkSource>
+          <ProgrammingLanguage>LAD</ProgrammingLanguage>
+        </AttributeList>
+        <ObjectList>
+          <MultilingualText ID="6" CompositionName="Comment">
+            <ObjectList>
+              <MultilingualTextItem ID="7" CompositionName="Items">
+                <AttributeList>
+                  <Culture>en-US</Culture>
+                  <Text></Text>
+                </AttributeList>
+              </MultilingualTextItem>
+            </ObjectList>
+          </MultilingualText>
+          <MultilingualText ID="8" CompositionName="Title">
+            <ObjectList>
+              <MultilingualTextItem ID="9" CompositionName="Items">
+                <AttributeList>
+                  <Culture>en-US</Culture>
+                  <Text>Check part</Text>
+                </AttributeList>
+              </MultilingualTextItem>
+            </ObjectList>
+          </MultilingualText>
+        </ObjectList>
+      </SW.Blocks.CompileUnit>
+      <SW.Blocks.CompileUnit ID="A" CompositionName="CompileUnits">
+        <AttributeList>
+          <NetworkSource>
+            <FlgNet xmlns="http://www.siemens.com/automation/Openness/SW/NetworkSource/FlgNet/v5">
+              <Parts>
+                <Call UId="21">
+                  <CallInfo Name="FB_Delay" BlockType="FB">
+                    <Instance Scope="LocalVariable" UId="22">
+                      <Component Name="Delay" />
+                    </Instance>
+                    <Parameter Name="Active" Section="Input" Type="Bool" />
+                    <Parameter Name="Ready" Section="Output" Type="Bool" />
+                  </CallInfo>
+                </Call>
+                <Access Scope="LocalVariable" UId="23">
+                  <Symbol>
+                    <Component Name="Eligible" />
+                  </Symbol>
+                </Access>
+                <Access Scope="LocalVariable" UId="24">
+                  <Symbol>
+                    <Component Name="Ready" />
+                  </Symbol>
+                </Access>
+              </Parts>
+              <Wires>
+                <Wire UId="25">
+                  <Powerrail />
+                  <NameCon UId="21" Name="en" />
+                </Wire>
+                <Wire UId="26">
+                  <IdentCon UId="23" />
+                  <NameCon UId="21" Name="Active" />
+                </Wire>
+                <Wire UId="27">
+                  <NameCon UId="21" Name="Ready" />
+                  <IdentCon UId="24" />
+                </Wire>
+              </Wires>
+            </FlgNet>
+          </NetworkSource>
+          <ProgrammingLanguage>LAD</ProgrammingLanguage>
+        </AttributeList>
+        <ObjectList>
+          <MultilingualText ID="B" CompositionName="Comment">
+            <ObjectList>
+              <MultilingualTextItem ID="C" CompositionName="Items">
+                <AttributeList>
+                  <Culture>en-US</Culture>
+                  <Text></Text>
+                </AttributeList>
+              </MultilingualTextItem>
+            </ObjectList>
+          </MultilingualText>
+          <MultilingualText ID="D" CompositionName="Title">
+            <ObjectList>
+              <MultilingualTextItem ID="E" CompositionName="Items">
+                <AttributeList>
+                  <Culture>en-US</Culture>
+                  <Text>Wait for stable detection</Text>
+                </AttributeList>
+              </MultilingualTextItem>
+            </ObjectList>
+          </MultilingualText>
+        </ObjectList>
+      </SW.Blocks.CompileUnit>
+    </ObjectList>
+  </SW.Blocks.FB>
+</Document>

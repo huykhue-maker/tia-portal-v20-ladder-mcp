@@ -20,7 +20,12 @@ function parseTime(s) {
   if (!m) return null;
   let total = 0; const re = /([\d._]+)(ms|us|ns|d|h|m|s)/gi; let t;
   const mult = { d: 86400000, h: 3600000, m: 60000, s: 1000, ms: 1, us: 0.001, ns: 0.000001 };
-  while ((t = re.exec(m[1]))) total += parseFloat(t[1].replace(/_/g, '')) * mult[t[2].toLowerCase()];
+  while ((t = re.exec(m[1]))) {
+    const digits = t[1].replace(/_/g, '');
+    if (!digits) return null;
+    total += Number(digits) * mult[t[2].toLowerCase()];
+  }
+  if (!Number.isFinite(total)) return null;
   return m[1].startsWith('-') ? -Math.abs(total) : total;
 }
 function litValue(op) {
@@ -38,12 +43,15 @@ class Frame { constructor() { this.locals = new Map(); this.timers = new Map(); 
 class Simulator {
   constructor(program, opts) {
     opts = opts || {};
-    this.program = program; this.entry = opts.entry; this.scanMs = opts.scanMs || 10;
+    this.program = program; this.entry = opts.entry;
+    this.scanMs = opts.scanMs === undefined ? 10 : opts.scanMs;
+    if (!Number.isSafeInteger(this.scanMs) || this.scanMs <= 0) throw new Error('scanMs must be a positive integer.');
     this.time = 0; this.scans = 0;
     this.globals = new Map(); this.gTimers = new Map(); this.gCounters = new Map(); this.gInst = new Map();
     this.axes = new Map(); // axisKey -> { pos, vel, enabled, homed, error, activeMove }
     this.mcInst = new Map(); // mcInstKey -> { execPrev, busy, done, aborted, error, target, speed }
     this.root = new Frame(); this.warnings = new Set(); this.types = opts.types || (() => null);
+    this.operands = new Map();
     this.prev = new Map(); this.timeline = [];
   }
 
@@ -104,7 +112,10 @@ class Simulator {
     if (typeof v === 'string') { const t = parseTime(v); v = /^L?T#/i.test(v) ? t : (/^(true|false)$/i.test(v) ? /^true$/i.test(v) : (Number.isNaN(Number(v)) ? v : Number(v))); }
     this.write(op, v, this.root);
   }
-  get(key) { return this.read(D.parseOperandString(key), this.root); }
+  get(key) {
+    if (!this.operands.has(key)) this.operands.set(key, D.parseOperandString(key));
+    return this.read(this.operands.get(key), this.root);
+  }
 
   // ---------------------------------------------------------------- conditions
   cond(n, rlo, f) {
@@ -434,7 +445,7 @@ class Simulator {
     return keys;
   }
   sample() {
-    for (const k of this.watchKeys(this.watch)) {
+    for (const k of (this.watch && this.watch.length ? this.watch : this.watchKeys())) {
       let v; try { v = this.get(k); } catch (e) { continue; }
       const old = this.prev.get(k);
       const normV = x => (typeof x === 'boolean' ? (x ? 1 : 0) : x === undefined ? 0 : x);
@@ -445,13 +456,14 @@ class Simulator {
 }
 
 function buildProgram(blockReads, entry) {
-  const blocks = {};
+  const blocks = Object.create(null);
   for (const r of blockReads) {
     const flows = []; const skipped = [];
     for (const n of r.networks) { if (n.flows && n.dsl !== null) flows.push(...n.flows); else skipped.push(n.index); }
     blocks[r.block.name] = {
       name: r.block.name, type: r.block.type, flows, skipped,
-      outputs: (r.interface.Output || []).map(m => m.name), inouts: (r.interface.InOut || []).map(m => m.name),
+      outputs: [...(r.interface.Output || []), ...(r.interface.Return || [])].map(m => m.name),
+      inouts: (r.interface.InOut || []).map(m => m.name),
     };
   }
   return { blocks, entry };
@@ -459,17 +471,21 @@ function buildProgram(blockReads, entry) {
 
 function approxEq(a, b, tol) {
   if (typeof a === 'number' && typeof b === 'number' && (!Number.isInteger(a) || !Number.isInteger(b))) {
-    return Math.abs(a - b) <= (tol || 1e-3);
+    return Math.abs(a - b) <= (tol === undefined ? 1e-3 : tol);
   }
   return a === b;
 }
 
+function expectedValue(value) {
+  return norm(typeof value === 'string' && /^L?T#/i.test(value) ? parseTime(value) : value);
+}
+
 function runScenario(program, scenario, types) {
-  const sim = new Simulator(program, { entry: program.entry, scanMs: scenario.scanMs || 10, types });
+  const sim = new Simulator(program, { entry: program.entry, scanMs: scenario.scanMs, types });
   sim.watch = (scenario.watch || []).map(k => O.text(D.parseOperandString(k)));
   const results = { expects: [], ok: true, scans: 0 };
   for (const [k, v] of Object.entries(scenario.init || {})) sim.setInput(k, v);
-  const runTime = ms => { const n = Math.max(1, Math.round(ms / sim.scanMs)); for (let i = 0; i < n; i++) sim.scan(); };
+  const runTime = ms => { const n = ms === 0 ? 0 : Math.max(1, Math.round(ms / sim.scanMs)); for (let i = 0; i < n; i++) sim.scan(); };
   let stepNo = 0;
   for (const st of (scenario.steps || [])) {
     stepNo++;
@@ -478,18 +494,29 @@ function runScenario(program, scenario, types) {
       if (typeof st.run === 'number') for (let i = 0; i < st.run; i++) sim.scan();
       else { const ms = parseTime(st.run); if (ms === null) throw new Error('step ' + stepNo + ': bad run duration ' + st.run); runTime(ms); }
     } else if (st.set && !st.until) sim.scan();
-    if (st.until) {
-      const [k, v] = Object.entries(st.until)[0]; const limit = parseTime(st.timeout || '10s'); const t0 = sim.time;
-      let hit = false;
-      while (sim.time - t0 <= limit) { sim.scan(); const cur = sim.get(k); if (approxEq(norm(cur), norm(v), st.tolerance)) { hit = true; break; } }
+    if (st.until !== undefined) {
+      if (!st.until || typeof st.until !== 'object' || Array.isArray(st.until) || Object.keys(st.until).length !== 1) {
+        throw new Error('step ' + stepNo + ': until requires exactly one variable and target value.');
+      }
+      const [k, v] = Object.entries(st.until)[0];
+      const limit = parseTime(st.timeout === undefined ? '10s' : st.timeout);
+      if (!Number.isFinite(limit) || limit < 0) throw new Error('step ' + stepNo + ': invalid timeout ' + st.timeout);
+      const t0 = sim.time;
+      const maxScans = Math.floor(limit / sim.scanMs);
+      const target = expectedValue(v);
+      const matches = () => approxEq(norm(sim.get(k)), target, st.tolerance);
+      let hit = matches();
+      for (let i = 0; !hit && i < maxScans; i++) {
+        sim.scan();
+        hit = matches();
+      }
       results.expects.push({ step: stepNo, key: k, expected: v, actual: sim.get(k), ok: hit, t: sim.time, note: hit ? 'reached after ' + (sim.time - t0) + ' ms' : 'timeout after ' + limit + ' ms' });
       if (!hit) results.ok = false;
     }
     if (st.expect) {
       for (const [k, v] of Object.entries(st.expect)) {
         const actual = sim.get(k);
-        const expectedVal = norm(typeof v === 'string' && /^L?T#/i.test(v) ? parseTime(v) : v);
-        const ok = approxEq(norm(actual), expectedVal, st.tolerance);
+        const ok = approxEq(norm(actual), expectedValue(v), st.tolerance);
         results.expects.push({ step: stepNo, key: k, expected: v, actual: actual === undefined ? 0 : actual, ok, t: sim.time });
         if (!ok) results.ok = false;
       }

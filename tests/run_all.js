@@ -72,6 +72,55 @@ async function withMcpServer(run) {
 
 async function main() {
   console.log('=== TIA Portal V20 MCP & Ladder Engine Test Suite ===');
+  await test('Offline project runner: CLI, MCP, JUnit, independent cases and diagnostics', () =>
+    require('./project')(withMcpServer));
+
+  await test('Offline MCP: until obeys the simulated deadline', async () => {
+    await withMcpServer(async rpc => {
+      async function simulate(step, scanMs = 10) {
+        const response = await rpc('tools/call', { name: 'tia_dry_run_ladder', arguments: {
+          entry: 'Main',
+          inlineBlocks: [{ name: 'Main', networks: ['ADD(#Count, 1, #Count, DInt)'] }],
+          scenario: { scanMs, init: { '#Count': 0 }, steps: [step] },
+        } });
+        return response.result;
+      }
+      for (const [target, timeout, expected] of [
+        [3, '20ms', 'FAIL - 2 scans, simulated 20 ms'],
+        [2, '20ms', 'PASS - 2 scans, simulated 20 ms'],
+        [3, '25ms', 'FAIL - 2 scans, simulated 20 ms'],
+        [1, '5ms', 'FAIL - 0 scans, simulated 0 ms'],
+        [1, '0ms', 'FAIL - 0 scans, simulated 0 ms'],
+        [0, '0ms', 'PASS - 0 scans, simulated 0 ms'],
+        [2, undefined, 'PASS - 2 scans, simulated 20 ms'],
+      ]) {
+        const result = await simulate({ until: { '#Count': target }, timeout });
+        assert(!result.isError);
+        assert.strictEqual(result.content[0].text.split('\n')[0], expected);
+      }
+      for (const value of ['bad', '1.2.3ms', '-10ms', '']) {
+        const result = await simulate({ until: { '#Count': 1 }, timeout: value });
+        assert(result.isError && /step 1.*timeout/i.test(result.content[0].text));
+      }
+      for (const until of [{}, { '#Count': 1, '#Other': 1 }]) {
+        const result = await simulate({ until });
+        assert(result.isError && /step 1.*until/i.test(result.content[0].text));
+      }
+      for (const scanMs of [0, -1, 0.5]) {
+        const result = await simulate({ run: 0 }, scanMs);
+        assert(result.isError && /scanMs/.test(result.content[0].text));
+      }
+      const elapsed = await simulate({
+        set: { '#Elapsed': 'T#20ms' }, until: { '#Elapsed': 'T#20ms' },
+        timeout: '0ms', expect: { '#Elapsed': 'T#20ms' },
+      });
+      assert(elapsed.content[0].text.startsWith('PASS - 0 scans'), elapsed.content[0].text);
+      const exact = await simulate({
+        set: { '#Value': 1.0001 }, until: { '#Value': 1 }, timeout: '0ms', tolerance: 0,
+      });
+      assert(exact.content[0].text.startsWith('FAIL - 0 scans'), exact.content[0].text);
+    });
+  });
 
   // 1. Ladder DSL <-> SimaticML XML roundtrip
   await test('1. Ladder DSL <-> SimaticML XML full roundtrip (contacts, OR branches, RTRIG, TON, CTU, CMP, MATH, MOVE, CALL)', () => {
@@ -204,7 +253,8 @@ async function main() {
   await test('Offline MCP: list tools, create, patch and simulate a timed output', async () => {
     await withMcpServer(async rpc => {
       const listed = await rpc('tools/list', {});
-      assert.strictEqual(listed.result.tools.length, 30, 'Expected 30 MCP tools, got ' + listed.result.tools.length);
+      assert(listed.result.tools.some(t => t.name === 'tia_test_ladder_project'));
+      assert.strictEqual(listed.result.tools.length, 31, 'Expected 31 MCP tools');
       const toolNames = new Set(listed.result.tools.map(t => t.name));
       const newTools = [
         'tia_watch_table',

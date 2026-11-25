@@ -1,0 +1,31 @@
+{
+  "blockDir": "blocks",
+  "entry": "FB_Inspection",
+  "cases": [
+    {
+      "name": "Part stays present for 200 ms",
+      "scanMs": 50,
+      "init": { "#Present": 1, "#Enabled": 1 },
+      "watch": ["#Eligible", "#Ready"],
+      "steps": [
+        { "run": 4, "expect": { "#Eligible": 1, "#Ready": 0 } },
+        { "until": { "#Ready": 1 }, "timeout": "50ms" }
+      ]
+    },
+    {
+      "name": "Brief pulse clears the delay",
+      "scanMs": 50,
+      "steps": [
+        { "set": { "#Present": 1, "#Enabled": 1 }, "run": 2, "expect": { "#Ready": 0 } },
+        { "set": { "#Present": 0 }, "expect": { "#Eligible": 0, "#Ready": 0 } },
+        { "set": { "#Present": 1 }, "run": 4, "expect": { "#Ready": 0 } },
+        { "run": 1, "expect": { "#Ready": 1 } }
+      ]
+    },
+    {
+      "name": "Disabled inspection ignores a present part",
+      "init": { "#Present": 1 },
+      "steps": [{ "run": "1s", "expect": { "#Eligible": 0, "#Ready": 0 } }]
+    }
+  ]
+}

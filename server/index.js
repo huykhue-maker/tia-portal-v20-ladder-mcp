@@ -12,6 +12,7 @@ const D = require('./ladder/dsl');
 const L = require('./ladder/learn');
 const A = require('./ladder/analyzer');
 const S = require('./ladder/simulator');
+const project = require('./ladder/project');
 const X = require('./ladder/xml');
 
 const SERVER_INFO = { name: 'tia-portal-v20-mcp', version: '1.0.0' };
@@ -450,6 +451,17 @@ const TOOLS = [
 
   // --- Group 4: Instant Scan-Cycle Dry-Run Simulator, Compile, PLCSIM V20, Download & Online ---
   {
+    name: 'tia_test_ladder_project',
+    description: 'Analyze a directory of offline LAD XML blocks and run named regression scenarios. Paths in the suite JSON are relative to that file. Returns text, JSON or JUnit.',
+    inputSchema: {
+      type: 'object', required: ['manifestPath'],
+      properties: {
+        manifestPath: { type: 'string', description: 'Path to the suite JSON file.' },
+        format: { type: 'string', enum: ['text', 'json', 'junit'] },
+      },
+    },
+  },
+  {
     name: 'tia_dry_run_ladder',
     description: 'Run an instant in-RAM PLC Scan-Cycle Simulation on LAD blocks (live from TIA, offline XML files, or inline DSL snippets!). Tests contacts, latches, edges, TON/TOF/TP/TONR timers, CTU/CTD/CTUD counters, comparisons, math, MOVE, and FC/FB sub-calls across multi-step scenarios with assertions & change timeline.',
     inputSchema: {
@@ -477,7 +489,7 @@ const TOOLS = [
         scenario: {
           type: 'object',
           properties: {
-            scanMs: { type: 'integer', description: 'Simulated scan cycle time in ms (default: 10).' },
+            scanMs: { type: 'integer', minimum: 1, description: 'Simulated scan cycle time in ms (default: 10).' },
             init: { type: 'object', description: 'Initial variable values, e.g. {"#Stop": 0, "\"E_Stop\"": 0}.' },
             watch: { type: 'array', items: { type: 'string' }, description: 'Variables to record in timeline & final snapshot.' },
             steps: {
@@ -487,9 +499,10 @@ const TOOLS = [
                 properties: {
                   set: { type: 'object', description: 'Variables to assign before running this step.' },
                   run: { description: 'Number of scan cycles (integer) or duration string (e.g. "T#3s", "500ms").' },
-                  until: { type: 'object', description: 'Run until single {var: value} matches.' },
-                  timeout: { type: 'string', description: 'Timeout duration for until (default "10s").' },
+                  until: { type: 'object', minProperties: 1, maxProperties: 1, description: 'Check one {var: value} now and after each whole scan up to the deadline.' },
+                  timeout: { type: 'string', description: 'Non-negative simulated duration for until (default "10s"). A zero timeout checks only the current state.' },
                   expect: { type: 'object', description: 'Assertions {var: expectedValue} checked after step.' },
+                  tolerance: { type: 'number', minimum: 0, description: 'Absolute tolerance for floating-point comparisons (default 0.001). Use 0 for an exact comparison.' },
                 },
               },
             },
@@ -1152,6 +1165,10 @@ async function handleTool(name, args) {
       return { text: 'Exported to ' + res.path + ' (' + xml.length + ' chars):\n' + xml.slice(0, maxChars) + (xml.length > maxChars ? '\n... (truncated)' : '') };
     }
 
+    case 'tia_test_ladder_project': {
+      const report = project.runProject(args.manifestPath);
+      return { text: project.formatReport(report, args.format) };
+    }
     case 'tia_dry_run_ladder': {
       const reads = [];
       for (const p of (args.xmlPaths || [])) {

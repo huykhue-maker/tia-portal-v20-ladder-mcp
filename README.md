@@ -30,7 +30,7 @@ TIA_Portal_V20_MCP/
 │   ├── TiaBridge.PlcsimAndEscape.cs# Điều khiển S7-PLCSIM Runtime & Escape Hatch phản chiếu động
 │   └── TiaBridge.exe              # File thực thi cầu nối (biên dịch qua build.ps1)
 ├── server/                        # Máy chủ MCP chạy trên Node.js (giao thức stdio JSON-RPC)
-│   ├── index.js                   # Khởi tạo 30 MCP tools
+│   ├── index.js                   # Khởi tạo 31 MCP tools
 │   └── ladder/                    # Bộ biên dịch DSL Ladder V20, AST, Analyzer và Simulator
 ├── skill/                         # File hướng dẫn tích hợp Skill cho AI Agent
 │   └── SKILL.md
@@ -43,7 +43,7 @@ TIA_Portal_V20_MCP/
 
 ---
 
-## 3. Danh sách 30 MCP Tools
+## 3. Danh sách 31 MCP Tools
 
 1. **Quản lý phiên & Dự án (5 tools):**
    - `tia_status`: Kiểm tra kết nối TIA Portal V20 và quyền Openness.
@@ -69,8 +69,9 @@ TIA_Portal_V20_MCP/
    - `tia_rollback_block`: Khôi phục khối từ bản lưu XML tự động.
    - `tia_export_raw`: Xuất SimaticML XML gốc khi cần tra cứu sâu.
 
-4. **Biên dịch & Kiểm thử mô phỏng cơ bản (4 tools):**
+4. **Biên dịch & Kiểm thử mô phỏng (5 tools):**
    - `tia_dry_run_ladder`: Mô phỏng chu kỳ quét PLC trong RAM không cần bật TIA.
+   - `tia_test_ladder_project`: Nạp thư mục XML LAD, phân tích tĩnh và chạy nhiều ca kiểm thử độc lập từ một file JSON.
    - `tia_compile`: Biên dịch Software / Hardware (báo cáo lỗi chi tiết).
    - `tia_sim_prepare`: Khởi động S7-PLCSIM V20 và xuất bảng SIM Table CSV.
    - `tia_download_and_online`: Kết nối Online/Offline và nạp xuống CPU ảo/PLC thật.
@@ -90,6 +91,29 @@ TIA_Portal_V20_MCP/
 ---
 
 ## 4. Hướng dẫn cài đặt & Cấu hình
+
+### Chạy một project kiểm thử offline
+
+Trên Windows, nhấp đúp `Run-Offline-Demo.cmd` để chạy ví dụ. Với Node.js, cũng có thể chạy từ thư mục gốc:
+
+```powershell
+node server/test-project.js examples/inspection/suite.json
+```
+
+Ví dụ dùng ba block XML tổng hợp. `FB_Inspection` gọi `FC_Eligible` để kiểm tra điều kiện và `FB_Delay` để theo dõi timer. Ba kịch bản kiểm tra tín hiệu giữ đủ lâu, xung ngắn và trường hợp chức năng bị tắt.
+
+Để dùng cho project riêng, sao chép thư mục `examples/inspection`. Đặt XML của các OB/FB/FC LAD cần kiểm thử vào `blocks/`, kể cả các block được gọi qua `CALL`. Công cụ đọc cả thư mục con. Mỗi file XML chứa một block. Chọn `entry` trong `suite.json` và sửa danh sách `cases`. Mỗi case có tên riêng, có ít nhất một `expect` hoặc `until` và có thể chọn `entry` riêng. `blockDir` tính từ vị trí của `suite.json`.
+
+Mỗi lần chạy chỉ đọc các XML một lượt. Mỗi case bắt đầu với vùng nhớ, bộ đếm và timer mới. Thiếu đích CALL, CALL đệ quy, network đọc không đầy đủ hoặc trùng tên block sẽ dừng bước nạp project và ghi lý do. Lỗi trong một case đã nạp vẫn cho phép chạy các case tiếp theo.
+
+```powershell
+node server/test-project.js examples/inspection/suite.json --format json
+node server/test-project.js examples/inspection/suite.json --format junit
+```
+
+Kết quả JSON gồm phát hiện phân tích tĩnh, từng phép so sánh, timeline và giá trị cuối. JUnit gồm một testcase cho phân tích tĩnh và một testcase cho mỗi case. CLI xuất báo cáo ra stdout. Mã thoát `0` khi đạt, `1` khi có lỗi phân tích hoặc case không đạt và `2` khi không nạp được suite hoặc cú pháp CLI sai (chi tiết trên stderr). Với MCP, gọi `tia_test_ladder_project` bằng `{"manifestPath":"D:/demo/suite.json","format":"json"}` và đọc trường `ok` trong báo cáo.
+
+Phạm vi kiểm tra là mô hình LAD trong RAM. Compile/import project Siemens và xác minh đặc tính CPU vẫn cần TIA Portal hoặc PLCSIM phù hợp.
 
 ### Bước 1: Thêm tài khoản vào nhóm Siemens TIA Openness (1 lần duy nhất)
 Mở PowerShell bằng quyền Administrator và chạy:

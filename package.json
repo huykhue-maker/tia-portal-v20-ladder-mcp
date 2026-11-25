@@ -7,6 +7,7 @@
     "start": "node server/index.js",
     "test": "node tests/run_all.js",
     "test:offline": "node tests/run_all.js offline",
+    "test:project": "node server/test-project.js",
     "test:tia": "node tests/run_all.js tia",
     "build": "powershell -ExecutionPolicy Bypass -File build.ps1"
   },

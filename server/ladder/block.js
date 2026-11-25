@@ -135,8 +135,13 @@ function readBlock(src, opts) {
     if (n.flg) {
       const r = R.readFlgNet(n.flg);
       if (opts.ctx && opts.ctx.learned) L.learnFlgNet(n.flg, opts.ctx.learned);
-      const tmp = L.emptyLearned(); L.learnFlgNet(n.flg, tmp);
       row.dsl = r.dsl; row.flows = r.flows; row.notes = r.notes;
+      if (opts.simulationOnly) {
+        row.complete = r.complete;
+        nets.push(row);
+        continue;
+      }
+      const tmp = L.emptyLearned(); L.learnFlgNet(n.flg, tmp);
       row.editable = r.complete && roundtrips(r.dsl, gctx, tmp.calls);
       if (!row.editable && r.complete) row.notes = (row.notes || []).concat(['DSL does not round-trip exactly; treat as read-only or replace the whole network']);
       if (opts.format === 'ascii' || opts.format === 'both') row.ascii = render.renderNetwork(r.flows);
