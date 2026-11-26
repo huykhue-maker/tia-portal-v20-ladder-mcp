@@ -2,7 +2,8 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $csc = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 $api = if ($env:TIA_PUBLIC_API_DIR) { Join-Path $env:TIA_PUBLIC_API_DIR 'Siemens.Engineering.dll' } else { 'C:\Program Files\Siemens\Automation\Portal V20\PublicAPI\V20\Siemens.Engineering.dll' }
-$simApi = 'C:\Program Files\Siemens\Automation\PLCSIM_V20\resources\bin\wwwroot\assets\lib\runtime\Siemens.Simatic.Simulation.Runtime.Api.x64.dll'
+$simDir = if ($env:TIA_PLCSIM_RUNTIME_DIR) { $env:TIA_PLCSIM_RUNTIME_DIR } else { 'C:\Program Files\Siemens\Automation\PLCSIM_V20\resources\bin\wwwroot\assets\lib\runtime' }
+$simApi = Join-Path $simDir 'Siemens.Simatic.Simulation.Runtime.Api.x64.dll'
 
 $sources = @(
     (Join-Path $root 'bridge\TiaBridge.cs'),

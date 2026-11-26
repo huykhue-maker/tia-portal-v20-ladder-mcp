@@ -171,11 +171,99 @@ async function main() {
     assert.deepStrictEqual(globalOnly.affectedBlocks, [], 'Global "Flag" must not falsely match local #Flag');
     const dbMember = A.analyze(scopedBlocks, { targetSymbol: 'DB_Cfg.Speed' }).impact;
     assert.deepStrictEqual(dbMember.affectedBlocks, ['OB_Caller'], 'Unquoted DB_Cfg.Speed must match "DB_Cfg".Speed');
+
     await withMcpServer(async rpc => {
       const result = (await rpc('tools/call', { name: 'tia_test_ladder_project', arguments: { manifestPath, format: 'json', targetBlock: 'FC_Eligible' } })).result;
       assert(!result.isError);
       assert.strictEqual(result.structuredContent.analysis.impact.suggestedCases.length, 3);
     });
+  });
+
+  await test('Scoped cache never shares tags, DBs or CALL signatures between PLCs/projects', () => {
+    const { BridgeClient } = require('../server/bridge_client');
+    const client = new BridgeClient();
+    client.setScope('Project_A.ap20', 'PLC_1');
+    client.tagsCache.Start = { address: '%I0.0' };
+    client.dbsCache.DB1 = { Static: [] };
+    client.learned.calls.Worker = { type: 'FB' };
+    client.setScope(undefined, '');
+    assert(client.tagsCache.Start && client.dbsCache.DB1 && client.learned.calls.Worker);
+    client.setScope(undefined, 'PLC_2');
+    assert.deepStrictEqual(client.tagsCache, {});
+    assert.deepStrictEqual(client.dbsCache, {});
+    assert.deepStrictEqual(client.learned.calls, {});
+    client.setScope(undefined, '');
+    assert(client.tagsCache.Start && client.learned.calls.Worker, 'Omitted plcName must return to the project default PLC');
+    client.setScope(undefined, 'PLC_2');
+    assert.deepStrictEqual(client.tagsCache, {});
+    client.setScope('Project_B.ap20', 'PLC_1');
+    assert.deepStrictEqual(client.tagsCache, {});
+    client.setScope('Project_A.ap20', 'PLC_1');
+    assert(client.tagsCache.Start && client.learned.calls.Worker);
+    client.invalidateObject('Worker');
+    client.invalidateObject('DB1');
+    assert(!client.learned.calls.Worker && !client.dbsCache.DB1);
+    assert.notStrictEqual(client.uniqueExportPath('Main', '.xml'), client.uniqueExportPath('Main', '.xml'));
+    client.clearProjectScope();
+    assert.deepStrictEqual(client.tagsCache, {});
+  });
+
+  await test('MCP tools/call executes FIFO even when the first call waits for the bridge', async () => {
+    await withMcpServer(async rpc => {
+      const order = [];
+      const first = rpc('tools/call', { name: 'tia_status', arguments: {} }).then(r => { order.push('status'); return r; });
+      const second = rpc('tools/call', { name: 'tia_test_ladder_project', arguments: {
+        manifestPath: path.join(__dirname, '..', 'examples', 'inspection', 'suite.json'), format: 'json',
+      } }).then(r => { order.push('suite'); return r; });
+      const results = await Promise.all([first, second]);
+      assert(results.every(r => !r.result.isError));
+      assert.deepStrictEqual(order, ['status', 'suite']);
+    });
+  });
+
+  await test('Temp resets per OB scan and FB call; Initial_Call and OB system inputs', () => {
+    const net = dsl => D.parseNetwork(dsl).flows;
+    const program = { entry: 'Main', blocks: {
+      Main: { type: 'OB', inputs: ['Initial_Call'], temps: [{ name: 'T', type: 'Bool' }], skipped: [], flows: [
+        ...net('NO(#Initial_Call) => COIL("First")'),
+        ...net('NO(#T) => COIL("Stale")'),
+        ...net('TRUE => SET(#T)'),
+        ...net('TRUE => CALL("Worker", inst="DB_Worker")'),
+        ...net('TRUE => CALL("Worker", inst="DB_Worker")'),
+      ] },
+      Worker: { type: 'FB', inputs: [], outputs: [], inouts: [], temps: [{ name: 'Tmp', type: 'Bool' }], skipped: [], flows: [
+        ...net('NO(#Tmp) => COIL("CallStale")'), ...net('TRUE => SET(#Tmp)'),
+      ] },
+    } };
+    const result = S.runScenario(program, { steps: [
+      { run: 1, expect: { '"First"': 1, '"Stale"': 0, '"CallStale"': 0 } },
+      { run: 1, expect: { '"First"': 0, '"Stale"': 0, '"CallStale"': 0 } },
+    ] });
+    assert(result.ok, S.formatResults(result));
+    const read = { block: { name: 'Main' }, interface: { Input: [], Temp: [{ name: 'T', type: 'Bool' }] }, networks: [
+      { index: 1, dsl: 'NO(#T) => COIL("Bad")', flows: net('NO(#T) => COIL("Bad")') },
+    ] };
+    assert(A.analyze([read]).findings.some(f => f.code === 'TEMP_READ_BEFORE_WRITE'));
+    for (const [secondaryType, number, inputs] of [
+      ['Startup', 100, ['LostRetentive', 'LostRTC']],
+      ['CyclicInterrupt', 30, ['Initial_Call', 'Event_Count']],
+    ]) {
+      const xml = B.createBlockXml({ type: 'OB', name: secondaryType, number, secondaryType }).xml;
+      const parsed = B.readBlock(xml);
+      assert(xml.includes('<SecondaryType>' + secondaryType + '</SecondaryType>'));
+      for (const input of inputs) assert(parsed.interface.Input.some(m => m.name === input));
+    }
+  });
+
+  await test('PLCSIM raw unsigned encoding and PLC time comparison in compiled bridge', async () => {
+    if (!fs.existsSync(path.join(__dirname, '..', 'bridge', 'TiaBridge.exe'))) return;
+    const { BridgeClient } = require('../server/bridge_client');
+    const client = new BridgeClient();
+    try {
+      const result = await client.call('sim_codec_self_test', {});
+      if (result.skipped) assert.strictEqual(result.passed, true);
+      else assert.deepStrictEqual(result, { passed: true, unsignedWord: true, unsignedDWord: true, timeLiteral: true });
+    } finally { client.shutdown(); }
   });
 
   await test('Online backup identity and checksum isolation', async () => {
@@ -213,6 +301,52 @@ async function main() {
   });
 
   // 1. Ladder DSL <-> SimaticML XML roundtrip
+  await test('Deleted block/DB/UDT backups can be listed and restored into their original group', async () => {
+    const { OnlineBackups } = require('../server/online_backups');
+    for (const [kind, objectType] of [['block', 'FB'], ['block', 'GlobalDB'], ['udt', 'PlcType']]) {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'deleted-restore-'));
+      let exists = true, imports = 0, projectPath = 'ProjectA', plc = 'PLC_A';
+      const scope = { projectPath, device: 'Station', cpu: plc, software: plc, group: 'Folder/Nested', kind, name: 'Object', objectType, number: '1' };
+      const bridge = {
+        async call(cmd, args) {
+          if (cmd === 'status') return { projectPath };
+          if (cmd === 'list_blocks') return { plc };
+          if (cmd === 'import_block' || cmd === 'import_type') {
+            assert.strictEqual(cmd, kind === 'udt' ? 'import_type' : 'import_block');
+            assert.strictEqual(args.group, 'Folder/Nested');
+            assert.strictEqual(args.plcName, 'PLC_A');
+            assert.strictEqual(fs.readFileSync(args.xmlPath, 'utf8'), '<original/>');
+            imports++; exists = true; return {};
+          }
+          if (!exists) throw new Error(kind + " 'Object' not found.");
+          if (args.action === 'export') fs.writeFileSync(args.xmlPath, '<original/>');
+          return { ...scope };
+        },
+        saveBackup(label, xml) { const file = path.join(dir, label + '__1.xml'); fs.writeFileSync(file, xml); return file; },
+        listBackups(label) { return fs.readdirSync(dir).filter(f => f.endsWith('.xml') && (!label || f.startsWith(label))).map(file => ({ file, path: path.join(dir, file) })); },
+      };
+      try {
+        const service = new OnlineBackups(bridge), args = { blockName: 'Object', kind, plcName: 'PLC_A' };
+        const backup = await service.backupOnly(args, kind);
+        assert.strictEqual(JSON.parse(fs.readFileSync(backup + '.json')).group, scope.group);
+        exists = false;
+        assert.strictEqual((await service.rollback(args, 'list')).length, 1);
+        projectPath = 'OtherProject';
+        assert.strictEqual((await service.rollback(args, 'list')).length, 0);
+        projectPath = 'ProjectA'; plc = 'PLC_B';
+        assert.strictEqual((await service.rollback(args, 'list')).length, 0);
+        plc = 'PLC_A';
+        assert.strictEqual((await service.rollback({ ...args, group: 'Wrong' }, 'list')).length, 0);
+        await service.rollback(args, 'restore');
+        assert.strictEqual(imports, 1);
+        exists = false;
+        fs.appendFileSync(backup, 'corrupt');
+        await assert.rejects(service.rollback(args, 'restore'), /checksum mismatch/);
+        assert.strictEqual(imports, 1);
+      } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    }
+  });
+
   await test('1. Ladder DSL <-> SimaticML XML full roundtrip (contacts, OR branches, RTRIG, TON, CTU, CMP, MATH, MOVE, CALL)', () => {
     const callCatalog = {
       FB_Axis: {
@@ -457,6 +591,8 @@ async function main() {
       const st = await rpc('tools/call', { name: 'tia_status', arguments: {} });
       assert(!st.result.isError, 'tia_status error: ' + st.result.content[0].text);
       assert(st.result.content[0].text.includes('OPENNESS ACCESSIBLE: true'), 'Expected TiaBridge opennessAccessible=true');
+      const noProjectClose = await rpc('tools/call', { name: 'tia_close_project', arguments: { disconnect: true } });
+      assert(!noProjectClose.result.isError, noProjectClose.result.content[0].text);
 
       // Smoke test new bridge tools that do not require an open TIA project
       const eh = await rpc('tools/call', { name: 'tia_escape_hatch', arguments: { action: 'list_handles' } });

@@ -418,6 +418,7 @@ class Simulator {
       if (!st.has(k)) st.set(k, new Frame());
       child = st.get(k);
     } else child = new Frame();
+    this.resetTemps(callee, child);
     for (const k of Object.keys(a.args)) {
       const P = a.args[k]; const isOutOnly = (callee.outputs || []).includes(k);
       if (isOutOnly) continue;
@@ -431,9 +432,14 @@ class Simulator {
     return this.next(a, true, f);
   }
   runFlows(flows, f) { for (const fl of flows) this.flow(fl, true, f); }
+  resetTemps(block, frame) {
+    for (const m of (block.temps || [])) frame.locals.set('#' + m.name, /^Bool$/i.test(m.type) ? false : 0);
+  }
   scan() {
     const entry = this.program.blocks[this.entry];
     if (!entry) throw new Error('entry block "' + this.entry + '" not found');
+    this.resetTemps(entry, this.root);
+    if (entry.type === 'OB' && entry.inputs.includes('Initial_Call')) this.root.locals.set('#Initial_Call', this.scans === 0);
     this.runFlows(entry.flows, this.root);
     this.sample();
     this.time += this.scanMs; this.scans++;
@@ -484,6 +490,8 @@ function buildProgram(blockReads, entry) {
       name: r.block.name, type: r.block.type, flows, skipped,
       outputs: [...(r.interface.Output || []), ...(r.interface.Return || [])].map(m => m.name),
       inouts: (r.interface.InOut || []).map(m => m.name),
+      inputs: (r.interface.Input || []).map(m => m.name),
+      temps: (r.interface.Temp || []).map(m => ({ name: m.name, type: m.type })),
     };
   }
   return { blocks, entry };

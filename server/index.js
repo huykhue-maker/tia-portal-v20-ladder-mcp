@@ -5,6 +5,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { BridgeClient, EXPORTS_DIR, ensureDir } = require('./bridge_client');
 const { OnlineBackups } = require('./online_backups');
 const B = require('./ladder/block');
@@ -35,6 +36,8 @@ function getLadderCtx(extra) {
 
 async function refreshTagCache(plcName) {
   const data = await bridge.call('list_tags', plcName ? { plcName } : {});
+  if (!plcName) bridge.resolveDefaultPlc(data.plc);
+  else bridge.setScope(undefined, data.plc || plcName);
   const map = {};
   for (const tbl of (data.tables || [])) {
     for (const t of (tbl.tags || [])) {
@@ -46,10 +49,11 @@ async function refreshTagCache(plcName) {
 }
 
 async function exportBlockXml(blockName, plcName) {
-  const outPath = bridge.exportFilePath(blockName, '.xml');
-  const res = await bridge.call('export_block', { blockName, plcName: plcName || '', outPath, format: 'xml' });
-  const xml = fs.readFileSync(res.path, 'utf8');
-  return { xml, meta: res };
+  const outPath = bridge.uniqueExportPath(blockName, '.xml');
+  try {
+    const res = await bridge.call('export_block', { blockName, plcName: plcName || '', outPath, format: 'xml' });
+    return { xml: fs.readFileSync(res.path, 'utf8'), meta: res };
+  } finally { try { fs.unlinkSync(outPath); } catch { } }
 }
 
 async function editLadderXml(args, transform, preview = false) {
@@ -225,10 +229,10 @@ const TOOLS = [
     description: 'Create or update one or more PLC tags in a PLC Tag Table.',
     inputSchema: {
       type: 'object',
-      required: ['tags'],
       properties: {
         plcName: { type: 'string' },
         table: { type: 'string', description: 'Target tag table name (default: Default tag table).' },
+        delete: { type: 'array', items: { type: 'string' }, description: 'Exact tag names to delete from this PLC/table.' },
         tags: {
           type: 'array',
           items: {
@@ -265,7 +269,7 @@ const TOOLS = [
       type: 'object',
       required: ['name'],
       properties: {
-        action: { type: 'string', enum: ['edit', 'create'], description: 'Default: edit. Use "create" to create a new GlobalDB, InstanceDB, or UDT.' },
+        action: { type: 'string', enum: ['edit', 'create', 'delete'], description: 'Default: edit. Delete creates a verified XML backup first.' },
         name: { type: 'string' },
         kind: { type: 'string', enum: ['db', 'instance_db', 'udt'], description: 'Default: db. Use "instance_db" when creating an FB instance DB.' },
         instanceOf: { type: 'string', description: 'For action="create", kind="instance_db": FB name (e.g. "FB_TrafficLight").' },
@@ -397,6 +401,7 @@ const TOOLS = [
       required: ['type', 'name'],
       properties: {
         type: { type: 'string', enum: ['FB', 'FC', 'OB'] },
+        secondaryType: { type: 'string', enum: ['ProgramCycle', 'Startup', 'CyclicInterrupt'], description: 'OB event class (default ProgramCycle).' },
         name: { type: 'string' },
         number: { type: 'integer', description: 'Optional block number (omit for AutoNumber).' },
         plcName: { type: 'string' },
@@ -447,7 +452,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['list', 'restore'], description: 'Default: list.' },
+        action: { type: 'string', enum: ['list', 'restore', 'delete'], description: 'Default: list. Delete backs up the online block/UDT first.' },
         blockName: { type: 'string', description: 'Online object name. Required to restore.' },
         kind: { type: 'string', enum: ['block', 'udt'], description: 'Online object category. Use block for DBs.' },
         backupFile: { type: 'string', description: 'Exact filename listed for this target. Online restore defaults to its latest scoped backup.' },
@@ -724,6 +729,7 @@ const TOOLS = [
       properties: {
         action: { type: 'string', enum: ['inspect', 'set_ip', 'connect_subnet', 'opcua'] },
         plcName: { type: 'string' },
+        deviceName: { type: 'string', description: 'Exact device name for set_ip/connect_subnet when the target is not a PLC.' },
         interfaceName: { type: 'string', description: 'Optional network interface name filter.' },
         ipAddress: { type: 'string' },
         subnetMask: { type: 'string' },
@@ -807,10 +813,12 @@ const TOOLS = [
 
 // ------------------------------------------------------------------ Tool Execution
 async function handleTool(name, args) {
+  bridge.setScope(undefined, args && args.plcName || '');
   args = args || {};
   switch (name) {
     case 'tia_status': {
       const s = await bridge.call('status');
+      bridge.setScope(s.projectPath || '', args.plcName || '');
       const lines = [
         'USER: ' + s.user + ' | In "Siemens TIA Openness" group: ' + s.inOpennessGroup,
         'CONNECTED: ' + s.connected + ' (mode: ' + s.mode + ', attachedExisting: ' + s.attachedExisting + ')',
@@ -827,6 +835,7 @@ async function handleTool(name, args) {
 
     case 'tia_connect': {
       const s = await bridge.call('connect', { mode: args.mode || 'auto', processId: args.processId || 0 });
+      bridge.clearProjectScope(); bridge.setScope(s.projectPath || '', '');
       return { text: 'Connected to TIA Portal V20 (mode: ' + s.mode + ', project: ' + (s.projectName || 'none') + ').', json: s };
     }
 
@@ -837,6 +846,7 @@ async function handleTool(name, args) {
         closeCurrent: !!args.closeCurrent,
         upgrade: !!args.upgrade,
       });
+      bridge.clearProjectScope(); bridge.setScope(s.projectPath || '', '');
       return { text: 'Opened project "' + s.projectName + '" (' + s.projectPath + ').', json: s };
     }
 
@@ -855,7 +865,8 @@ async function handleTool(name, args) {
       if (args.disconnect || args.closeTia) {
         await bridge.call('disconnect', { closeTia: !!args.closeTia });
       }
-      return { text: 'Closed project "' + r.project + '".', json: r };
+      bridge.clearProjectScope();
+      return { text: r.closed ? 'Closed project "' + r.project + '".' : 'No project was open; session ' + (args.disconnect || args.closeTia ? 'disconnected.' : 'remains connected.'), json: r };
     }
 
     case 'tia_project_blueprint': {
@@ -937,6 +948,7 @@ async function handleTool(name, args) {
 
     case 'tia_list_blocks': {
       const data = await bridge.call('list_blocks', { plcName: args.plcName || '' });
+      if (!args.plcName) bridge.resolveDefaultPlc(data.plc);
       let list = data.blocks;
       if (args.type) list = list.filter(b => b.type.toLowerCase() === args.type.toLowerCase());
       if (args.language) list = list.filter(b => b.language.toLowerCase() === args.language.toLowerCase());
@@ -964,13 +976,15 @@ async function handleTool(name, args) {
     }
 
     case 'tia_upsert_tags': {
+      if ((!args.tags || !args.tags.length) && (!args.delete || !args.delete.length)) throw new Error('Provide tags[] to upsert or delete[] with exact tag names.');
       const r = await bridge.call('upsert_tags', {
         plcName: args.plcName || '',
         table: args.table || 'Default tag table',
-        tags: args.tags,
+        tags: args.tags || [],
+        delete: args.delete || [],
       });
       await refreshTagCache(args.plcName || '');
-      return { text: 'Updated tag table "' + r.table + '":\n  ' + r.changes.join('\n  '), json: r };
+      return { text: 'Updated tag table "' + r.table + '":\n  ' + r.changes.join('\n  ') + ((r.warnings || []).length ? '\nWARNINGS: ' + r.warnings.join('; ') : ''), json: r };
     }
 
     case 'tia_read_db_udt': {
@@ -991,6 +1005,14 @@ async function handleTool(name, args) {
     case 'tia_edit_db_udt': {
       const action = args.action || 'edit';
       const kind = args.kind || 'db';
+      if (action === 'delete') {
+        const backup = await onlineBackups.backupOnly({ ...args, blockName: args.name }, kind === 'udt' ? 'udt' : 'block');
+        const r = kind === 'udt'
+          ? await bridge.call('delete_type', { typeName: args.name, plcName: args.plcName || '' })
+          : await bridge.call('delete_block', { blockName: args.name, plcName: args.plcName || '' });
+        bridge.invalidateObject(args.name);
+        return { text: 'Deleted ' + kind + ' "' + r.deleted + '" (backup: ' + backup + ').', json: { ...r, backup } };
+      }
       if (action === 'create') {
         const dbKind = kind === 'instance_db' ? 'InstanceDB' : (kind === 'udt' ? 'UDT' : 'GlobalDB');
         const xml = B.createDbXml({
@@ -1089,6 +1111,7 @@ async function handleTool(name, args) {
     case 'tia_create_ladder_block': {
       const created = B.createBlockXml({
         type: args.type,
+        secondaryType: args.secondaryType,
         name: args.name,
         number: args.number,
         title: args.title,
@@ -1156,7 +1179,17 @@ async function handleTool(name, args) {
 
     case 'tia_rollback_block': {
       const action = args.action || 'list';
-      if (!['list', 'restore'].includes(action)) throw new Error('Expected list or restore.');
+      if (!['list', 'restore', 'delete'].includes(action)) throw new Error('Expected list, restore or delete.');
+      if (action === 'delete') {
+        if (!args.blockName || args.xmlPath) throw new Error('Online delete requires blockName and no xmlPath.');
+        const kind = args.kind || 'block';
+        const backup = await onlineBackups.backupOnly(args, kind);
+        const r = kind === 'udt'
+          ? await bridge.call('delete_type', { typeName: args.blockName, plcName: args.plcName || '' })
+          : await bridge.call('delete_block', { blockName: args.blockName, plcName: args.plcName || '' });
+        bridge.invalidateObject(args.blockName);
+        return { text: 'Deleted "' + r.deleted + '" (backup: ' + backup + ').', json: { ...r, backup } };
+      }
       if (!args.xmlPath && action === 'restore') {
         const file = await onlineBackups.rollback(args, action);
         return { text: 'Restored from backup "' + file + '" -> imported: ' + args.blockName };
@@ -1439,6 +1472,23 @@ async function handleTool(name, args) {
         if (!args.sourceCode && !args.filePath) throw new Error('Provide sourceCode or filePath for SCL import.');
       }
 
+      let priorSourceBackup = null;
+      if (action === 'import' || action === 'write') {
+        const sourceText = args.sourceCode || fs.readFileSync(args.filePath, 'utf8');
+        const declared = /\b(?:FUNCTION_BLOCK|FUNCTION|ORGANIZATION_BLOCK|DATA_BLOCK)\s+"?([A-Za-z_][\w]*)"?/i.exec(sourceText);
+        const targetName = args.blockName || (declared && declared[1]);
+        if (targetName) {
+          const blocks = await bridge.call('list_blocks', { plcName: args.plcName || '' });
+          if ((blocks.blocks || []).some(b => b.name === targetName)) {
+            const exportPath = bridge.uniqueExportPath(targetName, '.scl');
+            try {
+              const previous = await bridge.call('scl_source', { action: 'export', blockName: targetName, plcName: args.plcName || '', outPath: exportPath });
+              const label = 'scl_' + crypto.createHash('sha256').update(JSON.stringify([bridge.projectPath, blocks.plc, targetName])).digest('hex').slice(0, 24);
+              priorSourceBackup = bridge.saveBackup(label, previous.sourceCode);
+            } finally { try { fs.unlinkSync(exportPath); } catch { } }
+          }
+        }
+      }
       const r = await bridge.call('scl_source', payload, 120000);
       if (action === 'export' || action === 'read') {
         const maxChars = args.maxChars || 20000;
@@ -1451,8 +1501,8 @@ async function handleTool(name, args) {
       }
       return {
         text: 'Imported SCL/DB/UDT source -> generated: ' + ((r.generatedObjects || []).join(', ') || '(none)') +
-          '\nFile: ' + r.filePath,
-        json: r,
+          '\nFile: ' + r.filePath + (priorSourceBackup ? '\nPrevious source backup: ' + priorSourceBackup : ''),
+        json: { ...r, priorSourceBackup },
       };
     }
 
@@ -1514,6 +1564,7 @@ async function handleTool(name, args) {
         return { text: lines.join('\n'), json: r };
       }
       if (action === 'create_project') {
+        bridge.clearProjectScope(); bridge.setScope(r.projectPath || '', '');
         return { text: 'Created project "' + r.projectName + '" (' + r.projectPath + ').', json: r };
       }
       if (action === 'search_catalog') {
@@ -1574,6 +1625,7 @@ async function handleTool(name, args) {
       const payload = {
         action,
         plcName: args.plcName || '',
+        deviceName: args.deviceName || '',
         interfaceName: args.interfaceName || '',
         ipAddress: args.ipAddress || '',
         subnetMask: args.subnetMask || '',
@@ -1619,7 +1671,7 @@ async function handleTool(name, args) {
         }
         return { text: lines.join('\n'), json: r };
       }
-      const lines = ['PLC "' + r.plc + '" via interface "' + r.interface + '":'];
+      const lines = ['Device "' + (r.device || r.plc) + '" via interface "' + r.interface + '":'];
       if (!(r.changes || []).length) lines.push('  (no changes)');
       for (const c of (r.changes || [])) lines.push('  ' + c);
       if ((r.warnings || []).length) {
@@ -1894,6 +1946,7 @@ async function onMessage(msg) {
 }
 
 let inBuf = '';
+let toolQueue = Promise.resolve();
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', chunk => {
   inBuf += chunk;
@@ -1904,7 +1957,11 @@ process.stdin.on('data', chunk => {
     if (!line || line.startsWith('Content-Length:')) continue;
     try {
       const msg = JSON.parse(line);
-      onMessage(msg);
+      if (msg.method === 'tools/call') {
+        toolQueue = toolQueue.then(() => onMessage(msg), () => onMessage(msg));
+      } else {
+        onMessage(msg);
+      }
     } catch { /* ignore non-JSON lines */ }
   }
 });

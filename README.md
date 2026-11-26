@@ -21,6 +21,8 @@ Bộ công cụ Model Context Protocol (MCP) dành cho **Siemens TIA Portal V20*
 
 ## 2. Cấu trúc dự án
 
+MCP xử lý `tools/call` theo FIFO để không chồng lệnh Openness. Cache tag/DB/chữ ký CALL nằm trong RAM theo project và PLC; `exports/learned_catalog.json` chỉ giữ metadata lệnh LAD dùng chung. Simulator reset biến `Temp` trước mỗi scan/CALL và đặt `#Initial_Call` của OB ở scan đầu tiên; analyzer cảnh báo `TEMP_READ_BEFORE_WRITE`.
+
 ```text
 TIA_Portal_V20_MCP/
 ├── bridge/                        # Cầu nối C# (.NET Framework 4.8 x64) gọi TIA Openness V20
@@ -50,23 +52,23 @@ TIA_Portal_V20_MCP/
    - `tia_connect`: Gắn vào tiến trình TIA Portal đang mở hoặc khởi chạy mới.
    - `tia_open_project`: Mở file dự án `.ap20`.
    - `tia_save_project`: Lưu dự án.
-   - `tia_close_project`: Đóng dự án.
+   - `tia_close_project`: Đóng dự án; `disconnect`/`closeTia` vẫn hoạt động khi phiên chưa mở project.
 
 2. **Dữ liệu & Cấu trúc (6 tools):**
    - `tia_project_blueprint`: Đọc sơ đồ tổng thể PLC, Blocks, DB, TO, Tags.
    - `tia_list_blocks`: Liệt kê các khối OB, FB, FC, DB.
    - `tia_read_tags`: Đọc bảng PLC Tags.
-   - `tia_upsert_tags`: Thêm hoặc cập nhật PLC Tags.
+   - `tia_upsert_tags`: Thêm, cập nhật hoặc xóa PLC Tags bằng `delete: ["TagName"]`.
    - `tia_read_db_udt`: Đọc cấu trúc Global DB hoặc UDT.
-   - `tia_edit_db_udt`: Tạo mới hoặc chỉnh sửa biến trong Global DB, Instance DB hoặc UDT.
+   - `tia_edit_db_udt`: Tạo, sửa hoặc xóa Global DB, Instance DB hoặc UDT; xóa sao lưu XML trước.
 
 3. **Thao tác khối Ladder (7 tools):**
    - `tia_read_ladder`: Đọc khối LAD dưới dạng DSL ngắn gọn hoặc ASCII rungs.
    - `tia_patch_ladder_network`: Chỉnh sửa, thay thế hoặc thêm từng Network bậc thang (hỗ trợ cổng `O` V20, `SUB`, `CONV`, `SIN`, `COS`, `NORM_X`, `SCALE_X`, `LIMIT`, Mảng, `MC_*`).
-   - `tia_create_ladder_block`: Tạo mới khối OB, FB, FC dạng LAD (hỗ trợ tự sinh Instance DB còn thiếu khi gọi FB).
+   - `tia_create_ladder_block`: Tạo mới OB, FB, FC dạng LAD; OB nhận `secondaryType: ProgramCycle | Startup | CyclicInterrupt` để sinh đúng thông tin hệ thống.
    - `tia_edit_block_interface`: Chỉnh sửa khai báo biến Input, Output, Temp, Static.
    - `tia_analyze_ladder`: Kiểm tra tĩnh (Double coil, Timer overlap, Cross-reference).
-   - `tia_rollback_block`: Khôi phục khối từ bản lưu XML tự động.
+   - `tia_rollback_block`: Liệt kê/khôi phục backup hoặc xóa block/UDT sau khi tạo backup định danh.
    - `tia_export_raw`: Xuất SimaticML XML gốc khi cần tra cứu sâu.
 
 4. **Biên dịch & Kiểm thử mô phỏng (5 tools):**
@@ -79,12 +81,12 @@ TIA_Portal_V20_MCP/
 5. **Watch Table, SCL, Cross-Reference & Giao diện TIA (4 tools mới):**
    - `tia_watch_table`: Tạo, đọc, cập nhật, xóa, xuất/nhập Watch Table (và liệt kê Force Table) trực tiếp trong TIA Portal, hỗ trợ mở thẳng lên màn hình bằng `ShowInEditor`.
    - `tia_show_in_editor`: Mở nhanh khối lệnh, Watch Table, Tag Table, UDT hoặc khung nhìn phần cứng/mạng ngay trên giao diện TIA Portal V20.
-   - `tia_scl_source`: Xuất khối/DB/UDT ra mã nguồn văn bản `.scl`/`.db`/`.udt` hoặc nhập mã nguồn SCL để sinh khối mới trực tiếp trong project.
+   - `tia_scl_source`: Xuất/nhập nguồn `.scl`/`.db`/`.udt`; khi nhập đè block xác định được tên, sao lưu source cũ và dọn file tạm.
    - `tia_cross_reference`: Tra cứu chéo (Cross-Reference) toàn dự án hoặc theo khối để biết chính xác biến/DB/UDT đang được đọc/ghi ở đâu.
 
 6. **Phần cứng, Mạng công nghiệp, PLCSIM Runtime & Escape Hatch (4 tools mới):**
    - `tia_hardware_config`: Tra cứu Hardware Catalog, xem preset mã đặt hàng, thêm CPU PLC (giữ nguyên bảo vệ mặc định, trừ khi yêu cầu thay đổi rõ ràng), cắm module mở rộng vào slot, cấu hình System/Clock Memory Byte, PUT/GET và tạo Technological Object (`TO_PositioningAxis`, `PID_Compact`...).
-   - `tia_network_config`: Kiểm tra giao diện mạng, đặt IP/Subnet Mask/Router, kết nối Subnet, tạo PROFINET IO-System và cấu hình OPC UA Server.
+   - `tia_network_config`: Kiểm tra cả thiết bị trong DeviceGroups; đặt IP/kết nối Subnet bằng `plcName` hoặc `deviceName`, từ chối tên interface mơ hồ, cấu hình PROFINET IO-System và OPC UA.
    - `tia_plcsim_runtime`: Điều khiển CPU ảo qua S7-PLCSIM Advanced Runtime Manager khi có kết nối API (đăng ký/gắn CPU ảo, Power/Run/Stop, đọc/ghi tín hiệu và chạy kịch bản test).
    - `tia_escape_hatch`: Công cụ phản chiếu động vạn năng trên `IEngineeringObject` — cho phép soi thuộc tính/composition/service/method (`inspect`), đọc/ghi thuộc tính động (`get`/`set`), gọi phương thức (`invoke`) và quản lý handle `obj:N`.
 

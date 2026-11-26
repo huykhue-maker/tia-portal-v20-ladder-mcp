@@ -356,17 +356,21 @@ function patchNetworks(src, ops, ctx) {
 }
 
 // ---------------------------------------------------------------- creating blocks
-function defaultSections(type) {
+function defaultSections(type, secondaryType = 'ProgramCycle') {
   if (type === 'FB') return { Input: [], Output: [], InOut: [], Static: [], Temp: [], Constant: [] };
   if (type === 'FC') return { Input: [], Output: [], InOut: [], Temp: [], Constant: [], Return: [{ name: 'Ret_Val', type: 'Void' }] };
-  if (type === 'OB') return {
-    Input: [
-      { name: 'Initial_Call', type: 'Bool', comment: 'Initial call of this OB', informative: true },
-      { name: 'Remanence', type: 'Bool', comment: 'True, if remanent data are available', informative: true },
-    ],
+  if (type === 'OB') {
+    const inputs = {
+      ProgramCycle: [{ name: 'Initial_Call', type: 'Bool' }, { name: 'Remanence', type: 'Bool' }],
+      Startup: [{ name: 'LostRetentive', type: 'Bool' }, { name: 'LostRTC', type: 'Bool' }],
+      CyclicInterrupt: [{ name: 'Initial_Call', type: 'Bool' }, { name: 'Event_Count', type: 'Int' }],
+    }[secondaryType];
+    if (!inputs) throw new G.GenError('Unsupported OB secondaryType: ' + secondaryType, 'E_TYPE');
+    return {
+    Input: inputs.map(m => ({ ...m, informative: true })),
     Temp: [],
     Constant: [],
-  };
+  }; }
   throw new G.GenError('type must be FB, FC or OB', 'E_TYPE');
 }
 function mkMemberNode(m, culture) {
@@ -379,7 +383,7 @@ function createBlockXml(spec, ctx) {
   ctx = ctx || {};
   const type = spec.type;
   const culture = spec.culture || ctx.culture || 'en-US';
-  const sections = defaultSections(type);
+  const sections = defaultSections(type, spec.secondaryType);
   for (const s of Object.keys(spec.interface || {})) {
     if (!sections[s]) sections[s] = [];
     for (const m of spec.interface[s]) sections[s].push({ name: m.name, type: m.type, comment: m.comment });

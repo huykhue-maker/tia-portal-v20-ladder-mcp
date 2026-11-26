@@ -37,13 +37,19 @@ class BridgeClient {
     this.buf = '';
     this.stderrBuf = '';
     this.learned = this.loadLearned();
-    this.tagsCache = {}; // tagName -> { name, address, type, comment, table }
-    this.dbsCache = {};  // dbName -> interface sections
+    this.projectPath = '';
+    this.scopeKey = '';
+    this.scopes = new Map();
+    this.defaultPlcs = new Map();
+    this.setScope('', '');
   }
 
   loadLearned() {
     try {
-      if (fs.existsSync(LEARNED_FILE)) return JSON.parse(fs.readFileSync(LEARNED_FILE, 'utf8'));
+      if (fs.existsSync(LEARNED_FILE)) {
+        const saved = JSON.parse(fs.readFileSync(LEARNED_FILE, 'utf8'));
+        return { ...saved, calls: {} };
+      }
     } catch { }
     return L.emptyLearned();
   }
@@ -51,9 +57,49 @@ class BridgeClient {
   saveLearned() {
     try {
       ensureDir(EXPORTS_DIR);
-      fs.writeFileSync(LEARNED_FILE, JSON.stringify(this.learned, null, 2), 'utf8');
+      const { calls, ...globalOnly } = this.learned;
+      fs.writeFileSync(LEARNED_FILE, JSON.stringify(globalOnly, null, 2), 'utf8');
     } catch { }
   }
+
+  setScope(projectPath, plcName) {
+    if (projectPath !== undefined) this.projectPath = projectPath || '';
+    const projectKey = this.projectPath.toLowerCase();
+    if (plcName && !this.defaultPlcs.has(projectKey)) this.defaultPlcs.set(projectKey, plcName);
+    const resolvedPlc = plcName || this.defaultPlcs.get(projectKey) || '';
+    const key = JSON.stringify([projectKey, String(resolvedPlc).toLowerCase()]);
+    if (!this.scopes.has(key)) this.scopes.set(key, { tags: {}, dbs: {}, calls: {} });
+    this.scopeKey = key;
+    this.learned.calls = this.scopes.get(key).calls;
+  }
+
+  resolveDefaultPlc(plcName) {
+    if (!plcName) return;
+    const emptyKey = JSON.stringify([this.projectPath.toLowerCase(), '']);
+    const resolvedKey = JSON.stringify([this.projectPath.toLowerCase(), plcName.toLowerCase()]);
+    if (this.scopes.has(emptyKey) && !this.scopes.has(resolvedKey)) this.scopes.set(resolvedKey, this.scopes.get(emptyKey));
+    this.defaultPlcs.set(this.projectPath.toLowerCase(), plcName);
+    this.setScope(undefined, plcName);
+  }
+
+  invalidateObject(name) {
+    for (const [key, cache] of this.scopes) {
+      if (key !== this.scopeKey) continue;
+      for (const map of [cache.dbs, cache.calls]) for (const entry of Object.keys(map)) if (entry.toLowerCase() === name.toLowerCase()) delete map[entry];
+    }
+  }
+
+  clearProjectScope() {
+    this.projectPath = '';
+    this.scopes.clear();
+    this.defaultPlcs.clear();
+    this.setScope('', '');
+  }
+
+  get tagsCache() { return this.scopes.get(this.scopeKey).tags; }
+  set tagsCache(value) { this.scopes.get(this.scopeKey).tags = value; }
+  get dbsCache() { return this.scopes.get(this.scopeKey).dbs; }
+  set dbsCache(value) { this.scopes.get(this.scopeKey).dbs = value; }
 
   ensureStarted() {
     if (this.proc && !this.proc.killed && this.proc.exitCode === null) return;
@@ -131,6 +177,11 @@ class BridgeClient {
   exportFilePath(name, ext) {
     ensureDir(EXPORTS_DIR);
     return path.join(EXPORTS_DIR, safeName(name) + (ext || '.xml'));
+  }
+
+  uniqueExportPath(name, ext) {
+    ensureDir(EXPORTS_DIR);
+    return path.join(EXPORTS_DIR, safeName(name) + '__' + crypto.randomBytes(8).toString('hex') + (ext || '.xml'));
   }
 
   saveBackup(blockName, xmlContent) {

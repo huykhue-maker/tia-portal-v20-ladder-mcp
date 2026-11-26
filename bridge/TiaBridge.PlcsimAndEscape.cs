@@ -6,6 +6,7 @@ using System.Globalization;
 using System.Linq;
 using System.Reflection;
 using System.Threading;
+using System.Text.RegularExpressions;
 using Siemens.Engineering;
 using Siemens.Engineering.HW;
 using Siemens.Engineering.SW.Blocks;
@@ -593,19 +594,12 @@ namespace TiaBridge
                 if (width == 'B') { io.WriteByte(bOff, Convert.ToByte(val, CultureInfo.InvariantCulture)); return; }
                 if (width == 'W')
                 {
-                    short sv = Convert.ToInt16(val, CultureInfo.InvariantCulture);
-                    byte[] b = BitConverter.GetBytes(sv);
-                    Array.Reverse(b);
-                    io.WriteBytes(bOff, b);
+                    io.WriteBytes(bOff, EncodeRawSimValue(width, expType, val));
                     return;
                 }
                 if (width == 'D')
                 {
-                    byte[] b = string.Equals(expType, "Real", StringComparison.OrdinalIgnoreCase) || val is double || val is float || val is decimal
-                        ? BitConverter.GetBytes(Convert.ToSingle(val, CultureInfo.InvariantCulture))
-                        : BitConverter.GetBytes(Convert.ToInt32(val, CultureInfo.InvariantCulture));
-                    Array.Reverse(b);
-                    io.WriteBytes(bOff, b);
+                    io.WriteBytes(bOff, EncodeRawSimValue(width, expType, val));
                     return;
                 }
             }
@@ -632,6 +626,36 @@ namespace TiaBridge
                     else throw new InvalidOperationException("Cannot write non-primitive tag '" + cleanTag + "' of type " + cur.Type);
                     break;
             }
+        }
+
+        private static byte[] EncodeRawSimValue(char width, string expType, object value)
+        {
+            byte[] bytes;
+            if (width == 'W')
+            {
+                bool unsigned = string.Equals(expType, "UInt", StringComparison.OrdinalIgnoreCase) || string.Equals(expType, "Word", StringComparison.OrdinalIgnoreCase) || (string.IsNullOrEmpty(expType) && Convert.ToDouble(value, CultureInfo.InvariantCulture) >= 32768 && Convert.ToDouble(value, CultureInfo.InvariantCulture) <= 65535);
+                bytes = unsigned ? BitConverter.GetBytes(Convert.ToUInt16(value, CultureInfo.InvariantCulture)) : BitConverter.GetBytes(Convert.ToInt16(value, CultureInfo.InvariantCulture));
+            }
+            else if (width == 'D')
+            {
+                double numeric = Convert.ToDouble(value, CultureInfo.InvariantCulture);
+                bool unsigned = string.Equals(expType, "UDInt", StringComparison.OrdinalIgnoreCase) || string.Equals(expType, "DWord", StringComparison.OrdinalIgnoreCase) || (string.IsNullOrEmpty(expType) && numeric >= 2147483648 && numeric <= 4294967295 && Math.Truncate(numeric) == numeric);
+                bool real = string.Equals(expType, "Real", StringComparison.OrdinalIgnoreCase) || (!unsigned && string.IsNullOrEmpty(expType) && (value is double || value is float || value is decimal));
+                bytes = real ? BitConverter.GetBytes(Convert.ToSingle(value, CultureInfo.InvariantCulture))
+                    : unsigned ? BitConverter.GetBytes(Convert.ToUInt32(value, CultureInfo.InvariantCulture))
+                    : BitConverter.GetBytes(Convert.ToInt32(value, CultureInfo.InvariantCulture));
+            }
+            else throw new ArgumentException("Raw SIM encoding supports W and D widths only.");
+            Array.Reverse(bytes);
+            return bytes;
+        }
+
+        private object CmdSimCodecSelfTest()
+        {
+            bool word = BitConverter.ToString(EncodeRawSimValue('W', "UInt", 65535)) == "FF-FF" && BitConverter.ToString(EncodeRawSimValue('W', "", 65535)) == "FF-FF";
+            bool dword = BitConverter.ToString(EncodeRawSimValue('D', "UDInt", 4294967295L)) == "FF-FF-FF-FF" && BitConverter.ToString(EncodeRawSimValue('D', "", 4294967295L)) == "FF-FF-FF-FF" && BitConverter.ToString(EncodeRawSimValue('D', "", 4294967295.0)) == "FF-FF-FF-FF";
+            bool time = CompareSimValues(1500.0, "T#1s500ms", 0) && CompareSimValues(1500.0, "LT#1500ms", 0);
+            return new Dictionary<string, object> { { "passed", word && dword && time }, { "unsignedWord", word }, { "unsignedDWord", dword }, { "timeLiteral", time } };
         }
 
         private object CmdPlcsimRuntime(Dictionary<string, object> args)
@@ -926,16 +950,15 @@ namespace TiaBridge
                     int waitMs = GetInt(st, "waitMs", 0);
                     if (waitMs > 0)
                     {
-                        int elapsed = 0;
-                        while (elapsed < waitMs)
+                        long deadline = sw.ElapsedMilliseconds + waitMs;
+                        while (sw.ElapsedMilliseconds < deadline)
                         {
                             if (sw.ElapsedMilliseconds > maxTotalMs)
                             {
                                 throw new TimeoutException("PLCSIM run_sequence exceeded timeoutMs (" + maxTotalMs + " ms) during wait at step " + stepIdx + ".");
                             }
-                            int sleepChunk = Math.Min(sampleIntervalMs, waitMs - elapsed);
+                            int sleepChunk = Math.Max(0, (int)Math.Min(sampleIntervalMs, deadline - sw.ElapsedMilliseconds));
                             Thread.Sleep(sleepChunk);
-                            elapsed += sleepChunk;
                             takeSample();
                         }
                     }
@@ -990,8 +1013,8 @@ namespace TiaBridge
             }
             try
             {
-                double da = Convert.ToDouble(actual, CultureInfo.InvariantCulture);
-                double db = Convert.ToDouble(expected, CultureInfo.InvariantCulture);
+                double da = ParseSimComparable(actual);
+                double db = ParseSimComparable(expected);
                 return Math.Abs(da - db) <= tol;
             }
             catch
@@ -999,7 +1022,32 @@ namespace TiaBridge
                 return string.Equals(Convert.ToString(actual), Convert.ToString(expected), StringComparison.OrdinalIgnoreCase);
             }
         }
+
+        private static double ParseSimComparable(object value)
+        {
+            string s = value as string;
+            if (s == null || !Regex.IsMatch(s, @"^(?:L?T|L?TIME)#", RegexOptions.IgnoreCase)) return Convert.ToDouble(value, CultureInfo.InvariantCulture);
+            string body = Regex.Replace(s, @"^(?:L?T|L?TIME)#", "", RegexOptions.IgnoreCase).Replace("_", "");
+            bool negative = body.StartsWith("-");
+            if (negative) body = body.Substring(1);
+            MatchCollection parts = Regex.Matches(body, @"(\d+(?:\.\d+)?)(ms|us|ns|d|h|m|s)", RegexOptions.IgnoreCase);
+            double total = 0; int consumed = 0;
+            foreach (Match part in parts)
+            {
+                if (part.Index != consumed) throw new FormatException("Invalid PLC time literal: " + s);
+                double n = double.Parse(part.Groups[1].Value, CultureInfo.InvariantCulture);
+                string unit = part.Groups[2].Value.ToLowerInvariant();
+                total += n * (unit == "d" ? 86400000 : unit == "h" ? 3600000 : unit == "m" ? 60000 : unit == "s" ? 1000 : unit == "ms" ? 1 : unit == "us" ? 0.001 : 0.000001);
+                consumed += part.Length;
+            }
+            if (consumed != body.Length || consumed == 0) throw new FormatException("Invalid PLC time literal: " + s);
+            return negative ? -total : total;
+        }
 #else
+        private object CmdSimCodecSelfTest()
+        {
+            return new Dictionary<string, object> { { "passed", true }, { "skipped", "PLCSIM Runtime API not installed" } };
+        }
         private object CmdPlcsimRuntime(Dictionary<string, object> args)
         {
             throw new InvalidOperationException("TiaBridge.exe was compiled without Siemens.Simatic.Simulation.Runtime.Api.x64.dll. Install S7-PLCSIM V20 / PLCSIM Advanced and run build.ps1.");

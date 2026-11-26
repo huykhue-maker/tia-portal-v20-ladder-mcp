@@ -73,6 +73,7 @@ function analyze(blockReads, opts) {
     const bname = r.block.name; const declared = new Map();
     for (const sec of Object.keys(r.interface)) for (const m of r.interface[sec]) declared.set(m.name.split('.')[0], sec);
     const used = new Set(), written = new Set();
+    const tempWritten = new Set();
     const timerUse = new Map(), edgeUse = new Map();
     let nonLad = 0;
     for (const n of r.networks) {
@@ -83,6 +84,10 @@ function analyze(blockReads, opts) {
         const key = O.text(op);
         const head = op.k === 'local' ? op.path[0] : null;
         if (head) used.add(head);
+        if (head && declared.get(head) === 'Temp') {
+          if (mode !== 'w' && !tempWritten.has(head)) add('warning', 'TEMP_READ_BEFORE_WRITE', '#' + head + ' is read before assignment; Temp does not retain its previous value', bname + ' NW' + n.index);
+          if (mode === 'w' || mode === 'rw') tempWritten.add(head);
+        }
         const rw = mode === 'w' ? 'write' : mode === 'rw' ? 'read/write' : 'read';
         if (!xref.has(key)) xref.set(key, []);
         xref.get(key).push({ block: bname, nw: n.index, access: mode === 'inst' || mode === 'mem' ? 'instance' : rw });

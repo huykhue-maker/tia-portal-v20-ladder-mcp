@@ -51,7 +51,7 @@ class OnlineBackups {
       const result = transform(xml);
       if (preview) return { xml, result };
       const backup = this.bridge.saveBackup(label(scope), original);
-      const manifest = { scope, sha256: digest(original), file: path.basename(backup) };
+      const manifest = { scope, group: scope.group, sha256: digest(original), file: path.basename(backup) };
       fs.writeFileSync(backup + '.json', JSON.stringify(manifest, null, 2), { flag: 'wx' });
       fs.writeFileSync(xmlPath, result.xml, 'utf8');
       await this.bridge.call('existing_object', { ...request, action: 'import', expectedScope: scope, xmlPath });
@@ -59,9 +59,26 @@ class OnlineBackups {
     });
   }
 
+  async backupOnly(args, kind) {
+    const request = this.request(args, kind);
+    return withScratchXml(async xmlPath => {
+      const scope = await this.bridge.call('existing_object', { ...request, action: 'export', forWrite: true, xmlPath });
+      const original = fs.readFileSync(xmlPath);
+      const backup = this.bridge.saveBackup(label(scope), original);
+      fs.writeFileSync(backup + '.json', JSON.stringify({ scope, group: scope.group, sha256: digest(original), file: path.basename(backup) }, null, 2), { flag: 'wx' });
+      return backup;
+    });
+  }
+
   async rollback(args, action) {
     const request = this.request(args, args.kind || 'block');
-    const scope = await this.bridge.call('existing_object', { ...request, action: 'describe', forWrite: action === 'restore' });
+    let scope;
+    try {
+      scope = await this.bridge.call('existing_object', { ...request, action: 'describe', forWrite: true });
+    } catch (error) {
+      if (!/^(block|udt) '[^']+' not found\.$/.test(error.message)) throw error;
+      return this.rollbackDeleted(args, action, request);
+    }
     const list = this.bridge.listBackups(label(scope)).filter(item => fs.existsSync(item.path + '.json'));
     if (action === 'list') return list;
     const chosen = args.backupFile === undefined ? list[0] : list.find(item => item.file === args.backupFile);
@@ -74,6 +91,35 @@ class OnlineBackups {
     await withScratchXml(async xmlPath => {
       fs.writeFileSync(xmlPath, bytes);
       await this.bridge.call('existing_object', { ...request, action: 'import', expectedScope: scope, xmlPath });
+    });
+    return chosen.file;
+  }
+
+  async rollbackDeleted(args, action, request) {
+    const status = await this.bridge.call('status', {});
+    if (!status.projectPath) throw new Error('No TIA Portal project is open.');
+    const selected = await this.bridge.call('list_blocks', { plcName: request.plcName });
+    const equal = (a, b) => String(a || '').toLowerCase() === String(b || '').toLowerCase();
+    const list = this.bridge.listBackups().filter(item => {
+      try {
+        const m = JSON.parse(fs.readFileSync(item.path + '.json', 'utf8'));
+        scopeKey(m.scope);
+        return m.file === item.file && equal(m.scope.projectPath, status.projectPath) &&
+          equal(m.scope.cpu, selected.plc) && equal(m.scope.name, request.name) && m.scope.kind === request.kind &&
+          (request.group === undefined || equal(m.scope.group, request.group.replace(/\\/g, '/').replace(/^\/|\/$/g, '')));
+      } catch { return false; }
+    });
+    if (action === 'list') return list;
+    const chosen = args.backupFile === undefined ? list[0] : list.find(item => item.file === args.backupFile);
+    if (!chosen) throw new Error('No matching verified backup for deleted object in this project, PLC and group.');
+    const m = JSON.parse(fs.readFileSync(chosen.path + '.json', 'utf8'));
+    const bytes = fs.readFileSync(chosen.path);
+    if (m.sha256 !== digest(bytes) || (m.group !== undefined && m.group !== m.scope.group)) throw new Error('Backup identity or XML checksum mismatch. Restore cancelled.');
+    await withScratchXml(async xmlPath => {
+      fs.writeFileSync(xmlPath, bytes);
+      await this.bridge.call(request.kind === 'udt' ? 'import_type' : 'import_block', {
+        xmlPath, plcName: selected.plc, group: m.scope.group,
+      });
     });
     return chosen.file;
   }

@@ -520,19 +520,20 @@ namespace TiaBridge
                 string srcName = GetStr(args, "sourceName", "MCP_Generated_Source");
                 string groupPath = GetStr(args, "group", "");
                 bool keepSource = GetBool(args, "keepExternalSource", false);
+                string temporaryPath = null;
 
                 if (!string.IsNullOrEmpty(code))
                 {
-                    if (string.IsNullOrEmpty(filePath))
-                    {
-                        string ext = code.IndexOf("DATA_BLOCK", StringComparison.OrdinalIgnoreCase) >= 0 && code.IndexOf("FUNCTION", StringComparison.OrdinalIgnoreCase) < 0
+                    string ext = code.IndexOf("DATA_BLOCK", StringComparison.OrdinalIgnoreCase) >= 0 && code.IndexOf("FUNCTION", StringComparison.OrdinalIgnoreCase) < 0
                             ? ".db"
                             : (code.IndexOf("TYPE ", StringComparison.OrdinalIgnoreCase) >= 0 && code.IndexOf("FUNCTION", StringComparison.OrdinalIgnoreCase) < 0 ? ".udt" : ".scl");
-                        filePath = Path.Combine(Path.GetTempPath(), srcName + ext);
-                    }
+                    temporaryPath = Path.Combine(Path.GetTempPath(), "tia_mcp_scl_" + Guid.NewGuid().ToString("N") + ext);
+                    filePath = temporaryPath;
                     File.WriteAllText(filePath, code, new UTF8Encoding(true));
                 }
 
+                try
+                {
                 FileInfo fi = new FileInfo(filePath);
                 if (!fi.Exists) throw new FileNotFoundException("SCL/DB/UDT source file not found: " + fi.FullName);
 
@@ -581,6 +582,8 @@ namespace TiaBridge
                     { "filePath", fi.FullName },
                     { "generatedObjects", genNames }
                 };
+                }
+                finally { if (temporaryPath != null) { try { File.Delete(temporaryPath); } catch { } } }
             }
 
             throw new ArgumentException("Unknown scl_source action: " + action);

@@ -199,6 +199,7 @@ namespace TiaBridge
                 case "delete_block": return CmdDeleteBlock(args);
                 case "export_type": return CmdExportType(args);
                 case "import_type": return CmdImportType(args);
+                case "delete_type": return CmdDeleteType(args);
                 case "compile": return CmdCompile(args);
                 case "sim_launch": return CmdSimLaunch(args);
                 case "list_connections": return CmdListConnections(args);
@@ -212,6 +213,7 @@ namespace TiaBridge
                 case "hardware_config": return CmdHardwareConfig(args);
                 case "network_config": return CmdNetworkConfig(args);
                 case "plcsim_runtime": return CmdPlcsimRuntime(args);
+                case "sim_codec_self_test": return CmdSimCodecSelfTest();
                 case "escape_hatch": return CmdEscapeHatch(args);
                 default: throw new InvalidOperationException("Unknown bridge command: " + cmd);
             }
@@ -426,13 +428,15 @@ namespace TiaBridge
                 try
                 {
                     int dummy = _tia.Projects.Count;
-                    if (mode == "auto") return CmdStatus();
+                    if (mode == "auto" && pid == 0) return CmdStatus();
                 }
-                catch
-                {
-                    _tia = null;
-                    _project = null;
-                }
+                catch { }
+                try { if (!_attachedExisting) _tia.Dispose(); } catch { }
+                _tia = null;
+                _project = null;
+                _handles.Clear();
+                _mode = "none";
+                _attachedExisting = false;
             }
 
             if (mode == "attach" || mode == "auto")
@@ -587,7 +591,7 @@ namespace TiaBridge
 
         private object CmdCloseProject()
         {
-            EnsureProject();
+            if (_project == null) return new Dictionary<string, object> { { "closed", false }, { "project", null } };
             string name = _project.Name;
             _project.Close();
             _project = null;
@@ -796,6 +800,10 @@ namespace TiaBridge
                 }
                 if (tbl == null)
                 {
+                    ArrayList requestedDeletes = args.ContainsKey("delete") ? args["delete"] as ArrayList : null;
+                    ArrayList requestedTags = args.ContainsKey("tags") ? args["tags"] as ArrayList : null;
+                    if (requestedDeletes != null && requestedDeletes.Count > 0 && (requestedTags == null || requestedTags.Count == 0))
+                        throw new InvalidOperationException("Tag table '" + tableName + "' not found; delete will not create a table.");
                     tbl = plc.Software.TagTableGroup.TagTables.Create(tableName);
                 }
             }
@@ -803,10 +811,24 @@ namespace TiaBridge
             object rawTags;
             if (!args.TryGetValue("tags", out rawTags) || !(rawTags is ArrayList))
             {
-                throw new ArgumentException("tags array is required.");
+                if (args.ContainsKey("delete")) rawTags = new ArrayList();
+                else throw new ArgumentException("tags array is required.");
             }
 
             List<string> results = new List<string>();
+            List<string> warnings = new List<string>();
+            ArrayList deleteNames = args.ContainsKey("delete") ? args["delete"] as ArrayList : null;
+            if (deleteNames != null)
+            {
+                foreach (object rawName in deleteNames)
+                {
+                    string deleteName = Convert.ToString(rawName);
+                    PlcTag existing = tbl.Tags.Find(deleteName);
+                    if (existing == null) throw new InvalidOperationException("Tag '" + deleteName + "' not found in table '" + tbl.Name + "'.");
+                    existing.Delete();
+                    results.Add("deleted " + deleteName);
+                }
+            }
             foreach (object item in (ArrayList)rawTags)
             {
                 Dictionary<string, object> td = item as Dictionary<string, object>;
@@ -832,9 +854,11 @@ namespace TiaBridge
                 if (comment != null && tag.Comment != null && tag.Comment.Items != null)
                 {
                     if (tag.Comment.Items.Count > 0) tag.Comment.Items[0].Text = comment;
+                    else warnings.Add("Comment for tag '" + name + "' was not saved: no active project language item is available.");
                 }
+                else if (comment != null) warnings.Add("Comment for tag '" + name + "' was not saved: multilingual comment is unavailable.");
             }
-            return new Dictionary<string, object> { { "table", tbl.Name }, { "changes", results } };
+            return new Dictionary<string, object> { { "table", tbl.Name }, { "changes", results }, { "warnings", warnings } };
         }
 
         private object CmdListTypes(Dictionary<string, object> args)
@@ -1065,8 +1089,22 @@ namespace TiaBridge
             string xmlPath = GetStr(args, "xmlPath", "");
             FileInfo fi = new FileInfo(xmlPath);
             if (!fi.Exists) throw new FileNotFoundException("UDT XML not found: " + fi.FullName);
-            IList<PlcType> res = plc.Software.TypeGroup.Types.Import(fi, ImportOptions.Override);
+            PlcTypeGroup target = plc.Software.TypeGroup;
+            foreach (string part in GetStr(args, "group", "").Replace('\\', '/').Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries))
+                target = target.Groups.Find(part) ?? target.Groups.Create(part);
+            IList<PlcType> res = target.Types.Import(fi, ImportOptions.Override);
             return new Dictionary<string, object> { { "imported", true }, { "types", res.Select(x => x.Name).ToArray() } };
+        }
+
+        private object CmdDeleteType(Dictionary<string, object> args)
+        {
+            PlcTarget plc = ResolvePlc(args, true);
+            string name = GetStr(args, "typeName", "");
+            if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("typeName is required for delete_type.");
+            PlcType type = FindPlcType(plc.Software.TypeGroup, name);
+            if (type == null) throw new InvalidOperationException("PLC data type '" + name + "' not found.");
+            type.Delete();
+            return new Dictionary<string, object> { { "deleted", name }, { "plc", plc.CpuItem.Name } };
         }
 
         private object CmdCompile(Dictionary<string, object> args)

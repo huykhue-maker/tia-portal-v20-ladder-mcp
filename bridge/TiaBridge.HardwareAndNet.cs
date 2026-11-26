@@ -110,7 +110,7 @@ namespace TiaBridge
                     // Fallback: search catalog by article base if exact firmware version differs on this TIA installation
                     string art = typeId.Replace("OrderNumber:", "").Split('/')[0].Trim();
                     IList<CatalogEntry> found = _tia.HardwareCatalog.Find(art);
-                    CatalogEntry latest = found.LastOrDefault(x => !string.IsNullOrEmpty(x.TypeIdentifier));
+                    CatalogEntry latest = LatestCatalogEntry(found, art);
                     if (latest == null) throw new InvalidOperationException("Failed to create device '" + typeId + "': " + ex.Message);
                     dev = _project.Devices.CreateWithItem(latest.TypeIdentifier, cpuName, stationName);
                     typeId = latest.TypeIdentifier;
@@ -154,7 +154,7 @@ namespace TiaBridge
                 {
                     // Try resolving version from HardwareCatalog if exact firmware didn't match
                     string art = typeId.Replace("OrderNumber:", "").Split('/')[0].Trim();
-                    foreach (CatalogEntry ce in _tia.HardwareCatalog.Find(art).Reverse())
+                    foreach (CatalogEntry ce in RankedCatalogEntries(_tia.HardwareCatalog.Find(art), art))
                     {
                         rack = FindPluggableContainer(plc.Device, ce.TypeIdentifier, modName, slot);
                         if (rack != null) { typeId = ce.TypeIdentifier; break; }
@@ -512,6 +512,30 @@ namespace TiaBridge
             }
         }
 
+        private static IEnumerable<CatalogEntry> RankedCatalogEntries(IEnumerable<CatalogEntry> entries, string article)
+        {
+            return entries.Where(e => string.Equals(e.ArticleNumber, article, StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(e.TypeIdentifier))
+                .OrderByDescending(e => { Version v; return Version.TryParse((e.Version ?? "").Trim().TrimStart('V', 'v'), out v) ? v : new Version(0, 0); });
+        }
+
+        private static CatalogEntry LatestCatalogEntry(IEnumerable<CatalogEntry> entries, string article)
+        {
+            return RankedCatalogEntries(entries, article).FirstOrDefault();
+        }
+
+        private static void CollectDevicesInNetworkGroup(DeviceUserGroup group, List<Device> devices)
+        {
+            foreach (Device d in group.Devices) devices.Add(d);
+            foreach (DeviceUserGroup child in group.Groups) CollectDevicesInNetworkGroup(child, devices);
+        }
+
+        private List<Device> AllNetworkDevices()
+        {
+            List<Device> devices = _project.Devices.ToList();
+            foreach (DeviceUserGroup group in _project.DeviceGroups) CollectDevicesInNetworkGroup(group, devices);
+            return devices;
+        }
+
         private object CmdNetworkConfig(Dictionary<string, object> args)
         {
             EnsureProject();
@@ -533,7 +557,7 @@ namespace TiaBridge
                 }
 
                 List<object> ifaces = new List<object>();
-                foreach (Device dev in _project.Devices)
+                foreach (Device dev in AllNetworkDevices())
                 {
                     List<KeyValuePair<DeviceItem, NetworkInterface>> devNis = new List<KeyValuePair<DeviceItem, NetworkInterface>>();
                     CollectNetworkInterfaces(dev.DeviceItems, dev.Name, devNis);
@@ -574,15 +598,25 @@ namespace TiaBridge
 
             if (action == "set_ip" || action == "connect_subnet")
             {
-                PlcTarget plc = ResolvePlc(args, true);
+                string deviceName = GetStr(args, "deviceName", "");
+                Device device;
+                if (!string.IsNullOrEmpty(deviceName))
+                {
+                    List<Device> matches = AllNetworkDevices().Where(d => string.Equals(d.Name, deviceName, StringComparison.OrdinalIgnoreCase)).ToList();
+                    if (matches.Count != 1) throw new InvalidOperationException("deviceName '" + deviceName + "' matches " + matches.Count + " devices; provide an exact unique name.");
+                    device = matches[0];
+                }
+                else device = ResolvePlc(args, true).Device;
                 string ifaceFilter = GetStr(args, "interfaceName", "");
                 List<KeyValuePair<DeviceItem, NetworkInterface>> devNis = new List<KeyValuePair<DeviceItem, NetworkInterface>>();
-                CollectNetworkInterfaces(plc.Device.DeviceItems, plc.Device.Name, devNis);
+                CollectNetworkInterfaces(device.DeviceItems, device.Name, devNis);
 
-                KeyValuePair<DeviceItem, NetworkInterface> chosen = devNis.FirstOrDefault(x =>
+                List<KeyValuePair<DeviceItem, NetworkInterface>> matchesIface = devNis.Where(x =>
                     (string.IsNullOrEmpty(ifaceFilter) || x.Key.Name.IndexOf(ifaceFilter, StringComparison.OrdinalIgnoreCase) >= 0) &&
-                    x.Value.Nodes.Count > 0);
-                if (chosen.Value == null) throw new InvalidOperationException("No Ethernet/PROFINET NetworkInterface with Nodes found on '" + plc.Device.Name + "'.");
+                    x.Value.Nodes.Count > 0).ToList();
+                if (matchesIface.Count == 0) throw new InvalidOperationException("No Ethernet/PROFINET NetworkInterface with Nodes found on '" + device.Name + "'.");
+                if (matchesIface.Count > 1) throw new InvalidOperationException("interfaceName '" + ifaceFilter + "' is ambiguous on '" + device.Name + "': " + string.Join(", ", matchesIface.Select(x => x.Key.Name).ToArray()));
+                KeyValuePair<DeviceItem, NetworkInterface> chosen = matchesIface[0];
 
                 Node node = chosen.Value.Nodes[0];
                 List<string> changes = new List<string>();
@@ -625,7 +659,7 @@ namespace TiaBridge
 
                 return new Dictionary<string, object>
                 {
-                    { "plc", plc.CpuItem.Name },
+                    { "device", device.Name },
                     { "interface", chosen.Key.Name },
                     { "changes", changes },
                     { "warnings", warnings }
