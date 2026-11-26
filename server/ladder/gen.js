@@ -83,8 +83,13 @@ class Gen {
           if (/^\d+#/.test(op.value)) type = hint && /Word|Byte|Int/.test(hint) ? hint : 'Word';
           else type = hint || (op.real ? 'Real' : 'Int');
         }
+        const ctype = canonType(type);
+        if (ctype === 'Time' || ctype === 'LTime' || ctype === 'S5Time' || /^(?:L?TIME|LT|T|S5TIME|S5T)#/i.test(op.value)) {
+          attrs.Scope = 'TypedConstant';
+          return E('Access', attrs, E('Constant', {}, [E('ConstantValue', {}, op.value)]));
+        }
         attrs.Scope = 'LiteralConstant';
-        return E('Access', attrs, E('Constant', {}, [E('ConstantType', {}, canonType(type)), E('ConstantValue', {}, op.value)]));
+        return E('Access', attrs, E('Constant', {}, [E('ConstantType', {}, ctype), E('ConstantValue', {}, op.value)]));
       }
       default: throw new GenError('unsupported operand ' + JSON.stringify(op));
     }
@@ -262,23 +267,25 @@ class Gen {
       if (!P) throw new GenError(partName + ' needs ' + k + '=..., e.g. ' + partName + '(' + O.text(a.inst) + ', ' + k + '=' + (B.kind === 'timer' ? 'T#3s' : B.kind === 'motion' ? '"Truc_X"' : '10') + ')', 'E_PARAM');
       const kp = this.pin(uid, k, 'dst'); this.paramPin(P, kp, B.kind === 'timer' ? 'Time' : (B.kind === 'motion' ? undefined : type)); this.need(kp, partName + '.' + k);
     }
+    const needsOpenCon = B.kind === 'motion' || B.kind === 'timer' || B.kind === 'counter';
+    const hasNext = Array.isArray(a.next) && a.next.length > 0;
     for (const k of (B.optIn || [])) {
       const kp = this.pin(uid, k, 'dst');
       if (a.params[k]) {
         const hint = /Position|Distance|Velocity/.test(k) ? 'Real' : (/Mode|Direction/.test(k) ? 'Int' : 'Bool');
         this.paramPin(a.params[k], kp, hint);
-      } else if (B.kind === 'motion') {
+      } else if (needsOpenCon) {
         this.union(this.openPin('src'), kp);
       }
     }
     for (const k of B.flowIn) {
       if (a.params[k]) this.paramPin(a.params[k], this.pin(uid, k, 'dst'), 'Bool');
-      else if (B.kind === 'motion') this.union(this.openPin('src'), this.pin(uid, k, 'dst'));
+      else if (needsOpenCon) this.union(this.openPin('src'), this.pin(uid, k, 'dst'));
     }
     for (const k of [...B.valOut, ...B.boolOut]) {
       const P = a.params[k];
       if (!P) {
-        if (B.kind === 'motion') this.union(this.pin(uid, k, 'src'), this.openPin('dst'));
+        if (needsOpenCon && (k !== B.flowOut || !hasNext)) this.union(this.pin(uid, k, 'src'), this.openPin('dst'));
         continue;
       }
       if (P.v !== 'op') throw new GenError(partName + '.' + k + ' is an output; give it a variable (e.g. ' + k + '=#var) or chain with "=>"', 'E_PARAM');

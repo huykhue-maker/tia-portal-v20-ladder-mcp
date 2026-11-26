@@ -196,8 +196,8 @@ namespace TiaBridge
 
         private object CmdWatchTable(Dictionary<string, object> args)
         {
-            PlcTarget plc = ResolvePlc(args);
             string action = GetStr(args, "action", "list").ToLowerInvariant();
+            PlcTarget plc = ResolvePlc(args, action != "list" && action != "read" && action != "export");
             PlcWatchAndForceTableGroup root = plc.Software.WatchAndForceTableGroup;
 
             if (action == "list")
@@ -452,8 +452,8 @@ namespace TiaBridge
         // -------------------- SCL & External Text Sources --------------------
         private object CmdSclSource(Dictionary<string, object> args)
         {
-            PlcTarget plc = ResolvePlc(args);
             string action = GetStr(args, "action", "export").ToLowerInvariant();
+            PlcTarget plc = ResolvePlc(args, action == "import" || action == "write");
             PlcExternalSourceSystemGroup extGrp = plc.Software.ExternalSourceGroup;
 
             if (action == "export" || action == "read")

@@ -18,8 +18,8 @@ const X = require('../server/ladder/xml');
 let passed = 0;
 let total = 0;
 const suite = process.argv[2] || 'all';
-if (!['offline', 'tia', 'all'].includes(suite)) {
-  throw new Error('Expected test suite: offline, tia or all');
+if (!['offline', 'tia', 'tia-isolation', 'all'].includes(suite)) {
+  throw new Error('Expected test suite: offline, tia, tia-isolation or all');
 }
 
 function test(name, fn, group = 'offline') {
@@ -34,7 +34,7 @@ function test(name, fn, group = 'offline') {
   });
 }
 
-async function withMcpServer(run) {
+async function withMcpServer(run, timeoutMs = 15000) {
   const serverPath = path.join(__dirname, '..', 'server', 'index.js');
   const child = spawn(process.execPath, [serverPath], { stdio: ['pipe', 'pipe', 'pipe'] });
   const pending = new Map();
@@ -55,7 +55,7 @@ async function withMcpServer(run) {
   let nextId = 1;
   const rpc = (method, params) => new Promise((resolve, reject) => {
     const id = nextId++;
-    const t = setTimeout(() => reject(new Error('MCP RPC timeout: ' + method)), 15000);
+    const t = setTimeout(() => reject(new Error('MCP RPC timeout: ' + method)), timeoutMs);
     pending.set(id, { resolve: m => { clearTimeout(t); resolve(m); } });
     child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
   });
@@ -120,6 +120,59 @@ async function main() {
       });
       assert(exact.content[0].text.startsWith('FAIL - 0 scans'), exact.content[0].text);
     });
+  });
+
+  await test('Offline MCP: IEC ROUND ties and missing CALL targets', async () => {
+    await withMcpServer(async rpc => {
+      const dryRun = async (networks, steps, more = []) => (await rpc('tools/call', { name: 'tia_dry_run_ladder', arguments: {
+        entry: 'Main', inlineBlocks: [{ name: 'Main', networks }, ...more], scenario: { steps },
+      } })).result;
+      const cases = [[10.5, 10], [11.5, 12], [-1.5, -2], [-2.5, -2], [0.5, 0], [-0.5, 0], [7.49, 7], [-7.51, -8]];
+      const rounded = await dryRun(['ROUND(#X, #Y, Real, DInt)'],
+        cases.map(([input, output]) => ({ set: { '#X': input }, run: 1, expect: { '#Y': output } })));
+      assert.match(rounded.content[0].text, /^PASS/);
+      for (const logic of ['CALL("NotLoaded")', 'NO(#Disabled) => MOVE(1, #X) => CALL("NotLoaded")']) {
+        const result = await dryRun(['COIL(#Y)', logic], [{ run: 0 }]);
+        assert(result.isError);
+        assert.match(result.content[0].text, /Main NW2: missing CALL target NotLoaded/);
+      }
+      const loaded = await dryRun(['CALL("Loaded") => COIL(#Y)'], [{ run: 1, expect: { '#Y': 1 } }], [{ name: 'Loaded', type: 'FC', networks: [] }]);
+      assert.match(loaded.content[0].text, /^PASS/);
+    });
+  });
+
+  await test('Online backup identity and checksum isolation', async () => {
+    const { OnlineBackups } = require('../server/online_backups');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'backup-scope-'));
+    let scope = {projectPath:'A',device:'Station',cpu:'CPU',software:'PLC',group:'Folder',kind:'block',name:'Main',objectType:'OB',number:'1'};
+    let imported = 0;
+    const bridge = {
+      async call(cmd, args) {
+        if(args.action === 'export') fs.writeFileSync(args.xmlPath, '<original/>');
+        if(args.action === 'import') { assert.deepStrictEqual(args.expectedScope, scope); imported++; }
+        return {...scope};
+      },
+      saveBackup(label, xml) { const file = path.join(dir,label+'__1.xml'); fs.writeFileSync(file,xml); return file; },
+      listBackups(label) { return fs.readdirSync(dir).filter(f=>f.startsWith(label+'__') && f.endsWith('.xml')).map(file=>({file,path:path.join(dir,file)})); }
+    };
+    try {
+      const service = new OnlineBackups(bridge);
+      const args = {blockName:'Main'};
+      const saved = await service.edit(args,'block',()=>({xml:'<changed/>'}));
+      const file = path.basename(saved.backup);
+      const originalScope = {...scope};
+      for(const key of ['projectPath','device','cpu','software','group','kind','name','objectType','number']) {
+        scope = {...originalScope,[key]:'Other'};
+        await assert.rejects(service.rollback({...args,backupFile:file},'restore'), /No matching verified backup/);
+      }
+      scope = originalScope;
+      await service.rollback(args,'restore');
+      assert.strictEqual(imported,2);
+      await assert.rejects(service.rollback({...args,backupFile:'../'+file},'restore'), /No matching/);
+      fs.appendFileSync(saved.backup,'corrupted');
+      await assert.rejects(service.rollback(args,'restore'), /checksum mismatch/);
+      assert.strictEqual(imported,2);
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
   });
 
   // 1. Ladder DSL <-> SimaticML XML roundtrip
@@ -555,6 +608,104 @@ async function main() {
     });
     assert.strictEqual(sim.ok, true, 'Rounding simulation failed:\n' + S.formatResults(sim));
   });
+
+  await test('8. SimaticML V20 Timers (TypedConstant, time_type, OpenCon), Counters (OpenCon), DB/UDT XML & MCP negotiation', async () => {
+    // 8a. TON / TOF / TP / TONR emit TypedConstant, time_type, and OpenCon on omitted ET/R/Q
+    for (const timer of ['TON', 'TOF', 'TP', 'TONR']) {
+      const dsl = 'NO(#Active) => ' + timer + '(#T1, PT=T#5s) => COIL(#Q)';
+      const gen = G.generateFlgNet(D.parseNetwork(dsl).flows, {});
+      assert(gen.xml.includes('<Access Scope="TypedConstant"'), timer + ' must emit TypedConstant for T#5s');
+      assert(!gen.xml.includes('<ConstantType>Time</ConstantType>'), timer + ' TypedConstant must omit ConstantType');
+      assert(gen.xml.includes('<TemplateValue Name="time_type" Type="Type">Time</TemplateValue>'), timer + ' must emit time_type TemplateValue');
+      assert(gen.xml.includes('Name="ET"') && gen.xml.includes('<OpenCon'), timer + ' must connect OpenCon to omitted ET');
+      if (timer === 'TONR') assert(gen.xml.includes('Name="R"') && gen.xml.includes('<OpenCon'), 'TONR must connect OpenCon to omitted R');
+      const back = R.readFlgNet(X.parse(gen.xml));
+      assert.strictEqual(back.complete, true, timer + ' roundtrip incomplete: ' + JSON.stringify(back.notes));
+      assert.strictEqual(back.dsl, dsl, timer + ' roundtrip mismatch');
+    }
+
+    // Bare timer without downstream COIL wires OpenCon to Q and ET
+    const bareTon = G.generateFlgNet(D.parseNetwork('NO(#Active) => TON(#T1, PT=TIME#2s)').flows, {});
+    assert(bareTon.xml.includes('Name="Q"') && bareTon.xml.includes('Name="ET"') && bareTon.xml.includes('<OpenCon'), 'Bare TON must connect OpenCon to Q and ET');
+    assert.strictEqual(R.readFlgNet(X.parse(bareTon.xml)).complete, true);
+
+    // 8b. CTU / CTD / CTUD emit OpenCon for omitted R / LD / CD / CV / QD
+    for (const [dsl, pin] of [
+      ['NO(#Active) => CTU(#C1, PV=5) => COIL(#Q)', 'R'],
+      ['NO(#Active) => CTD(#C2, PV=5)', 'LD'],
+      ['NO(#Active) => CTUD(#C3, PV=5, CV=#Cnt) => COIL(#Q)', 'CD'],
+    ]) {
+      const gen = G.generateFlgNet(D.parseNetwork(dsl).flows, {});
+      assert(gen.xml.includes('Name="' + pin + '"') && gen.xml.includes('<OpenCon'), dsl + ' missing OpenCon on ' + pin);
+      const back = R.readFlgNet(X.parse(gen.xml));
+      assert.strictEqual(back.complete, true, dsl + ' incomplete');
+      assert.strictEqual(back.dsl, dsl, dsl + ' roundtrip mismatch');
+    }
+
+    // 8c. InstanceDB XML omits read-only MemoryLayout; GlobalDB/UDT XML build cleanly
+    const idb = B.createDbXml({ kind: 'InstanceDB', name: 'DB_TrafficLight', instanceOf: 'FB_TrafficLight' });
+    assert(idb.includes('<SW.Blocks.InstanceDB') && !idb.includes('<MemoryLayout>'), 'InstanceDB must omit MemoryLayout');
+    const gdb = B.createDbXml({ kind: 'GlobalDB', name: 'DB_Settings', members: [{ name: 'TGreen', type: 'Time' }] });
+    assert(gdb.includes('<SW.Blocks.GlobalDB') && gdb.includes('<MemoryLayout>Optimized</MemoryLayout>'));
+    const udt = B.createDbXml({ kind: 'UDT', name: 'UDT_Axis', members: [{ name: 'Pos', type: 'Real' }] });
+    assert(udt.includes('<SW.Types.PlcStruct') && udt.includes('<Section Name="None">'));
+
+    // 8d. Stale learned TON without templates still receives time_type
+    const staleTimer = { parts: { TON: { version: '1.0', templates: [{ name: 'Version', type: 'String', value: '1.0' }] } }, calls: {} };
+    const tonFixed = G.generateFlgNet(D.parseNetwork('NO(#Active) => TON(#T1, PT=T#1s) => COIL(#Q)').flows, { learned: staleTimer });
+    assert(tonFixed.xml.includes('<TemplateValue Name="time_type" Type="Type">Time</TemplateValue>'));
+
+    // 8e. MCP protocolVersion negotiation + structuredContent + create FB -> call from Main offline
+    await withMcpServer(async rpc => {
+      const bogusInit = await rpc('initialize', { protocolVersion: '2099-01-01', capabilities: {} });
+      assert.strictEqual(bogusInit.result.protocolVersion, '2025-11-25');
+
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tia-chain-'));
+      try {
+        const fbPath = path.join(dir, 'FB_Unit.xml');
+        const obPath = path.join(dir, 'Main.xml');
+        const cFb = (await rpc('tools/call', {
+          name: 'tia_create_ladder_block',
+          arguments: {
+            type: 'FB', name: 'FB_Unit', importToTia: false, outXmlPath: fbPath,
+            interface: { Input: [{ name: 'Active', type: 'Bool' }], Output: [{ name: 'Out', type: 'Bool' }] },
+            networks: [{ title: 'Delay', dsl: 'NO(#Active) => TON(#T1, PT=T#100ms) => COIL(#Out)' }],
+          },
+        })).result;
+        assert(!cFb.isError, cFb.content[0].text);
+
+        // FB_Unit signature is auto-learned into callCatalog without needing blueprint
+        const cOb = (await rpc('tools/call', {
+          name: 'tia_create_ladder_block',
+          arguments: {
+            type: 'OB', name: 'Main', number: 1, importToTia: false, outXmlPath: obPath,
+            networks: [{ title: 'Call', dsl: 'TRUE => CALL("FB_Unit", inst="DB_Unit", Active="Btn", Out="Lamp")' }],
+          },
+        })).result;
+        assert(!cOb.isError, cOb.content[0].text);
+        assert(fs.readFileSync(obPath, 'utf8').includes('Informative="true"'), 'OB system params must include Informative="true"');
+
+        const an = (await rpc('tools/call', { name: 'tia_analyze_ladder', arguments: { xmlPaths: [obPath, fbPath] } })).result;
+        assert(!an.isError && an.structuredContent && an.structuredContent.summary.error === 0);
+
+        const dry = (await rpc('tools/call', {
+          name: 'tia_dry_run_ladder',
+          arguments: {
+            entry: 'Main', xmlPaths: [obPath, fbPath],
+            scenario: { scanMs: 50, steps: [{ set: { Btn: true }, until: { Lamp: true }, timeout: '500ms' }] },
+          },
+        })).result;
+        assert(!dry.isError && dry.structuredContent && dry.structuredContent.ok === true);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  if (suite === 'tia-isolation') {
+    await test('Headless TIA: isolated PLC writes and backup restore across two projects', () =>
+      require('./tia_isolation')(withMcpServer), 'tia-isolation');
+  }
 
   console.log('\n=== SUMMARY: ' + passed + '/' + total + ' test groups passed ===');
 }

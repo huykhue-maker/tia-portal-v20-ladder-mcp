@@ -280,7 +280,7 @@ function readFlgNet(flg, opts) {
       for (const k of [...B.valIn, ...(B.optIn || [])]) { const P = paramFrom(u, k, 'val'); if (P) params[k] = P; }
       for (const k of B.flowIn) { const P = paramFrom(u, k, 'flow'); if (P) params[k] = P; }
       for (const k of [...B.valOut, ...B.boolOut]) { const P = paramFrom(u, k, 'out'); if (P) params[k] = P; }
-      return { t: 'box', name: bk, inst: part.inst || { k: 'raw', value: '?' }, params, type: tpl(part, 'value_type') || (B.kind === 'timer' ? 'Time' : (B.kind === 'motion' ? 'Void' : 'Int')) };
+      return { t: 'box', name: bk, inst: part.inst || { k: 'raw', value: '?' }, params, type: tpl(part, 'value_type') || tpl(part, 'time_type') || (B.kind === 'timer' ? 'Time' : (B.kind === 'motion' ? 'Void' : 'Int')) };
     }
     notes.push('unsupported instruction ' + part.name);
     return { t: 'raw', label: part.name + '#' + u };

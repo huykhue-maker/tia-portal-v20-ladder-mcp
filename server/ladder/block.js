@@ -359,9 +359,22 @@ function patchNetworks(src, ops, ctx) {
 function defaultSections(type) {
   if (type === 'FB') return { Input: [], Output: [], InOut: [], Static: [], Temp: [], Constant: [] };
   if (type === 'FC') return { Input: [], Output: [], InOut: [], Temp: [], Constant: [], Return: [{ name: 'Ret_Val', type: 'Void' }] };
-  if (type === 'OB') return { Input: [{ name: 'Initial_Call', type: 'Bool', comment: 'Initial call of this OB' }, { name: 'Remanence', type: 'Bool', comment: 'True, if remanent data are available' }], Temp: [], Constant: [] };
+  if (type === 'OB') return {
+    Input: [
+      { name: 'Initial_Call', type: 'Bool', comment: 'Initial call of this OB', informative: true },
+      { name: 'Remanence', type: 'Bool', comment: 'True, if remanent data are available', informative: true },
+    ],
+    Temp: [],
+    Constant: [],
+  };
   throw new G.GenError('type must be FB, FC or OB', 'E_TYPE');
 }
+function mkMemberNode(m, culture) {
+  const attrs = { Name: m.name, Datatype: m.type };
+  if (m.informative) attrs.Informative = 'true';
+  return E('Member', attrs, m.comment ? [E('Comment', {}, E('MultiLanguageText', { Lang: culture }, m.comment))] : []);
+}
+
 function createBlockXml(spec, ctx) {
   ctx = ctx || {};
   const type = spec.type;
@@ -388,8 +401,7 @@ function createBlockXml(spec, ctx) {
     sections[d.section].push({ name: d.name, type: d.type });
   }
   for (const d of (spec.declare || [])) if (!Object.values(sections).flat().find(m => m.name === d.name)) { (sections[d.section] = sections[d.section] || []).push(d); }
-  const memberNode = m => E('Member', { Name: m.name, Datatype: m.type }, m.comment ? [E('Comment', {}, E('MultiLanguageText', { Lang: culture }, m.comment))] : []);
-  const secNodes = SECTION_ORDER.filter(s => sections[s]).map(s => E('Section', { Name: s }, sections[s].map(memberNode)));
+  const secNodes = SECTION_ORDER.filter(s => sections[s]).map(s => E('Section', { Name: s }, sections[s].map(m => mkMemberNode(m, culture))));
   const attrs = [E('Interface', {}, E('Sections', { xmlns: IF_NS }, secNodes)), E('MemoryLayout', {}, spec.memoryLayout || 'Optimized'), E('Name', {}, spec.name), E('Namespace', {})];
   if (spec.number) attrs.push(E('Number', {}, String(spec.number))); else attrs.push(E('AutoNumber', {}, 'true'));
   attrs.push(E('ProgrammingLanguage', {}, 'LAD'));
@@ -403,7 +415,45 @@ function createBlockXml(spec, ctx) {
   return { xml, dbInstances: dbInst, declared: decls };
 }
 
+function createDbXml(spec) {
+  const kind = spec.kind || 'GlobalDB';
+  if (!spec.name) throw new G.GenError('name is required for DB/UDT XML.', 'E_DECL');
+  const culture = spec.culture || 'en-US';
+  const members = (spec.members || []).map(m => mkMemberNode(m, culture));
+  if (kind === 'InstanceDB') {
+    if (!spec.instanceOf) throw new G.GenError('instanceOf is required for InstanceDB "' + spec.name + '".', 'E_DECL');
+    const attrs = [
+      E('InstanceOfName', {}, spec.instanceOf),
+      E('InstanceOfType', {}, spec.instanceOfType || 'FB'),
+      E('Name', {}, spec.name),
+      E('Namespace', {}),
+    ];
+    if (spec.number) attrs.push(E('Number', {}, String(spec.number)));
+    else attrs.push(E('AutoNumber', {}, 'true'));
+    attrs.push(E('ProgrammingLanguage', {}, 'DB'));
+    const doc = E('Document', {}, [E('Engineering', { version: 'V20' }), E('SW.Blocks.InstanceDB', { ID: '0' }, [E('AttributeList', {}, attrs)])]);
+    const xml = '<?xml version="1.0" encoding="utf-8"?>\n' + ser(doc, 0) + '\n';
+    X.parse(xml);
+    return xml;
+  }
+  const isUdt = kind === 'UDT';
+  const secName = isUdt ? 'None' : 'Static';
+  const attrs = [E('Interface', {}, E('Sections', { xmlns: IF_NS }, [E('Section', { Name: secName }, members)]))];
+  if (!isUdt) attrs.push(E('MemoryLayout', {}, spec.memoryLayout || 'Optimized'));
+  attrs.push(E('Name', {}, spec.name), E('Namespace', {}));
+  if (!isUdt) {
+    if (spec.number) attrs.push(E('Number', {}, String(spec.number)));
+    else attrs.push(E('AutoNumber', {}, 'true'));
+    attrs.push(E('ProgrammingLanguage', {}, 'DB'));
+  }
+  const tag = isUdt ? 'SW.Types.PlcStruct' : 'SW.Blocks.GlobalDB';
+  const doc = E('Document', {}, [E('Engineering', { version: 'V20' }), E(tag, { ID: '0' }, [E('AttributeList', {}, attrs)])]);
+  const xml = '<?xml version="1.0" encoding="utf-8"?>\n' + ser(doc, 0) + '\n';
+  X.parse(xml);
+  return xml;
+}
+
 module.exports = {
-  parseBlock, readBlock, formatBlock, interfaceText, patchNetworks, addMembers, removeMembers, createBlockXml,
+  parseBlock, readBlock, formatBlock, interfaceText, patchNetworks, addMembers, removeMembers, createBlockXml, createDbXml,
   makeResolver, parseInterface, SECTION_ORDER,
 };

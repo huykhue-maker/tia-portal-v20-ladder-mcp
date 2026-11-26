@@ -125,8 +125,10 @@ function tokenize(src) {
     }
     if (c === "'") { const e = src.indexOf("'", i + 1); if (e < 0) throw new DslError('unterminated string', src, i); push('str', pos, { v: src.slice(i + 1, e) }); i = e + 1; continue; }
     let m;
-    if ((m = /^(?:LT|T)#[-0-9A-Za-z_.:]+/i.exec(src.slice(i)))) {
-      push('op', pos, { op: lit(m[0].toUpperCase().startsWith('LT#') ? 'LTime' : 'Time', m[0].replace(/^(lt|t)#/i, s => s.toUpperCase())) });
+    if ((m = /^(?:L?TIME|LT|T|S5TIME|S5T)#[-0-9A-Za-z_.:]+/i.exec(src.slice(i)))) {
+      const upper = m[0].toUpperCase();
+      const t = (upper.startsWith('LT#') || upper.startsWith('LTIME#')) ? 'LTime' : ((upper.startsWith('S5T#') || upper.startsWith('S5TIME#')) ? 'S5Time' : 'Time');
+      push('op', pos, { op: lit(t, m[0].replace(/^(?:l?time|lt|t|s5time|s5t)#/i, s => s.toUpperCase())) });
       i += m[0].length; continue;
     }
     if ((m = /^\d+#[0-9A-Fa-f_]+/.exec(src.slice(i)))) { push('op', pos, { op: lit('auto', m[0]) }); i += m[0].length; continue; }

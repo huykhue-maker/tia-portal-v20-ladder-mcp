@@ -17,13 +17,6 @@ function* xmlFiles(directory) {
   }
 }
 
-function* calls(flows) {
-  for (const flow of flows) for (const action of flow.then) {
-    if (action.t === 'call') yield action;
-    if (action.next) yield* calls(action.next);
-  }
-}
-
 function loadBlocks(directory) {
   const reads = new Map();
   const dependencies = new Map();
@@ -37,7 +30,7 @@ function loadBlocks(directory) {
       const refs = [];
       for (const net of block.networks) {
         if (!net.complete) throw new Error(name + ' NW' + net.index + ': ' + (net.notes.join('; ') || 'incomplete LAD decoding'));
-        for (const call of calls(net.flows)) refs.push({ call, nw: net.index });
+        for (const call of S.calls(net.flows)) refs.push({ call, nw: net.index });
       }
       // Keep the decoded networks and interface; release the source XML and syntax tree.
       const { doc, ...decoded } = block;

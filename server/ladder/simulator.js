@@ -14,9 +14,15 @@ const RANGES = {
 };
 const INTEGER = new Set(Object.keys(RANGES));
 
+function roundToEven(value) {
+  const lower = Math.floor(value);
+  if (value - lower === 0.5) return lower % 2 === 0 ? lower : lower + 1;
+  return Math.round(value);
+}
+
 function parseTime(s) {
   if (typeof s === 'number') return s;
-  const m = /^(?:L?T#)?(-?[\d._]+(?:ms|us|ns|d|h|m|s)(?:[\d._]+(?:ms|us|ns|d|h|m|s))*)$/i.exec(String(s).trim());
+  const m = /^(?:(?:L?(?:TIME|T)|S5TIME|S5T)#)?(-?[\d._]+(?:ms|us|ns|d|h|m|s)(?:[\d._]+(?:ms|us|ns|d|h|m|s))*)$/i.exec(String(s).trim());
   if (!m) return null;
   let total = 0; const re = /([\d._]+)(ms|us|ns|d|h|m|s)/gi; let t;
   const mult = { d: 86400000, h: 3600000, m: 60000, s: 1000, ms: 1, us: 0.001, ns: 0.000001 };
@@ -31,7 +37,7 @@ function parseTime(s) {
 function litValue(op) {
   const v = op.value;
   if (op.type === 'Bool' || /^(TRUE|FALSE)$/i.test(v)) return /^TRUE$/i.test(v);
-  if (op.type === 'Time' || op.type === 'LTime' || /^L?T#/i.test(v)) return parseTime(v) || 0;
+  if (op.type === 'Time' || op.type === 'LTime' || op.type === 'S5Time' || /^(?:L?(?:TIME|T)|S5TIME|S5T)#/i.test(v)) return parseTime(v) || 0;
   const h = /^(\d+)#([0-9A-Fa-f_]+)$/.exec(v);
   if (h) return parseInt(h[2].replace(/_/g, ''), parseInt(h[1], 10));
   const n = Number(v); return Number.isNaN(n) ? v : n;
@@ -229,7 +235,7 @@ class Simulator {
           } else if (a.fn === 'TRUNC') {
             r = Math.trunc(num(this.read(a.ins[0], f)));
           } else if (a.fn === 'ROUND') {
-            r = Math.round(num(this.read(a.ins[0], f)));
+            r = roundToEven(num(this.read(a.ins[0], f)));
           } else if (a.fn === 'CEIL') {
             r = Math.ceil(num(this.read(a.ins[0], f)));
           } else if (a.fn === 'FLOOR') {
@@ -405,7 +411,7 @@ class Simulator {
   call(a, rlo, f) {
     if (!rlo) return this.next(a, false, f);
     const callee = this.program.blocks[a.name];
-    if (!callee) { this.warnings.add('CALL "' + a.name + '" not simulated (block not loaded); its outputs stay unchanged'); return this.next(a, true, f); }
+    if (!callee) throw new Error('missing CALL target ' + a.name);
     let child;
     if (callee.type === 'FB' && a.inst) {
       const st = a.inst.k === 'local' ? f.inst : this.gInst; const k = this.resolveKey(a.inst, f);
@@ -455,11 +461,25 @@ class Simulator {
   }
 }
 
+function* calls(flows) {
+  for (const flow of flows) for (const action of flow.then) {
+    if (action.t === 'call') yield action;
+    if (action.next) yield* calls(action.next);
+  }
+}
+
 function buildProgram(blockReads, entry) {
+  const names = new Set(blockReads.map(r => r.block.name));
   const blocks = Object.create(null);
   for (const r of blockReads) {
     const flows = []; const skipped = [];
-    for (const n of r.networks) { if (n.flows && n.dsl !== null) flows.push(...n.flows); else skipped.push(n.index); }
+    for (const n of r.networks) {
+      if (!n.flows || n.dsl === null) { skipped.push(n.index); continue; }
+      for (const call of calls(n.flows)) {
+        if (!names.has(call.name)) throw new Error(r.block.name + ' NW' + n.index + ': missing CALL target ' + call.name);
+      }
+      flows.push(...n.flows);
+    }
     blocks[r.block.name] = {
       name: r.block.name, type: r.block.type, flows, skipped,
       outputs: [...(r.interface.Output || []), ...(r.interface.Return || [])].map(m => m.name),
@@ -547,4 +567,4 @@ function formatResults(r) {
   return out.join('\n');
 }
 
-module.exports = { Simulator, buildProgram, runScenario, formatResults, parseTime };
+module.exports = { Simulator, calls, buildProgram, runScenario, formatResults, parseTime };

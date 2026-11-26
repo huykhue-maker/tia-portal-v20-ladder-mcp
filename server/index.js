@@ -6,6 +6,7 @@
 const fs = require('fs');
 const path = require('path');
 const { BridgeClient, EXPORTS_DIR, ensureDir } = require('./bridge_client');
+const { OnlineBackups } = require('./online_backups');
 const B = require('./ladder/block');
 const { readFlgNet } = require('./ladder/reader');
 const D = require('./ladder/dsl');
@@ -16,9 +17,11 @@ const project = require('./ladder/project');
 const X = require('./ladder/xml');
 
 const SERVER_INFO = { name: 'tia-portal-v20-mcp', version: '1.0.0' };
-const PROTOCOL_VERSION = '2024-11-05';
+const SUPPORTED_PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
+const PROTOCOL_VERSION = '2025-11-25';
 
 const bridge = new BridgeClient();
+const onlineBackups = new OnlineBackups(bridge);
 
 // ------------------------------------------------------------------ Helpers
 function getLadderCtx(extra) {
@@ -47,6 +50,16 @@ async function exportBlockXml(blockName, plcName) {
   const res = await bridge.call('export_block', { blockName, plcName: plcName || '', outPath, format: 'xml' });
   const xml = fs.readFileSync(res.path, 'utf8');
   return { xml, meta: res };
+}
+
+async function editLadderXml(args, transform, preview = false) {
+  if (!args.xmlPath) return onlineBackups.edit(args, 'block', transform, preview);
+  const xml = fs.readFileSync(args.xmlPath, 'utf8');
+  const result = transform(xml);
+  if (preview) return { xml, result };
+  const backup = bridge.saveBackup(bridge.offlineBackupLabel(args.xmlPath), xml);
+  fs.writeFileSync(args.xmlPath, result.xml, 'utf8');
+  return { xml, result, backup };
 }
 
 function patchSummary(original, patch) {
@@ -247,13 +260,18 @@ const TOOLS = [
   },
   {
     name: 'tia_edit_db_udt',
-    description: 'Add or remove members in a GlobalDB or UDT (automatically backs up XML before re-importing).',
+    description: 'Create or edit a GlobalDB, InstanceDB, or PLC Data Type (UDT) (automatically backs up XML before re-importing on edit).',
     inputSchema: {
       type: 'object',
       required: ['name'],
       properties: {
+        action: { type: 'string', enum: ['edit', 'create'], description: 'Default: edit. Use "create" to create a new GlobalDB, InstanceDB, or UDT.' },
         name: { type: 'string' },
-        kind: { type: 'string', enum: ['db', 'udt'], description: 'Default: db.' },
+        kind: { type: 'string', enum: ['db', 'instance_db', 'udt'], description: 'Default: db. Use "instance_db" when creating an FB instance DB.' },
+        instanceOf: { type: 'string', description: 'For action="create", kind="instance_db": FB name (e.g. "FB_TrafficLight").' },
+        instanceOfType: { type: 'string', description: 'For action="create", kind="instance_db": default "FB".' },
+        number: { type: 'integer', description: 'Optional block number for action="create" (omit for AutoNumber).' },
+        memoryLayout: { type: 'string', enum: ['Optimized', 'Standard'], description: 'For action="create", kind="db" (default: Optimized).' },
         plcName: { type: 'string' },
         group: { type: 'string', description: 'Optional block group path if DB is inside a folder.' },
         add: {
@@ -403,6 +421,7 @@ const TOOLS = [
         },
         outXmlPath: { type: 'string', description: 'If set (and importToTia is false), write XML to this path without connecting to TIA.' },
         importToTia: { type: 'boolean', description: 'Import into open TIA Portal project (default: true unless outXmlPath is given).' },
+        autoCreateInstanceDbs: { type: 'boolean', description: 'When importing into TIA Portal, automatically create missing FB InstanceDBs referenced by CALL (default: true).' },
       },
     },
   },
@@ -426,8 +445,9 @@ const TOOLS = [
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['list', 'restore'], description: 'Default: list.' },
-        blockName: { type: 'string', description: 'Block name to filter backups or restore.' },
-        backupFile: { type: 'string', description: 'Specific backup filename from backups/ (defaults to latest backup of blockName).' },
+        blockName: { type: 'string', description: 'Online object name. Required to restore.' },
+        kind: { type: 'string', enum: ['block', 'udt'], description: 'Online object category. Use block for DBs.' },
+        backupFile: { type: 'string', description: 'Exact filename listed for this target. Online restore defaults to its latest scoped backup.' },
         xmlPath: { type: 'string', description: 'List or restore backups for this existing offline XML file. Restore requires backupFile.' },
         plcName: { type: 'string' },
         group: { type: 'string' },
@@ -673,6 +693,13 @@ const TOOLS = [
         enableClockMemory: { type: 'boolean' },
         clockMemoryAddress: { type: 'integer' },
         permitPutGet: { type: 'boolean' },
+        disableSecurity: { type: 'boolean', description: 'Configure no/full-access CPU protection and unprotect confidential config data so hardware compiles cleanly (defaults to true in add_plc).' },
+        accessControl: { type: 'string', description: 'S7-1500 PlcAccessControlConfiguration enum, e.g. Disabled, EnabledWithAccessControl.' },
+        accessLevel: { type: 'string', description: 'S7-1200 PlcProtectionAccessLevel enum, e.g. FullAccess, ReadAccess, HMIAccess, NoAccess.' },
+        protectConfigData: { type: 'boolean', description: 'Whether confidential PLC configuration data uses a password (false calls Unprotect()).' },
+        masterSecretPassword: { type: 'string', description: 'Password for confidential PLC configuration data (when protectConfigData is true/set).' },
+        oldMasterSecretPassword: { type: 'string' },
+        accessLevelPassword: { type: 'string', description: 'Optional password when setting accessLevel.' },
         attributes: { type: 'object', description: 'Raw CPU attribute overrides for cpu_properties.' },
         name: { type: 'string', description: 'Technological object name (default: Axis_1).' },
         type: { type: 'string', description: 'Technological object type (default: TO_PositioningAxis).' },
@@ -955,24 +982,40 @@ async function handleTool(name, args) {
     }
 
     case 'tia_edit_db_udt': {
+      const action = args.action || 'edit';
       const kind = args.kind || 'db';
-      const outPath = bridge.exportFilePath((kind === 'udt' ? 'UDT_' : '') + args.name, '.xml');
-      if (kind === 'udt') await bridge.call('export_type', { typeName: args.name, outPath, plcName: args.plcName || '' });
-      else await bridge.call('export_block', { blockName: args.name, outPath, plcName: args.plcName || '', format: 'xml' });
-
-      let xml = fs.readFileSync(outPath, 'utf8');
-      const backup = bridge.saveBackup((kind === 'udt' ? 'UDT_' : '') + args.name, xml);
+      if (action === 'create') {
+        const dbKind = kind === 'instance_db' ? 'InstanceDB' : (kind === 'udt' ? 'UDT' : 'GlobalDB');
+        const xml = B.createDbXml({
+          kind: dbKind,
+          name: args.name,
+          instanceOf: args.instanceOf,
+          instanceOfType: args.instanceOfType || 'FB',
+          number: args.number,
+          memoryLayout: args.memoryLayout,
+          members: args.add || [],
+        });
+        const outPath = bridge.exportFilePath((kind === 'udt' ? 'UDT_' : '') + args.name, '.xml');
+        fs.writeFileSync(outPath, xml, 'utf8');
+        if (kind === 'udt') {
+          await bridge.call('import_type', { xmlPath: outPath, plcName: args.plcName || '' });
+        } else {
+          await bridge.call('import_block', { xmlPath: outPath, plcName: args.plcName || '', group: args.group || '' });
+        }
+        const p = parseDbOrUdtXml(xml);
+        if (kind === 'db') bridge.dbsCache[p.name] = p.interface;
+        return {
+          text: 'Created ' + dbKind + ' "' + args.name + '"' + (args.instanceOf ? ' (instance of ' + args.instanceOf + ')' : '') + '.\n' + B.interfaceText(p.interface),
+          json: p,
+        };
+      }
       const sec = kind === 'udt' ? 'None' : 'Static';
-      if (args.remove && args.remove.length) {
-        xml = B.removeMembers(xml, args.remove.map(n => ({ section: sec, name: n })));
-      }
-      if (args.add && args.add.length) {
-        xml = B.addMembers(xml, args.add.map(m => ({ section: sec, name: m.name, type: m.type, comment: m.comment })));
-      }
-      fs.writeFileSync(outPath, xml, 'utf8');
-      if (kind === 'udt') await bridge.call('import_type', { xmlPath: outPath, plcName: args.plcName || '' });
-      else await bridge.call('import_block', { xmlPath: outPath, plcName: args.plcName || '', group: args.group || '' });
-      const p = parseDbOrUdtXml(xml);
+      const { backup, result } = await onlineBackups.edit(args, kind === 'udt' ? 'udt' : 'block', xml => {
+        if (args.remove && args.remove.length) xml = B.removeMembers(xml, args.remove.map(name => ({ section: sec, name })));
+        if (args.add && args.add.length) xml = B.addMembers(xml, args.add.map(m => ({ section: sec, name: m.name, type: m.type, comment: m.comment })));
+        return { xml };
+      });
+      const p = parseDbOrUdtXml(result.xml);
       if (kind === 'db') bridge.dbsCache[p.name] = p.interface;
       return { text: 'Updated ' + kind.toUpperCase() + ' "' + args.name + '" (backup: ' + path.basename(backup) + ').\n' + B.interfaceText(p.interface) };
     }
@@ -996,34 +1039,12 @@ async function handleTool(name, args) {
     }
 
     case 'tia_patch_ladder_network': {
-      let xml, targetPath, blockLabel;
       const offline = !!args.xmlPath;
-      if (offline) {
-        targetPath = args.xmlPath;
-        xml = fs.readFileSync(targetPath, 'utf8');
-        blockLabel = bridge.offlineBackupLabel(targetPath);
-      } else {
-        if (!args.blockName) throw new Error('Provide blockName or xmlPath.');
-        const exp = await exportBlockXml(args.blockName, args.plcName);
-        xml = exp.xml;
-        targetPath = exp.meta.path;
-        blockLabel = args.blockName;
-      }
-      const patched = B.patchNetworks(xml, args.ops, getLadderCtx({ declare: args.declare }));
+      const { xml, result: patched, backup } = await editLadderXml(args,
+        original => B.patchNetworks(original, args.ops, getLadderCtx({ declare: args.declare })), args.previewOnly);
       const summary = args.previewOnly || args.compact ? patchSummary(xml, patched) : '';
       if (args.previewOnly) return { text: 'PREVIEW\n' + summary };
-      const backup = bridge.saveBackup(blockLabel, xml);
-      fs.writeFileSync(targetPath, patched.xml, 'utf8');
-
-      let importMsg = 'Wrote patched XML offline to ' + targetPath;
-      if (!offline) {
-        const imp = await bridge.call('import_block', {
-          xmlPath: targetPath,
-          plcName: args.plcName || '',
-          group: args.group || '',
-        });
-        importMsg = 'Imported back into TIA Portal: ' + (imp.blocks || []).join(', ');
-      }
+      const importMsg = offline ? 'Wrote patched XML offline to ' + args.xmlPath : 'Imported back into TIA Portal: ' + args.blockName;
       const lines = [
         'PATCH OK — ' + patched.changes.join('; '),
         'BACKUP: ' + backup,
@@ -1046,27 +1067,15 @@ async function handleTool(name, args) {
     }
 
     case 'tia_edit_block_interface': {
-      let xml, targetPath, blockLabel;
-      const offline = !!args.xmlPath;
-      if (offline) {
-        targetPath = args.xmlPath;
-        xml = fs.readFileSync(targetPath, 'utf8');
-        blockLabel = bridge.offlineBackupLabel(targetPath);
-      } else {
-        if (!args.blockName) throw new Error('Provide blockName or xmlPath.');
-        const exp = await exportBlockXml(args.blockName, args.plcName);
-        xml = exp.xml;
-        targetPath = exp.meta.path;
-        blockLabel = args.blockName;
+      const { result, backup } = await editLadderXml(args, xml => {
+        if (args.remove && args.remove.length) xml = B.removeMembers(xml, args.remove);
+        if (args.add && args.add.length) xml = B.addMembers(xml, args.add);
+        return { xml };
+      });
+      const parsed = B.parseBlock(result.xml);
+      if (parsed.kind === 'FB' || parsed.kind === 'FC') {
+        bridge.learned.calls[parsed.name] = L.callEntryFromInterface(parsed.kind, parsed.interface);
       }
-      const backup = bridge.saveBackup(blockLabel, xml);
-      if (args.remove && args.remove.length) xml = B.removeMembers(xml, args.remove);
-      if (args.add && args.add.length) xml = B.addMembers(xml, args.add);
-      fs.writeFileSync(targetPath, xml, 'utf8');
-      if (!offline) {
-        await bridge.call('import_block', { xmlPath: targetPath, plcName: args.plcName || '', group: args.group || '' });
-      }
-      const parsed = B.parseBlock(xml);
       return { text: 'Updated interface of "' + parsed.name + '" (backup: ' + path.basename(backup) + '):\n' + B.interfaceText(parsed.interface) };
     }
 
@@ -1088,15 +1097,37 @@ async function handleTool(name, args) {
 
       const shouldImport = args.importToTia !== undefined ? args.importToTia : !args.outXmlPath;
       let statusLine = 'Generated LAD XML at ' + outPath;
+      const createdDbs = [];
       if (shouldImport) {
+        const fbInsts = created.dbInstances.filter(d => d.fb && d.name);
+        if (args.autoCreateInstanceDbs !== false && fbInsts.length) {
+          const list = await bridge.call('list_blocks', { plcName: args.plcName || '' });
+          const existing = new Set((list.blocks || []).map(b => String(b.name || '').toLowerCase()));
+          const seen = new Set();
+          for (const d of fbInsts) {
+            const key = d.name.toLowerCase();
+            if (existing.has(key) || seen.has(key)) continue;
+            seen.add(key);
+            const dbXml = B.createDbXml({ kind: 'InstanceDB', name: d.name, instanceOf: d.type, instanceOfType: 'FB' });
+            const dbPath = bridge.exportFilePath(d.name, '.xml');
+            ensureDir(path.dirname(dbPath));
+            fs.writeFileSync(dbPath, dbXml, 'utf8');
+            await bridge.call('import_block', { xmlPath: dbPath, plcName: args.plcName || '', group: args.group || '' });
+            createdDbs.push(d.name + ':' + d.type);
+          }
+        }
         const imp = await bridge.call('import_block', {
           xmlPath: outPath,
           plcName: args.plcName || '',
           group: args.group || '',
         });
-        statusLine = 'Created & imported into TIA Portal: ' + (imp.blocks || []).join(', ');
+        statusLine = 'Created & imported into TIA Portal: ' + (imp.blocks || []).join(', ') +
+          (createdDbs.length ? '\nAuto-created InstanceDB(s): ' + createdDbs.join(', ') : '');
       }
       const preview = B.readBlock(created.xml, { format: 'both', ctx: getLadderCtx() });
+      if (args.type === 'FB' || args.type === 'FC') {
+        bridge.learned.calls[args.name] = L.callEntryFromInterface(args.type, preview.interface);
+      }
       return { text: statusLine + '\n\n' + B.formatBlock(preview) };
     }
 
@@ -1116,36 +1147,29 @@ async function handleTool(name, args) {
 
     case 'tia_rollback_block': {
       const action = args.action || 'list';
-      const list = bridge.listBackups(args.xmlPath ? bridge.offlineBackupLabel(args.xmlPath) : args.blockName);
+      if (!['list', 'restore'].includes(action)) throw new Error('Expected list or restore.');
+      if (!args.xmlPath && action === 'restore') {
+        const file = await onlineBackups.rollback(args, action);
+        return { text: 'Restored from backup "' + file + '" -> imported: ' + args.blockName };
+      }
+      const list = args.xmlPath ? bridge.listBackups(bridge.offlineBackupLabel(args.xmlPath))
+        : args.blockName ? await onlineBackups.rollback(args, action) : bridge.listBackups();
       if (action === 'list') {
         if (!list.length) return { text: 'No backups found' + (args.blockName ? ' for "' + args.blockName + '"' : '') + '.' };
         return { text: 'BACKUPS (' + list.length + '):\n' + list.slice(0, 30).map(b => '  ' + b.file + ' (' + b.size + ' B, ' + b.mtime + ')').join('\n') };
       }
-      if (args.xmlPath) {
-        if (action !== 'restore') throw new Error('Expected list or restore.');
-        const backup = list.find(item => item.file === args.backupFile);
-        if (!backup) throw new Error('Select a backupFile listed for this xmlPath.');
-        const target = fs.realpathSync.native(args.xmlPath);
-        const dir = fs.mkdtempSync(path.join(path.dirname(target), '.tia-restore-'));
-        try {
-          const staged = path.join(dir, 'restore.xml');
-          fs.copyFileSync(backup.path, staged);
-          fs.renameSync(staged, target);
-        } finally {
-          fs.rmSync(dir, { recursive: true, force: true });
-        }
-        return { text: 'Restored ' + backup.file + ' to ' + target };
+      const backup = list.find(item => item.file === args.backupFile);
+      if (!backup) throw new Error('Select a backupFile listed for this xmlPath.');
+      const target = fs.realpathSync.native(args.xmlPath);
+      const dir = fs.mkdtempSync(path.join(path.dirname(target), '.tia-restore-'));
+      try {
+        const staged = path.join(dir, 'restore.xml');
+        fs.copyFileSync(backup.path, staged);
+        fs.renameSync(staged, target);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
       }
-      const chosen = args.backupFile
-        ? list.find(b => b.file === args.backupFile) || { path: path.join(path.dirname(list[0] ? list[0].path : EXPORTS_DIR), args.backupFile), file: args.backupFile }
-        : list[0];
-      if (!chosen || !fs.existsSync(chosen.path)) throw new Error('Backup not found for ' + (args.blockName || args.backupFile));
-      const imp = await bridge.call('import_block', {
-        xmlPath: chosen.path,
-        plcName: args.plcName || '',
-        group: args.group || '',
-      });
-      return { text: 'Restored from backup "' + chosen.file + '" -> imported: ' + (imp.blocks || []).join(', ') };
+      return { text: 'Restored ' + backup.file + ' to ' + target };
     }
 
     case 'tia_export_raw': {
@@ -1167,7 +1191,7 @@ async function handleTool(name, args) {
 
     case 'tia_test_ladder_project': {
       const report = project.runProject(args.manifestPath);
-      return { text: project.formatReport(report, args.format) };
+      return { text: project.formatReport(report, args.format), json: report };
     }
     case 'tia_dry_run_ladder': {
       const reads = [];
@@ -1460,7 +1484,7 @@ async function handleTool(name, args) {
       if (args.name) payload.name = args.name;
       if (args.type) payload.type = args.type;
       if (args.version) payload.version = args.version;
-      for (const k of ['enableSystemMemory', 'systemMemoryAddress', 'enableClockMemory', 'clockMemoryAddress', 'permitPutGet']) {
+      for (const k of ['enableSystemMemory', 'systemMemoryAddress', 'enableClockMemory', 'clockMemoryAddress', 'permitPutGet', 'disableSecurity', 'accessControl', 'accessLevel', 'protectConfigData', 'masterSecretPassword', 'oldMasterSecretPassword', 'accessLevelPassword']) {
         if (args[k] !== undefined) payload[k] = args[k];
       }
 
@@ -1488,6 +1512,12 @@ async function handleTool(name, args) {
         const dev = r.device || {};
         for (const it of (dev.items || [])) {
           lines.push('  - ' + it.name + ' [' + it.typeIdentifier + ']' + (it.isPlc ? ' (PLC software: ' + it.plcSoftwareName + ')' : ''));
+        }
+        if ((r.securityApplied || []).length) {
+          lines.push('  Security defaults applied: ' + r.securityApplied.join(', '));
+        }
+        if ((r.securityWarnings || []).length) {
+          lines.push('  Security warnings: ' + r.securityWarnings.join('; '));
         }
         return { text: lines.join('\n'), json: r };
       }
@@ -1789,11 +1819,13 @@ async function onMessage(msg) {
 
   try {
     if (method === 'initialize') {
+      const requested = params && params.protocolVersion;
+      const negotiated = SUPPORTED_PROTOCOL_VERSIONS.includes(requested) ? requested : PROTOCOL_VERSION;
       send({
         jsonrpc: '2.0',
         id,
         result: {
-          protocolVersion: (params && params.protocolVersion) || PROTOCOL_VERSION,
+          protocolVersion: negotiated,
           capabilities: { tools: {} },
           serverInfo: SERVER_INFO,
         },
@@ -1813,10 +1845,14 @@ async function onMessage(msg) {
       const toolArgs = (params && params.arguments) || {};
       try {
         const out = await handleTool(toolName, toolArgs);
+        const result = { content: [{ type: 'text', text: out.text }] };
+        if (out.json && typeof out.json === 'object' && !Array.isArray(out.json)) {
+          result.structuredContent = out.json;
+        }
         send({
           jsonrpc: '2.0',
           id,
-          result: { content: [{ type: 'text', text: out.text }] },
+          result,
         });
       } catch (err) {
         send({

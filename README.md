@@ -34,7 +34,7 @@ TIA_Portal_V20_MCP/
 │   └── ladder/                    # Bộ biên dịch DSL Ladder V20, AST, Analyzer và Simulator
 ├── skill/                         # File hướng dẫn tích hợp Skill cho AI Agent
 │   └── SKILL.md
-├── tests/                         # Bộ kiểm thử tự động toàn diện (7 nhóm test)
+├── tests/                         # Bộ kiểm thử tự động toàn diện (offline, TIA & cô lập đa PLC)
 │   └── run_all.js
 ├── build.ps1                      # Script biên dịch TiaBridge.exe bằng csc.exe có sẵn trên Windows
 ├── package.json
@@ -58,12 +58,12 @@ TIA_Portal_V20_MCP/
    - `tia_read_tags`: Đọc bảng PLC Tags.
    - `tia_upsert_tags`: Thêm hoặc cập nhật PLC Tags.
    - `tia_read_db_udt`: Đọc cấu trúc Global DB hoặc UDT.
-   - `tia_edit_db_udt`: Chỉnh sửa biến trong DB/UDT.
+   - `tia_edit_db_udt`: Tạo mới hoặc chỉnh sửa biến trong Global DB, Instance DB hoặc UDT.
 
 3. **Thao tác khối Ladder (7 tools):**
    - `tia_read_ladder`: Đọc khối LAD dưới dạng DSL ngắn gọn hoặc ASCII rungs.
    - `tia_patch_ladder_network`: Chỉnh sửa, thay thế hoặc thêm từng Network bậc thang (hỗ trợ cổng `O` V20, `SUB`, `CONV`, `SIN`, `COS`, `NORM_X`, `SCALE_X`, `LIMIT`, Mảng, `MC_*`).
-   - `tia_create_ladder_block`: Tạo mới khối OB, FB, FC dạng LAD.
+   - `tia_create_ladder_block`: Tạo mới khối OB, FB, FC dạng LAD (hỗ trợ tự sinh Instance DB còn thiếu khi gọi FB).
    - `tia_edit_block_interface`: Chỉnh sửa khai báo biến Input, Output, Temp, Static.
    - `tia_analyze_ladder`: Kiểm tra tĩnh (Double coil, Timer overlap, Cross-reference).
    - `tia_rollback_block`: Khôi phục khối từ bản lưu XML tự động.
@@ -83,7 +83,7 @@ TIA_Portal_V20_MCP/
    - `tia_cross_reference`: Tra cứu chéo (Cross-Reference) toàn dự án hoặc theo khối để biết chính xác biến/DB/UDT đang được đọc/ghi ở đâu.
 
 6. **Phần cứng, Mạng công nghiệp, PLCSIM Runtime & Escape Hatch (4 tools mới):**
-   - `tia_hardware_config`: Tra cứu Hardware Catalog, xem preset mã đặt hàng, thêm CPU PLC, cắm module mở rộng vào slot, cấu hình System/Clock Memory Byte, PUT/GET và tạo Technological Object (`TO_PositioningAxis`, `PID_Compact`...).
+   - `tia_hardware_config`: Tra cứu Hardware Catalog, xem preset mã đặt hàng, thêm CPU PLC (tự thiết lập cấu hình bảo mật sẵn sàng biên dịch/mô phỏng khi tạo mới), cắm module mở rộng vào slot, cấu hình System/Clock Memory Byte, PUT/GET và tạo Technological Object (`TO_PositioningAxis`, `PID_Compact`...).
    - `tia_network_config`: Kiểm tra giao diện mạng, đặt IP/Subnet Mask/Router, kết nối Subnet, tạo PROFINET IO-System và cấu hình OPC UA Server.
    - `tia_plcsim_runtime`: Điều khiển vòng lặp khép kín S7-PLCSIM V20 / PLCSIM Advanced Runtime (đăng ký/gắn CPU ảo, Power/Run/Stop, đọc/ghi tín hiệu trực tiếp và chạy kịch bản test theo thời gian thực).
    - `tia_escape_hatch`: Công cụ phản chiếu động vạn năng trên `IEngineeringObject` — cho phép soi thuộc tính/composition/service/method (`inspect`), đọc/ghi thuộc tính động (`get`/`set`), gọi phương thức (`invoke`) và quản lý handle `obj:N`.
@@ -130,9 +130,10 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 
 ### Bước 3: Chạy kiểm thử tự động
 ```powershell
-npm run test:offline   # Chỉ cần Node.js, có thể bỏ qua bước biên dịch bridge
-npm run test:tia       # Kiểm thử bridge trên máy Windows có TIA V20 và Openness
-npm test               # Chạy cả hai nhóm
+npm run test:offline        # Chỉ cần Node.js, có thể bỏ qua bước biên dịch bridge
+npm run test:tia            # Kiểm thử bridge trên máy Windows có TIA V20 và Openness
+npm run test:tia-isolation  # Kiểm thử cô lập đa PLC và checksum backup trên TIA headless
+npm test                    # Chạy bộ test offline + TIA smoke test
 ```
 
 Khi sửa XML offline bằng `tia_patch_ladder_network`, truyền `xmlPath`, `ops` và `previewOnly: true` để xem DSL trước/sau, các khai báo mới và cảnh báo. Để áp dụng cùng thay đổi và nhận báo cáo rút gọn, dùng `compact: true` và bỏ `previewOnly`.

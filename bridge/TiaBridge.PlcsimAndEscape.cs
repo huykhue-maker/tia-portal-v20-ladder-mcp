@@ -209,6 +209,29 @@ namespace TiaBridge
             }
         }
 
+        private void CheckEscapeWriteTarget(Dictionary<string, object> args, object target)
+        {
+            if (_tia == null || _tia.Projects.Count == 0) return;
+            List<PlcTarget> plcs = FindPlcs();
+            if (plcs.Count < 2) return;
+            string selector = GetStr(args, "target", "project").Trim();
+            string requested = GetStr(args, "plcName", "");
+            int colon = selector.IndexOf(':');
+            if (string.IsNullOrWhiteSpace(requested) && colon > 0 &&
+                new[] { "plc", "cpu", "software", "device" }.Contains(selector.Substring(0, colon), StringComparer.OrdinalIgnoreCase))
+                requested = selector.Substring(colon + 1);
+            string[][] names = plcs.Select(p => new[] { p.CpuItem.Name, p.Device.Name, p.Software.Name }).ToArray();
+            PlcTarget selected = plcs[SelectPlcIndex(names, requested, true)];
+            if (object.Equals(target, _tia) || object.Equals(target, _project)) return;
+            for (IEngineeringInstance item = target as IEngineeringInstance; item != null; item = item.Parent)
+            {
+                if (object.Equals(item, selected.Software) || object.Equals(item, selected.CpuItem)) return;
+                if (plcs.Any(p => object.Equals(item, p.Software) || object.Equals(item, p.CpuItem))) break;
+                if (object.Equals(item, selected.Device) && plcs.Count(p => object.Equals(p.Device, selected.Device)) == 1) return;
+            }
+            throw new InvalidOperationException("Cannot verify this write target belongs to the selected plcName.");
+        }
+
         private object CmdEscapeHatch(Dictionary<string, object> args)
         {
             string action = GetStr(args, "action", "inspect").ToLowerInvariant();
@@ -241,6 +264,7 @@ namespace TiaBridge
             }
 
             object obj = ResolveTargetObject(args);
+            if (action == "set" || action == "invoke") CheckEscapeWriteTarget(args, obj);
             string handle = RegisterHandle(obj);
             IEngineeringObject eobj = obj as IEngineeringObject;
 

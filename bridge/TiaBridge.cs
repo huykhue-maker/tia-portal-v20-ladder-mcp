@@ -193,6 +193,7 @@ namespace TiaBridge
                 case "upsert_tags": return CmdUpsertTags(args);
                 case "list_types": return CmdListTypes(args);
                 case "list_tech_objects": return CmdListTechObjects(args);
+                case "existing_object": return CmdExistingObject(args);
                 case "export_block": return CmdExportBlock(args);
                 case "import_block": return CmdImportBlock(args);
                 case "delete_block": return CmdDeleteBlock(args);
@@ -333,22 +334,27 @@ namespace TiaBridge
             }
         }
 
-        private PlcTarget ResolvePlc(Dictionary<string, object> args)
+        // A device, CPU or software name is accepted only if it selects exactly one PLC for a write.
+        internal static int SelectPlcIndex(string[][] names, string requested, bool forWrite)
+        {
+            if (names.Length == 0) throw new InvalidOperationException("No PLC software found in the open project.");
+            string choices = string.Join(", ", names.Select(n => n[0] + " (" + n[1] + ")").ToArray());
+            if (string.IsNullOrWhiteSpace(requested))
+            {
+                if (forWrite && names.Length > 1) throw new ArgumentException("Multiple PLCs: specify plcName for this write. Available: " + choices);
+                return 0;
+            }
+            var matches = Enumerable.Range(0, names.Length).Where(i => names[i].Contains(requested, StringComparer.OrdinalIgnoreCase)).ToArray();
+            if (matches.Length == 0) throw new ArgumentException("PLC '" + requested + "' not found. Available: " + choices);
+            if (forWrite && matches.Length > 1) throw new ArgumentException("Ambiguous plcName '" + requested + "'. Specify a unique device or CPU name. Available: " + choices);
+            return matches[0];
+        }
+
+        private PlcTarget ResolvePlc(Dictionary<string, object> args, bool forWrite = false)
         {
             List<PlcTarget> plcs = FindPlcs();
-            if (plcs.Count == 0) throw new InvalidOperationException("No PLC software found in the open project.");
-            string plcName = GetStr(args, "plcName", "");
-            if (string.IsNullOrEmpty(plcName)) return plcs[0];
-            foreach (PlcTarget t in plcs)
-            {
-                if (string.Equals(t.CpuItem.Name, plcName, StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(t.Device.Name, plcName, StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(t.Software.Name, plcName, StringComparison.OrdinalIgnoreCase))
-                {
-                    return t;
-                }
-            }
-            throw new InvalidOperationException("PLC '" + plcName + "' not found. Available: " + string.Join(", ", plcs.Select(p => p.CpuItem.Name).ToArray()));
+            string[][] names = plcs.Select(p => new[] { p.CpuItem.Name, p.Device.Name, p.Software.Name }).ToArray();
+            return plcs[SelectPlcIndex(names, GetStr(args, "plcName", ""), forWrite)];
         }
 
         // -------------------- Commands --------------------
@@ -779,7 +785,7 @@ namespace TiaBridge
 
         private object CmdUpsertTags(Dictionary<string, object> args)
         {
-            PlcTarget plc = ResolvePlc(args);
+            PlcTarget plc = ResolvePlc(args, true);
             string tableName = GetStr(args, "table", "Default tag table");
             PlcTagTable tbl = FindTagTable(plc.Software.TagTableGroup, tableName);
             if (tbl == null)
@@ -899,6 +905,63 @@ namespace TiaBridge
             }
         }
 
+        // Resolve and use the same live object in this bridge request, including its actual folder.
+        private object CmdExistingObject(Dictionary<string, object> args)
+        {
+            string action = GetStr(args, "action", "describe");
+            if (action != "describe" && action != "export" && action != "import")
+                throw new ArgumentException("Expected describe, export or import.");
+            PlcTarget plc = ResolvePlc(args, action == "import" || GetBool(args, "forWrite", false));
+            string kind = GetStr(args, "kind", "block");
+            string name = GetStr(args, "name", "");
+            PlcBlock block = null;
+            PlcType udt = null;
+            PlcBlockGroup blockGroup = null;
+            PlcTypeGroup typeGroup = null;
+            if (kind == "block") block = FindBlock(plc.Software.BlockGroup, name, out blockGroup);
+            else if (kind == "udt")
+            {
+                udt = FindPlcType(plc.Software.TypeGroup, name);
+                if (udt != null) typeGroup = (PlcTypeGroup)udt.Parent;
+            }
+            else throw new ArgumentException("Expected block or udt.");
+            if (block == null && udt == null) throw new InvalidOperationException(kind + " '" + name + "' not found.");
+
+            var folders = new Stack<string>();
+            IEngineeringObject parent = block != null ? (IEngineeringObject)blockGroup : typeGroup;
+            while (parent is PlcBlockUserGroup || parent is PlcTypeUserGroup)
+            {
+                folders.Push(parent is PlcBlockUserGroup ? ((PlcBlockUserGroup)parent).Name : ((PlcTypeUserGroup)parent).Name);
+                parent = parent.Parent;
+            }
+            string group = string.Join("/", folders.ToArray());
+            if (args.ContainsKey("group") && !string.Equals(GetStr(args, "group", "").Replace('\\', '/').Trim('/'), group, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("Requested group does not match the current group: '" + group + "'.");
+            var scope = new Dictionary<string, object>
+            {
+                { "projectPath", Path.GetFullPath(_project.Path.FullName).ToUpperInvariant() },
+                { "device", plc.Device.Name }, { "cpu", plc.CpuItem.Name }, { "software", plc.Software.Name },
+                { "group", group }, { "kind", kind }, { "name", block != null ? block.Name : udt.Name },
+                { "objectType", block != null ? block.GetType().Name : udt.GetType().Name },
+                { "number", block != null ? block.Number.ToString(CultureInfo.InvariantCulture) : "" }
+            };
+            if (action == "describe") return scope;
+            FileInfo file = new FileInfo(GetStr(args, "xmlPath", ""));
+            if (action == "export")
+            {
+                if (block != null) block.Export(file, ExportOptions.WithDefaults);
+                else udt.Export(file, ExportOptions.WithDefaults);
+                return scope;
+            }
+
+            var expected = GetDict(args, "expectedScope");
+            if (scope.Any(kv => !expected.ContainsKey(kv.Key) || !object.Equals(kv.Value, expected[kv.Key])))
+                throw new InvalidOperationException("The project, PLC or object has changed since the snapshot. Import cancelled.");
+            if (block != null) blockGroup.Blocks.Import(file, ImportOptions.Override);
+            else typeGroup.Types.Import(file, ImportOptions.Override);
+            return new { imported = true, name = scope["name"] };
+        }
+
         private object CmdExportBlock(Dictionary<string, object> args)
         {
             PlcTarget plc = ResolvePlc(args);
@@ -945,7 +1008,7 @@ namespace TiaBridge
 
         private object CmdImportBlock(Dictionary<string, object> args)
         {
-            PlcTarget plc = ResolvePlc(args);
+            PlcTarget plc = ResolvePlc(args, true);
             string xmlPath = GetStr(args, "xmlPath", "");
             string groupPath = GetStr(args, "group", "");
             string format = GetStr(args, "format", "xml").ToLowerInvariant();
@@ -973,7 +1036,7 @@ namespace TiaBridge
 
         private object CmdDeleteBlock(Dictionary<string, object> args)
         {
-            PlcTarget plc = ResolvePlc(args);
+            PlcTarget plc = ResolvePlc(args, true);
             string blockName = GetStr(args, "blockName", "");
             PlcBlockGroup owner;
             PlcBlock blk = FindBlock(plc.Software.BlockGroup, blockName, out owner);
@@ -998,7 +1061,7 @@ namespace TiaBridge
 
         private object CmdImportType(Dictionary<string, object> args)
         {
-            PlcTarget plc = ResolvePlc(args);
+            PlcTarget plc = ResolvePlc(args, true);
             string xmlPath = GetStr(args, "xmlPath", "");
             FileInfo fi = new FileInfo(xmlPath);
             if (!fi.Exists) throw new FileNotFoundException("UDT XML not found: " + fi.FullName);
@@ -1008,7 +1071,7 @@ namespace TiaBridge
 
         private object CmdCompile(Dictionary<string, object> args)
         {
-            PlcTarget plc = ResolvePlc(args);
+            PlcTarget plc = ResolvePlc(args, true);
             bool enableSim = GetBool(args, "enableSimulation", true);
             bool includeHardware = GetBool(args, "includeHardware", false);
 
@@ -1134,7 +1197,7 @@ namespace TiaBridge
 
         private object CmdDownload(Dictionary<string, object> args)
         {
-            PlcTarget plc = ResolvePlc(args);
+            PlcTarget plc = ResolvePlc(args, true);
             DownloadProvider dp = plc.CpuItem.GetService<DownloadProvider>();
             if (dp == null) throw new InvalidOperationException("DownloadProvider not available.");
 
@@ -1247,11 +1310,11 @@ namespace TiaBridge
 
         private object CmdOnline(Dictionary<string, object> args)
         {
-            PlcTarget plc = ResolvePlc(args);
+            string action = GetStr(args, "action", "status").ToLowerInvariant();
+            PlcTarget plc = ResolvePlc(args, action != "status");
             OnlineProvider op = plc.CpuItem.GetService<OnlineProvider>();
             if (op == null) throw new InvalidOperationException("OnlineProvider not available.");
 
-            string action = GetStr(args, "action", "status").ToLowerInvariant();
             if (action == "go_online" || action == "online")
             {
                 string modeName = GetStr(args, "mode", "PN/IE");

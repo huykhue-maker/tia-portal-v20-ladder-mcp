@@ -3,6 +3,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.CompilerServices;
+using System.Security;
 using Siemens.Engineering;
 using Siemens.Engineering.Connection;
 using Siemens.Engineering.HW;
@@ -115,19 +116,34 @@ namespace TiaBridge
                     typeId = latest.TypeIdentifier;
                 }
 
+                List<string> secApplied = new List<string>();
+                List<string> secWarnings = new List<string>();
+                if (action == "add_plc")
+                {
+                    List<PlcTarget> devPlcs = new List<PlcTarget>();
+                    CollectPlcItems(dev, dev.DeviceItems, devPlcs);
+                    if (devPlcs.Count > 0)
+                    {
+                        bool defaultDisableSec = !args.ContainsKey("disableSecurity") || GetBool(args, "disableSecurity", true);
+                        ConfigureCpuSecurity(devPlcs[0].CpuItem, args, defaultDisableSec, secApplied, secWarnings);
+                    }
+                }
+
                 return new Dictionary<string, object>
                 {
                     { "created", true },
                     { "stationName", dev.Name },
                     { "plcName", cpuName },
                     { "typeIdentifier", typeId },
+                    { "securityApplied", secApplied },
+                    { "securityWarnings", secWarnings },
                     { "device", DescribeDevice(dev, "") }
                 };
             }
 
             if (action == "plug_module")
             {
-                PlcTarget plc = ResolvePlc(args);
+                PlcTarget plc = ResolvePlc(args, true);
                 string spec = GetStr(args, "typeIdentifier", "");
                 string typeId = ResolveTypeIdentifier(spec);
                 string modName = GetStr(args, "moduleName", "Module_1");
@@ -160,10 +176,18 @@ namespace TiaBridge
 
             if (action == "cpu_properties")
             {
-                PlcTarget plc = ResolvePlc(args);
+                string[] secKeys = new[] { "disableSecurity", "accessControl", "accessLevel", "protectConfigData", "masterSecretPassword", "accessLevelPassword" };
+                bool hasSecArgs = secKeys.Any(args.ContainsKey);
+                bool forWrite = hasSecArgs || new[] { "enableSystemMemory", "systemMemoryAddress", "enableClockMemory", "clockMemoryAddress", "permitPutGet" }.Any(args.ContainsKey) || GetDict(args, "attributes").Count > 0;
+                PlcTarget plc = ResolvePlc(args, forWrite);
                 IEngineeringObject cpuObj = plc.CpuItem;
                 List<string> applied = new List<string>();
                 List<string> warnings = new List<string>();
+
+                if (hasSecArgs)
+                {
+                    ConfigureCpuSecurity(plc.CpuItem, args, GetBool(args, "disableSecurity", false), applied, warnings);
+                }
 
                 // Clock & System Memory Bytes, Startup Mode, PUT/GET, etc.
                 if (args.ContainsKey("enableSystemMemory"))
@@ -223,6 +247,8 @@ namespace TiaBridge
                     if (ai.Name.IndexOf("Memory", StringComparison.OrdinalIgnoreCase) >= 0 ||
                         ai.Name.IndexOf("Startup", StringComparison.OrdinalIgnoreCase) >= 0 ||
                         ai.Name.IndexOf("Protection", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        ai.Name.IndexOf("AccessControl", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        ai.Name.IndexOf("MasterSecret", StringComparison.OrdinalIgnoreCase) >= 0 ||
                         ai.Name.IndexOf("PutGet", StringComparison.OrdinalIgnoreCase) >= 0 ||
                         ai.Name.IndexOf("Cycle", StringComparison.OrdinalIgnoreCase) >= 0 ||
                         ai.Name.IndexOf("OpcUa", StringComparison.OrdinalIgnoreCase) >= 0 ||
@@ -231,6 +257,9 @@ namespace TiaBridge
                         try { current[ai.Name] = FormatSimpleValue(cpuObj.GetAttribute(ai.Name)); } catch { }
                     }
                 }
+                try { var acp = plc.CpuItem.GetService<PlcAccessControlConfigurationProvider>(); if (acp != null) current["PlcAccessControlConfiguration"] = acp.PlcAccessControlConfiguration.ToString(); } catch { }
+                try { var alp = plc.CpuItem.GetService<PlcAccessLevelProvider>(); if (alp != null) current["PlcProtectionAccessLevel"] = alp.PlcProtectionAccessLevel.ToString(); } catch { }
+                try { var msc = plc.CpuItem.GetService<PlcMasterSecretConfigurator>(); if (msc != null) current["MasterSecretConfiguration"] = msc.MasterSecretConfiguration.ToString(); } catch { }
 
                 return new Dictionary<string, object>
                 {
@@ -243,7 +272,7 @@ namespace TiaBridge
 
             if (action == "create_tech_object")
             {
-                PlcTarget plc = ResolvePlc(args);
+                PlcTarget plc = ResolvePlc(args, true);
                 string toName = GetStr(args, "name", "Axis_1");
                 string toType = GetStr(args, "type", "TO_PositioningAxis");
                 string verStr = GetStr(args, "version", "8.0");
@@ -329,6 +358,92 @@ namespace TiaBridge
                 if (sub != null) return sub;
             }
             return null;
+        }
+
+        private static SecureString ToSecureString(string s)
+        {
+            SecureString sec = new SecureString();
+            if (s != null) foreach (char c in s) sec.AppendChar(c);
+            sec.MakeReadOnly();
+            return sec;
+        }
+
+        private static TEnum ParseEnumStrict<TEnum>(string raw, string paramName) where TEnum : struct
+        {
+            TEnum val;
+            if (!Enum.TryParse<TEnum>(raw, true, out val))
+                throw new ArgumentException("Invalid " + paramName + " '" + raw + "'. Allowed: " + string.Join(", ", Enum.GetNames(typeof(TEnum))));
+            return val;
+        }
+
+        private void ConfigureCpuSecurity(DeviceItem cpuItem, Dictionary<string, object> args, bool disableSec, List<string> applied, List<string> warnings)
+        {
+            string masterPwd = GetStr(args, "masterSecretPassword", null);
+            bool? protectCfg = args.ContainsKey("protectConfigData") ? (bool?)GetBool(args, "protectConfigData", false) : null;
+            string reqAc = GetStr(args, "accessControl", "");
+            string reqLvl = GetStr(args, "accessLevel", "");
+            string lvlPwd = GetStr(args, "accessLevelPassword", null);
+
+            if (!string.IsNullOrEmpty(reqAc)) ParseEnumStrict<PlcAccessControlConfiguration>(reqAc, "accessControl");
+            if (!string.IsNullOrEmpty(reqLvl)) ParseEnumStrict<PlcProtectionAccessLevel>(reqLvl, "accessLevel");
+
+            try
+            {
+                PlcMasterSecretConfigurator msc = cpuItem.GetService<PlcMasterSecretConfigurator>();
+                if (msc != null)
+                {
+                    if (!string.IsNullOrEmpty(masterPwd) && protectCfg != false)
+                    {
+                        if (msc.MasterSecretConfiguration == MasterSecretConfiguration.WithPassword)
+                        {
+                            string oldPwd = GetStr(args, "oldMasterSecretPassword", null);
+                            if (!string.IsNullOrEmpty(oldPwd)) msc.ChangePassword(ToSecureString(oldPwd), ToSecureString(masterPwd));
+                            else { msc.Reset(); msc.Protect(ToSecureString(masterPwd)); }
+                        }
+                        else msc.Protect(ToSecureString(masterPwd));
+                        applied.Add("MasterSecretConfiguration=WithPassword");
+                    }
+                    else if (protectCfg == false || (disableSec && protectCfg != true))
+                    {
+                        string oldPwd = GetStr(args, "oldMasterSecretPassword", null);
+                        if (msc.MasterSecretConfiguration == MasterSecretConfiguration.WithPassword && !string.IsNullOrEmpty(oldPwd))
+                            msc.Unprotect(ToSecureString(oldPwd));
+                        else
+                            msc.Unprotect();
+                        applied.Add("MasterSecretConfiguration=WithoutPassword");
+                    }
+                }
+            }
+            catch (Exception ex) { warnings.Add("MasterSecret: " + ex.Message); }
+
+            try
+            {
+                PlcAccessControlConfigurationProvider acp = cpuItem.GetService<PlcAccessControlConfigurationProvider>();
+                if (acp != null && (!string.IsNullOrEmpty(reqAc) || disableSec))
+                {
+                    PlcAccessControlConfiguration target = ParseEnumStrict<PlcAccessControlConfiguration>(!string.IsNullOrEmpty(reqAc) ? reqAc : "Disabled", "accessControl");
+                    acp.PlcAccessControlConfiguration = target;
+                    applied.Add("PlcAccessControlConfiguration=" + target);
+                }
+            }
+            catch (Exception ex) { warnings.Add("AccessControl: " + ex.Message); }
+
+            try
+            {
+                PlcAccessLevelProvider alp = cpuItem.GetService<PlcAccessLevelProvider>();
+                if (alp != null && (!string.IsNullOrEmpty(reqLvl) || disableSec || !string.IsNullOrEmpty(lvlPwd)))
+                {
+                    PlcProtectionAccessLevel target = ParseEnumStrict<PlcProtectionAccessLevel>(!string.IsNullOrEmpty(reqLvl) ? reqLvl : "FullAccess", "accessLevel");
+                    if (!string.IsNullOrEmpty(lvlPwd))
+                    {
+                        alp.SetPassword(target, ToSecureString(lvlPwd));
+                        applied.Add("AccessLevelPassword=" + target);
+                    }
+                    alp.PlcProtectionAccessLevel = target;
+                    applied.Add("PlcProtectionAccessLevel=" + target);
+                }
+            }
+            catch (Exception ex) { warnings.Add("AccessLevel: " + ex.Message); }
         }
 
         private bool TrySetAttrFuzzy(IEngineeringObject obj, string[] names, object val)
@@ -459,7 +574,7 @@ namespace TiaBridge
 
             if (action == "set_ip" || action == "connect_subnet")
             {
-                PlcTarget plc = ResolvePlc(args);
+                PlcTarget plc = ResolvePlc(args, true);
                 string ifaceFilter = GetStr(args, "interfaceName", "");
                 List<KeyValuePair<DeviceItem, NetworkInterface>> devNis = new List<KeyValuePair<DeviceItem, NetworkInterface>>();
                 CollectNetworkInterfaces(plc.Device.DeviceItems, plc.Device.Name, devNis);
@@ -519,7 +634,7 @@ namespace TiaBridge
 
             if (action == "opcua")
             {
-                PlcTarget plc = ResolvePlc(args);
+                PlcTarget plc = ResolvePlc(args, args.ContainsKey("enableServer") || args.ContainsKey("port"));
                 List<string> changes = new List<string>();
                 List<string> warnings = new List<string>();
                 if (args.ContainsKey("enableServer"))

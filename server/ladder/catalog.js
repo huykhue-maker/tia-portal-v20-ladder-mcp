@@ -159,6 +159,7 @@ const DEFAULT_TEMPLATES = {
   Normalize: [['SrcType', 'Type'], ['DestType', 'DestType']],
   Scale_X: [['SrcType', 'Type'], ['DestType', 'DestType']],
   Limit: [['SrcType', 'Type']],
+  TON: [['time_type', 'Type']], TOF: [['time_type', 'Type']], TP: [['time_type', 'Type']], TONR: [['time_type', 'Type']],
   CTU: [['value_type', 'Type']], CTD: [['value_type', 'Type']], CTUD: [['value_type', 'Type']],
 };
 for (const part of Object.values(UNARY_MATH)) DEFAULT_TEMPLATES[part] = [['SrcType', 'Type']];
@@ -177,6 +178,8 @@ const NO_CARD_PARTS = new Set([
   ...Object.values(CONV_OPS).map(info => info.part),
 ]);
 const DUAL_TYPE_PARTS = new Set(Object.values(CONV_OPS).filter(info => info.dualType).map(info => info.part));
+const TIMER_PARTS = new Set(['TON', 'TOF', 'TP', 'TONR']);
+const COUNTER_PARTS = new Set(['CTU', 'CTD', 'CTUD']);
 
 function templatesFor(partName, ctx, learned) {
   const L = learned && learned.parts && learned.parts[partName];
@@ -189,6 +192,8 @@ function templatesFor(partName, ctx, learned) {
       .map(t => [t.name, t.type, t.value]);
     if (NO_CARD_PARTS.has(partName) && !defs.some(d => d[0] === 'SrcType')) defs.push(['SrcType', 'Type']);
     if (DUAL_TYPE_PARTS.has(partName) && !defs.some(d => d[0] === 'DestType')) defs.push(['DestType', 'DestType']);
+    if (TIMER_PARTS.has(partName) && !defs.some(d => d[0] === 'time_type')) defs.push(['time_type', 'Type']);
+    if (COUNTER_PARTS.has(partName) && !defs.some(d => d[0] === 'value_type')) defs.push(['value_type', 'Type']);
   } else {
     defs = DEFAULT_TEMPLATES[partName] || [];
   }
