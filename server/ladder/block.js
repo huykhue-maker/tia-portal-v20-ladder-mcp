@@ -52,8 +52,7 @@ function allIds(el, acc) {
   for (const c of el.children) allIds(c, acc);
   return acc;
 }
-function parseBlock(src) {
-  const root = X.parse(src);
+function parseBlock(src, root = X.parse(src)) {
   if (!root) throw new Error('empty XML');
   const blockEl = root.children.find(c => /^SW\.Blocks\./.test(c.name) || c.name === 'SW.Types.PlcStruct');
   if (!blockEl) throw new Error('No SW.Blocks.* element in document (root is <' + root.name + '>)');
@@ -185,7 +184,7 @@ function roundtrips(dsl, gctx, localCalls) {
 }
 function readBlock(src, opts) {
   opts = opts || {};
-  const b = parseBlock(src);
+  const b = parseBlock(src, opts.root);
   const gctx = genCtx(b, opts.ctx);
   const want = opts.networks && opts.networks.length ? new Set(opts.networks) : null;
   const nets = [];

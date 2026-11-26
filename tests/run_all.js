@@ -16,6 +16,8 @@ const S = require('../server/ladder/simulator');
 const X = require('../server/ladder/xml');
 const L = require('../server/ladder/learn');
 
+const SKIP = Symbol('skip');
+let skipped = 0;
 let passed = 0;
 let total = 0;
 const suite = process.argv[2] || 'all';
@@ -26,7 +28,12 @@ if (!['offline', 'tia', 'tia-isolation', 'all'].includes(suite)) {
 function test(name, fn, group = 'offline') {
   if (suite !== 'all' && suite !== group) return;
   total++;
-  return Promise.resolve().then(fn).then(() => {
+  return Promise.resolve().then(fn).then(result => {
+    if (result === SKIP) {
+      skipped++;
+      console.log('  [SKIP]', name);
+      return;
+    }
     passed++;
     console.log('  [PASS]', name);
   }).catch(err => {
@@ -35,9 +42,9 @@ function test(name, fn, group = 'offline') {
   });
 }
 
-async function withMcpServer(run, timeoutMs = 15000) {
+async function withMcpServer(run, timeoutMs = 15000, preload) {
   const serverPath = path.join(__dirname, '..', 'server', 'index.js');
-  const child = spawn(process.execPath, [serverPath], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, [...(preload ? ['--require', preload] : []), serverPath], { stdio: ['pipe', 'pipe', 'pipe'] });
   const pending = new Map();
   let buf = '';
   child.stdout.setEncoding('utf8');
@@ -75,6 +82,8 @@ async function main() {
   console.log('=== TIA Portal V20 MCP & Ladder Engine Test Suite ===');
   await test('Offline project runner: CLI, MCP, JUnit, independent cases and diagnostics', () =>
     require('./project')(withMcpServer));
+  await test('Typed LAD project: DB defaults, tag table and strict symbol diagnostics', () =>
+    require('./project_symbols')(withMcpServer));
 
   await test('Offline MCP: until obeys the simulated deadline', async () => {
     await withMcpServer(async rpc => {
@@ -217,9 +226,12 @@ async function main() {
         manifestPath: path.join(__dirname, '..', 'examples', 'inspection', 'suite.json'), format: 'json',
       } }).then(r => { order.push('suite'); return r; });
       const results = await Promise.all([first, second]);
-      assert(results.every(r => !r.result.isError));
+      assert(results[0].result.isError);
+      assert.match(results[0].result.content[0].text, /fixture status rejected/);
+      assert(!results[1].result.isError);
+      assert(JSON.parse(results[1].result.content[0].text).ok);
       assert.deepStrictEqual(order, ['status', 'suite']);
-    });
+    }, 15000, path.join(__dirname, 'fixtures', 'delayed-bridge.js'));
   });
 
   await test('Temp resets per OB scan and FB call; Initial_Call and OB system inputs', () => {
@@ -257,13 +269,13 @@ async function main() {
   });
 
   await test('PLCSIM raw unsigned encoding and PLC time comparison in compiled bridge', async () => {
-    if (!fs.existsSync(path.join(__dirname, '..', 'bridge', 'TiaBridge.exe'))) return;
+    if (!fs.existsSync(path.join(__dirname, '..', 'bridge', 'TiaBridge.exe'))) return SKIP;
     const { BridgeClient } = require('../server/bridge_client');
     const client = new BridgeClient();
     try {
       const result = await client.call('sim_codec_self_test', {});
-      if (result.skipped) assert.strictEqual(result.passed, true);
-      else assert.deepStrictEqual(result, { passed: true, unsignedWord: true, unsignedDWord: true, timeLiteral: true });
+      if (result.skipped) return SKIP;
+      assert.deepStrictEqual(result, { passed: true, unsignedWord: true, unsignedDWord: true, timeLiteral: true });
     } finally { client.shutdown(); }
   });
 
@@ -1225,7 +1237,7 @@ async function main() {
       require('./tia_isolation')(withMcpServer), 'tia-isolation');
   }
 
-  console.log('\n=== SUMMARY: ' + passed + '/' + total + ' test groups passed ===');
+  console.log('\n=== SUMMARY: ' + passed + ' passed, ' + skipped + ' skipped, ' + (total - passed - skipped) + ' failed (' + total + ' groups) ===');
 }
 
 main();

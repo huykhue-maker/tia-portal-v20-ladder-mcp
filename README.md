@@ -135,6 +135,18 @@ Kết quả JSON gồm phát hiện phân tích tĩnh, từng phép so sánh, ti
 
 Phạm vi kiểm tra là mô hình LAD trong RAM. Compile/import project Siemens và xác minh đặc tính CPU vẫn cần TIA Portal hoặc PLCSIM phù hợp.
 
+#### Kiểm thử thư mục XML có DB, UDT và bảng tag
+
+```powershell
+node server/test-project.js examples/typed-inspection/suite.json --format junit
+```
+
+Đặt XML SimaticML của OB/FB/FC LAD, GlobalDB, PLC data type (UDT) và bảng PLC tag vào cùng cây `blockDir`. Dùng XML của một PLC. Trong case, gán các tag bằng tên khai báo, ví dụ `"PartPresent"`. Trình mô phỏng giữ biến ký hiệu và địa chỉ tuyệt đối ở các vùng nhớ riêng.
+
+Đặt `"strictSymbols": true` trong `suite.json` để kiểm tra biến trong LAD và trong `init`, `set`, `watch`, `expect`, `until`. Công cụ kiểm tra tên biến, thành viên lồng nhau, số chiều và phạm vi của chỉ số mảng hằng, cùng giá trị test cho các kiểu vô hướng được hỗ trợ. Khi bỏ trường này, các case cũ vẫn dùng được biến toàn cục tự do. Giữ đúng cách viết tên biến cục bộ theo khai báo.
+
+Mỗi case đọc lại `StartValue` vô hướng có trong XML GlobalDB hoặc trong UDT mà DB sử dụng. `init` ghi đè trong phạm vi của case. Có thể dùng `init` để cung cấp giá trị ban đầu cho từng phần tử mảng. Phần mô phỏng FB tạo vùng nhớ instance từ khai báo FB.
+
 ### Bước 1: Thêm tài khoản vào nhóm Siemens TIA Openness (1 lần duy nhất)
 Mở PowerShell bằng quyền Administrator và chạy:
 ```powershell

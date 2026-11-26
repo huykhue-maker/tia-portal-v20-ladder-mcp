@@ -7,6 +7,8 @@ const A = require('./analyzer');
 const D = require('./dsl');
 const S = require('./simulator');
 const X = require('./xml');
+const AST = require('./ast');
+const { createSymbols, membersOf, validateOperand, acceptsValue } = require('./project_symbols');
 
 function* xmlFiles(directory) {
   for (const name of fs.readdirSync(directory).sort()) {
@@ -20,9 +22,25 @@ function* xmlFiles(directory) {
 function loadBlocks(directory) {
   const reads = new Map();
   const dependencies = new Map();
+  const symbols = createSymbols();
+  const sourceFiles = new Map();
   for (const file of xmlFiles(directory)) {
     try {
-      const block = B.readBlock(fs.readFileSync(file, 'utf8'), { simulationOnly: true });
+      const src = fs.readFileSync(file, 'utf8');
+      const root = X.parse(src);
+      const tables = X.kids(root, 'SW.Tags.PlcTagTable');
+      for (const table of tables) symbols.addTags(table);
+      const objects = (root?.children || []).filter(node => /^SW\.(Blocks\.|Types\.PlcStruct$)/.test(node.name));
+      if (!objects.length && tables.length) continue;
+      if (objects.length > 1) throw new Error('Expected one block or UDT per XML document');
+      const kind = objects[0]?.name;
+      if (['SW.Blocks.GlobalDB', 'SW.Types.PlcStruct', 'SW.Blocks.InstanceDB'].includes(kind)) {
+        const data = B.parseBlock(src, root);
+        if (kind === 'SW.Types.PlcStruct') symbols.addUdt(data.name, data.interface);
+        else if (kind === 'SW.Blocks.GlobalDB') symbols.addDb(data.name, data.interface);
+        continue;
+      }
+      const block = B.readBlock(src, { root, simulationOnly: true });
       const name = block.block.name;
       if (!name || !['OB', 'FB', 'FC'].includes(block.block.type)) throw new Error('Expected a named OB, FB or FC');
       if (!block.networks.length) throw new Error(name + ': no LAD networks to simulate');
@@ -35,6 +53,7 @@ function loadBlocks(directory) {
       // Keep the decoded networks and interface; release the source XML and syntax tree.
       const { doc, ...decoded } = block;
       reads.set(name, decoded);
+      sourceFiles.set(name, path.relative(directory, file));
       dependencies.set(name, refs);
     } catch (error) {
       throw new Error(path.relative(directory, file) + ': ' + error.message);
@@ -63,10 +82,10 @@ function loadBlocks(directory) {
     checked.add(name);
   }
   for (const name of reads.keys()) visit(name);
-  return reads;
+  return { reads, symbols, sourceFiles };
 }
 
-function validateScenario(test, entry) {
+function validateScenario(test, entry, resolve) {
   if (!Array.isArray(test.steps) || !test.steps.length) throw new Error('Expected non-empty steps');
   for (const field of Object.keys(test)) {
     if (!['name', 'entry', 'scanMs', 'watch', 'init', 'steps'].includes(field)) throw new Error('Unknown case field ' + field);
@@ -74,25 +93,34 @@ function validateScenario(test, entry) {
   if (test.init !== undefined && (!test.init || typeof test.init !== 'object' || Array.isArray(test.init))) throw new Error('init must be a variable map');
   if (test.watch !== undefined && !Array.isArray(test.watch)) throw new Error('watch must be an array of variables');
   const locals = new Set(Object.values(entry.interface).flat().map(member => member.name));
-  function checkKeys(keys) {
-    for (const key of keys) {
-      const op = D.parseOperandString(key);
-      if (op.k === 'lit' || op.k === 'raw') throw new Error('Expected variable name: ' + key);
-      if (op.k === 'local' && !locals.has(op.path[0])) throw new Error('Unknown local ' + key + ' in ' + entry.block.name);
+  function checkKeys(values, where, isWatch = false) {
+    const entries = isWatch ? values.map(key => [key]) : Object.entries(values);
+    for (const [key, value] of entries) {
+      if (typeof key !== 'string') throw new Error(where + ': expected a variable name');
+      let op;
+      try { op = D.parseOperandString(key); }
+      catch (error) { throw new Error(where + ': ' + key + ': ' + error.message); }
+      if (op.k === 'lit' || op.k === 'raw') throw new Error(where + ': expected a variable name: ' + key);
+      if (!resolve && op.k === 'local' && !locals.has(op.path[0])) throw new Error('Unknown local ' + key + ' in ' + entry.block.name);
+      if (resolve) {
+        const type = validateOperand(op, resolve, where);
+        if (!isWatch && !acceptsValue(type, value, S.parseTime)) throw new Error(where + ': invalid ' + type + ' value for ' + key);
+      }
     }
   }
-  checkKeys(Object.keys(test.init || {}));
-  checkKeys(test.watch || []);
+  checkKeys(test.init || {}, 'init');
+  checkKeys(test.watch || [], 'watch', true);
   for (const [i, step] of test.steps.entries()) {
     const label = 'step ' + (i + 1);
     if (!step || typeof step !== 'object' || Array.isArray(step)) throw new Error(label + ': expected an object');
     for (const field of Object.keys(step)) {
       if (!['run', 'set', 'expect', 'until', 'timeout', 'tolerance'].includes(field)) throw new Error(label + ': unknown field ' + field);
     }
-    for (const values of [step.set, step.expect, step.until]) {
+    for (const field of ['set', 'expect', 'until']) {
+      const values = step[field];
       if (values === undefined) continue;
       if (!values || typeof values !== 'object' || Array.isArray(values)) throw new Error(label + ': expected a variable map');
-      checkKeys(Object.keys(values));
+      checkKeys(values, label + ' ' + field);
     }
     if (step.run !== undefined) {
       const duration = typeof step.run === 'string' ? S.parseTime(step.run) : null;
@@ -107,10 +135,30 @@ function validateScenario(test, entry) {
 function runProject(manifestPath, opts = {}) {
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8').replace(/^\uFEFF/, ''));
   if (!manifest || !Array.isArray(manifest.cases) || !manifest.cases.length) throw new Error('Expected non-empty cases in project manifest');
-  const reads = loadBlocks(path.resolve(path.dirname(manifestPath), manifest.blockDir || 'blocks'));
+  if (manifest.strictSymbols !== undefined && typeof manifest.strictSymbols !== 'boolean') throw new Error('strictSymbols must be a boolean');
+  const { reads, symbols, sourceFiles } = loadBlocks(path.resolve(path.dirname(manifestPath), manifest.blockDir || 'blocks'));
   const blocks = [...reads.values()];
+  const resolvers = new Map();
+  if (manifest.strictSymbols) {
+    for (const block of blocks) {
+      const name = block.block.name;
+      const locals = membersOf(block.interface);
+      const returnValue = B.fcReturnBinding({ kind: block.block.type, name, interface: block.interface });
+      if (returnValue) locals.set(name, locals.get(returnValue.member.name));
+      const resolve = op => symbols.resolve(op, locals);
+      resolvers.set(name, resolve);
+      for (const net of block.networks) {
+        AST.walkFlows(net.flows, (op, mode) => {
+          if (mode !== 'inst' && (op.k === 'local' || op.k === 'global')) {
+            validateOperand(op, resolve, sourceFiles.get(name) + ': ' + name + ' NW' + net.index, true);
+          }
+        });
+      }
+    }
+  }
   const analysis = A.analyze(blocks, { ...opts, cases: manifest.cases, entry: manifest.entry });
   const program = S.buildProgram(blocks, manifest.entry);
+  program.resolveGlobal = op => symbols.resolve(op);
   const cases = [];
   const names = new Set();
   for (const test of manifest.cases) {
@@ -119,7 +167,7 @@ function runProject(manifestPath, opts = {}) {
     const entry = test.entry === undefined ? manifest.entry : test.entry;
     try {
       if (!reads.has(entry)) throw new Error('Unknown entry block: ' + entry);
-      validateScenario(test, reads.get(entry));
+      validateScenario(test, reads.get(entry), resolvers.get(entry));
       const result = S.runScenario({ ...program, entry }, test);
       if (!result.expects.length) throw new Error('Case needs at least one expect or until assertion');
       cases.push({ name: test.name, entry, status: result.ok ? 'passed' : 'failed', result });

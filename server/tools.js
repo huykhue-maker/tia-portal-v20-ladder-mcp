@@ -378,7 +378,7 @@ const TOOLS = [
   {
     name: 'tia_test_ladder_project',
     annotations: toolAnnotations(true),
-    description: 'Analyze a directory of offline LAD XML blocks and run named regression scenarios. Paths in the suite JSON are relative to that file. Returns text, JSON or JUnit.',
+    description: 'Analyze offline LAD XML, DBs, UDTs and PLC tags and run named regression scenarios. Set strictSymbols in the suite JSON to validate symbol paths and scenario values. Paths are relative to the suite file. Returns text, JSON or JUnit.',
     inputSchema: {
       type: 'object', required: ['manifestPath'],
       properties: {

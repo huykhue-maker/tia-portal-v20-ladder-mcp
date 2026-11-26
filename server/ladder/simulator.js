@@ -78,14 +78,18 @@ class Simulator {
   }
 
   // Resolve dynamic array indices e.g. #Arr[#i] -> #Arr[2]
-  resolveKey(op, f) {
-    if (!op.idx || !Object.keys(op.idx).length) return O.text(op);
+  resolveOperand(op, f) {
+    if (!op.idx || !Object.keys(op.idx).length) return op;
     const resolvedIdx = {};
     for (const [compIdx, dims] of Object.entries(op.idx)) {
       resolvedIdx[compIdx] = dims.map(d => O.lit('DInt', String(Math.trunc(num(this.read(d, f))))));
     }
-    const copy = op.k === 'local' ? O.local(op.path, resolvedIdx, op.slice) : O.global(op.path, resolvedIdx, op.slice);
-    return O.text(copy);
+    return op.k === 'local' ? O.local(op.path, resolvedIdx, op.slice) : O.global(op.path, resolvedIdx, op.slice);
+  }
+  resolveKey(op, f) {
+    const resolved = this.resolveOperand(op, f);
+    const symbol = resolved.k === 'global' ? this.program.resolveGlobal?.(resolved) : null;
+    return O.text(symbol?.op || resolved);
   }
 
   getAxis(axisName) {
@@ -131,7 +135,12 @@ class Simulator {
       const mc = this.mcInst.get(bk);
       if (mc && field in mc.pins) return mc.pins[field];
     }
-    return this.mapOf(op, f).get(this.resolveKey(op, f));
+    const resolved = this.resolveOperand(op, f);
+    const symbol = resolved.k === 'global' ? this.program.resolveGlobal?.(resolved) : null;
+    const store = this.mapOf(op, f);
+    const key = O.text(symbol?.op || resolved);
+    if (store.has(key)) return store.get(key);
+    if (symbol?.start !== undefined) return startValue({ type: symbol.type, startValue: symbol.start });
   }
   write(op, v, f) {
     if (op.k === 'lit') return;
@@ -156,7 +165,7 @@ class Simulator {
   setInput(key, value) {
     const op = D.parseOperandString(key);
     let v = value;
-    if (typeof v === 'string') { const t = parseTime(v); v = /^L?T#/i.test(v) ? t : (/^(true|false)$/i.test(v) ? /^true$/i.test(v) : (Number.isNaN(Number(v)) ? v : Number(v))); }
+    if (typeof v === 'string') { const t = parseTime(v); v = /^(?:L?(?:TIME|T)|S5TIME|S5T)#/i.test(v) ? t : (/^(true|false)$/i.test(v) ? /^true$/i.test(v) : (Number.isNaN(Number(v)) ? v : Number(v))); }
     this.write(op, v, this.root);
   }
   get(key) {
@@ -591,7 +600,7 @@ function approxEq(a, b, tol) {
 }
 
 function expectedValue(value) {
-  return norm(typeof value === 'string' && /^L?T#/i.test(value) ? parseTime(value) : value);
+  return norm(typeof value === 'string' && /^(?:L?(?:TIME|T)|S5TIME|S5T)#/i.test(value) ? parseTime(value) : value);
 }
 
 function runScenario(program, scenario, types) {
