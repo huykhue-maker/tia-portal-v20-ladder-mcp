@@ -301,7 +301,7 @@ function readFlgNet(flg, opts) {
       const info = C.CONV_OPS[fn];
       const ins = info.ins.map(pin => dataOperand(u, pin) || { k: 'raw', value: '?' });
       const out = dataOperand(u, 'out') || { k: 'raw', value: '?' };
-      return { t: 'conv', fn, ins, out, srcType: tpl(part, 'SrcType'), destType: tpl(part, 'DestType') };
+      return { t: 'conv', fn, ins, out, srcType: tpl(part, 'value_type') || tpl(part, 'SrcType'), destType: tpl(part, 'DestType') };
     }
     const bk = C.BOX_FROM_PART[part.name];
     if (bk) {

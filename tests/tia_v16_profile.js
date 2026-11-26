@@ -26,8 +26,15 @@ module.exports = async function testV16Profile(withMcpServer) {
       const listed = (await rpc('tools/list', {})).result.tools;
       assert(listed.some(tool => tool.name === 'tia_open_project'));
       assert(listed.some(tool => tool.name === 'tia_test_ladder_project'));
-      assert(!listed.some(tool => tool.name === 'tia_plcsim_runtime' || tool.name === 'tia_download_and_online'));
+      assert(listed.some(tool => tool.name === 'tia_download_and_online'));
+      assert(listed.some(tool => tool.name === 'tia_hardware_config'));
+      assert(listed.some(tool => tool.name === 'tia_network_config'));
+      assert(listed.some(tool => tool.name === 'tia_watch_table'));
+      assert(listed.some(tool => tool.name === 'tia_scl_source'));
+      assert(listed.some(tool => tool.name === 'tia_escape_hatch'));
+      assert(!listed.some(tool => tool.name === 'tia_plcsim_runtime' || tool.name === 'tia_cross_reference'));
       assert.match((await call('tia_plcsim_runtime', { action: 'status' })).content[0].text, /unavailable.*V16/);
+      assert.match((await call('tia_cross_reference', { target: 'StartBtn' })).content[0].text, /unavailable.*V16/);
       assert.match((await call('tia_open_project', { path: 'wrong.ap20' })).content[0].text, /native \.ap16/);
       assert.match((await call('tia_open_project', { path: 'correct.ap16', upgrade: true })).content[0].text, /omit upgrade/);
 
@@ -57,8 +64,19 @@ module.exports = async function testV16Profile(withMcpServer) {
       assert(changed.networks.every(network => network.flg.attrs.xmlns.endsWith('/v3')));
       const untouched = B.parseBlock(old).networks[1].el;
       assert(patched.xml.includes(old.slice(untouched.start, untouched.end)));
-      assert.throws(() => B.patchNetworks(original, [{ op: 'replace', nw: 1, dsl: 'MOVE(1, #Lamp)' }]),
-        /V16 LAD generation supports/);
+
+      // V16 now supports full LAD generation in FlgNet/v4 without Namespace attribute
+      const richV16 = B.createBlockXml({
+        portalVersion: '16', type: 'FB', name: 'FB_V16_Rich',
+        interface: {
+          Input: [{ name: 'En', type: 'Bool' }, { name: 'Val', type: 'Real' }],
+          Output: [{ name: 'Out', type: 'Real' }],
+        },
+        networks: [{ dsl: 'NO(#En) => MOVE(1.5, #Out) => LIMIT(0.0, #Val, 100.0, #Out, Real)' }],
+      });
+      assert(!richV16.xml.includes('<Namespace'), 'V16 SimaticML must not emit <Namespace>');
+      assert.match(richV16.xml, /FlgNet\/v4/);
+      assert.match(richV16.xml, /Name="Limit"[^>]*DisabledENO="false"/);
 
       fs.writeFileSync(xmlPath, patched.xml, 'utf8');
       const simulation = await call('tia_dry_run_ladder', {

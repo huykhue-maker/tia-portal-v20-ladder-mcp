@@ -295,6 +295,7 @@ class Gen {
         const uid = this.addPart(info.part, {
           version: C.versionFor(info.part, this.ctx.learned),
           templates: C.templatesFor(info.part, { type: srcType, destType }, this.ctx.learned),
+          disabledEno: a.fn === 'LIMIT' ? 'false' : undefined,
         });
         this.connect(srcs, this.pin(uid, 'en', 'dst'));
         info.ins.forEach((pinName, i) => {

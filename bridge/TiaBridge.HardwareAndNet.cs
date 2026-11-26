@@ -8,7 +8,9 @@ using Siemens.Engineering;
 using Siemens.Engineering.Connection;
 using Siemens.Engineering.HW;
 using Siemens.Engineering.HW.Features;
+#if !TIA_V16
 using Siemens.Engineering.HW.HardwareCatalog;
+#endif
 using Siemens.Engineering.SW.TechnologicalObjects;
 
 namespace TiaBridge
@@ -18,6 +20,16 @@ namespace TiaBridge
         // -------------------- Zero-to-Project Hardware & CPU Configuration --------------------
         private static readonly Dictionary<string, string> CommonHardwarePresets = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
+#if TIA_V16
+            { "CPU_1212C_DC_DC_DC", "OrderNumber:6ES7 212-1AE40-0XB0/V4.4" },
+            { "CPU_1212C_AC_DC_RLY", "OrderNumber:6ES7 212-1BE40-0XB0/V4.4" },
+            { "CPU_1214C_DC_DC_DC", "OrderNumber:6ES7 214-1AG40-0XB0/V4.4" },
+            { "CPU_1214C_DC_DC_DC_V44", "OrderNumber:6ES7 214-1AG40-0XB0/V4.4" },
+            { "CPU_1214C_AC_DC_RLY", "OrderNumber:6ES7 214-1BG40-0XB0/V4.4" },
+            { "CPU_1215C_DC_DC_DC", "OrderNumber:6ES7 215-1AG40-0XB0/V4.4" },
+            { "CPU_1511_1_PN", "OrderNumber:6ES7 511-1AK02-0AB0/V2.8" },
+            { "CPU_1515_2_PN", "OrderNumber:6ES7 515-2AM02-0AB0/V2.8" },
+#else
             { "CPU_1212C_DC_DC_DC", "OrderNumber:6ES7 212-1AE40-0XB0/V4.6" },
             { "CPU_1212C_AC_DC_RLY", "OrderNumber:6ES7 212-1BE40-0XB0/V4.6" },
             { "CPU_1214C_DC_DC_DC", "OrderNumber:6ES7 214-1AG40-0XB0/V4.6" },
@@ -26,6 +38,7 @@ namespace TiaBridge
             { "CPU_1215C_DC_DC_DC", "OrderNumber:6ES7 215-1AG40-0XB0/V4.6" },
             { "CPU_1511_1_PN", "OrderNumber:6ES7 511-1AL03-0AB0/V3.1" },
             { "CPU_1515_2_PN", "OrderNumber:6ES7 515-2AN03-0AB0/V3.1" },
+#endif
             { "SM_1221_DI16", "OrderNumber:6ES7 221-1BH32-0XB0/V2.0" },
             { "SM_1222_DQ16", "OrderNumber:6ES7 222-1BH32-0XB0/V2.0" },
             { "SM_1223_DI16_DQ16", "OrderNumber:6ES7 223-1BL32-0XB0/V2.0" },
@@ -63,6 +76,9 @@ namespace TiaBridge
 
             if (action == "search_catalog")
             {
+#if TIA_V16
+                throw new NotSupportedException("HardwareCatalog search is unavailable in TIA Portal V16 Openness. Use action='presets' or pass an explicit OrderNumber:... typeIdentifier.");
+#else
                 string query = GetStr(args, "query", "6ES7 214");
                 string filterText = GetStr(args, "filter", "");
                 int limit = GetInt(args, "limit", 40);
@@ -89,6 +105,7 @@ namespace TiaBridge
                     });
                 }
                 return new Dictionary<string, object> { { "query", query }, { "count", list.Count }, { "entries", list } };
+#endif
             }
 
             EnsureProject();
@@ -107,6 +124,9 @@ namespace TiaBridge
                 }
                 catch (Exception ex)
                 {
+#if TIA_V16
+                    throw new InvalidOperationException("Failed to create device '" + typeId + "': " + ex.Message, ex);
+#else
                     // Fallback: search catalog by article base if exact firmware version differs on this TIA installation
                     string art = typeId.Replace("OrderNumber:", "").Split('/')[0].Trim();
                     IList<CatalogEntry> found = _tia.HardwareCatalog.Find(art);
@@ -114,6 +134,7 @@ namespace TiaBridge
                     if (latest == null) throw new InvalidOperationException("Failed to create device '" + typeId + "': " + ex.Message);
                     dev = _project.Devices.CreateWithItem(latest.TypeIdentifier, cpuName, stationName);
                     typeId = latest.TypeIdentifier;
+#endif
                 }
 
                 List<string> secApplied = new List<string>();
@@ -150,6 +171,7 @@ namespace TiaBridge
                 int slot = GetInt(args, "slot", 2);
 
                 DeviceItem rack = FindPluggableContainer(plc.Device, typeId, modName, slot);
+#if !TIA_V16
                 if (rack == null)
                 {
                     // Try resolving version from HardwareCatalog if exact firmware didn't match
@@ -160,6 +182,7 @@ namespace TiaBridge
                         if (rack != null) { typeId = ce.TypeIdentifier; break; }
                     }
                 }
+#endif
                 if (rack == null)
                 {
                     throw new InvalidOperationException("Cannot plug '" + typeId + "' into slot " + slot + " on device '" + plc.Device.Name + "'. Check module compatibility and slot number (S7-1200 expansion slots start at 2, Signal Board is 1, Comm modules are 101..103).");
@@ -260,9 +283,13 @@ namespace TiaBridge
                         try { current[ai.Name] = FormatSimpleValue(cpuObj.GetAttribute(ai.Name)); } catch { }
                     }
                 }
+#if !TIA_V16
                 try { var acp = plc.CpuItem.GetService<PlcAccessControlConfigurationProvider>(); if (acp != null) current["PlcAccessControlConfiguration"] = acp.PlcAccessControlConfiguration.ToString(); } catch { }
+#endif
                 try { var alp = plc.CpuItem.GetService<PlcAccessLevelProvider>(); if (alp != null) current["PlcProtectionAccessLevel"] = alp.PlcProtectionAccessLevel.ToString(); } catch { }
+#if !TIA_V16
                 try { var msc = plc.CpuItem.GetService<PlcMasterSecretConfigurator>(); if (msc != null) current["MasterSecretConfiguration"] = msc.MasterSecretConfiguration.ToString(); } catch { }
+#endif
 
                 return new Dictionary<string, object>
                 {
@@ -278,7 +305,11 @@ namespace TiaBridge
                 PlcTarget plc = ResolvePlc(args, true);
                 string toName = GetStr(args, "name", "Axis_1");
                 string toType = GetStr(args, "type", "TO_PositioningAxis");
+#if TIA_V16
+                string verStr = GetStr(args, "version", "5.0");
+#else
                 string verStr = GetStr(args, "version", "8.0");
+#endif
 
                 TechnologicalInstanceDB existing = plc.Software.TechnologicalObjectGroup.TechnologicalObjects.Find(toName);
                 if (existing == null)
@@ -387,9 +418,21 @@ namespace TiaBridge
             string reqLvl = GetStr(args, "accessLevel", "");
             string lvlPwd = GetStr(args, "accessLevelPassword", null);
 
+#if !TIA_V16
             if (!string.IsNullOrEmpty(reqAc)) ParseEnumStrict<PlcAccessControlConfiguration>(reqAc, "accessControl");
+#endif
             if (!string.IsNullOrEmpty(reqLvl)) ParseEnumStrict<PlcProtectionAccessLevel>(reqLvl, "accessLevel");
 
+#if TIA_V16
+            if (!string.IsNullOrEmpty(masterPwd) || protectCfg.HasValue)
+            {
+                warnings.Add("MasterSecret/protectConfigData requires TIA Portal V17+ Openness; skipped on V16.");
+            }
+            if (!string.IsNullOrEmpty(reqAc))
+            {
+                warnings.Add("PlcAccessControlConfiguration requires TIA Portal V19+ Openness; skipped on V16.");
+            }
+#else
             try
             {
                 PlcMasterSecretConfigurator msc = cpuItem.GetService<PlcMasterSecretConfigurator>();
@@ -430,6 +473,7 @@ namespace TiaBridge
                 }
             }
             catch (Exception ex) { warnings.Add("AccessControl: " + ex.Message); }
+#endif
 
             try
             {
@@ -515,6 +559,7 @@ namespace TiaBridge
             }
         }
 
+#if !TIA_V16
         private static IEnumerable<CatalogEntry> RankedCatalogEntries(IEnumerable<CatalogEntry> entries, string article)
         {
             return entries.Where(e => string.Equals(e.ArticleNumber, article, StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(e.TypeIdentifier))
@@ -525,6 +570,7 @@ namespace TiaBridge
         {
             return RankedCatalogEntries(entries, article).FirstOrDefault();
         }
+#endif
 
         private static void CollectDevicesInNetworkGroup(DeviceUserGroup group, List<Device> devices)
         {

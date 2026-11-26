@@ -13,13 +13,12 @@ using System.Text;
 using System.Web.Script.Serialization;
 using Siemens.Engineering;
 using Siemens.Engineering.Compiler;
-#if !TIA_V16
 using Siemens.Engineering.Connection;
 using Siemens.Engineering.Download;
 using Siemens.Engineering.Download.Configurations;
 using Siemens.Engineering.Online;
 using Siemens.Engineering.SW.TechnologicalObjects;
-#else
+#if TIA_V16
 using System.Xml;
 #endif
 using Siemens.Engineering.HW;
@@ -231,7 +230,6 @@ namespace TiaBridge
                 case "import_type": return CmdImportType(args);
                 case "delete_type": return CmdDeleteType(args);
                 case "compile": return CmdCompile(args);
-#if !TIA_V16
                 case "sim_launch": return CmdSimLaunch(args);
                 case "list_connections": return CmdListConnections(args);
                 case "download": return CmdDownload(args);
@@ -240,12 +238,13 @@ namespace TiaBridge
                 case "watch_table": return CmdWatchTable(args);
                 case "show_in_editor": return CmdShowInEditor(args);
                 case "scl_source": return CmdSclSource(args);
-                case "cross_reference": return CmdCrossReference(args);
                 case "hardware_config": return CmdHardwareConfig(args);
                 case "network_config": return CmdNetworkConfig(args);
+                case "escape_hatch": return CmdEscapeHatch(args);
+#if !TIA_V16
+                case "cross_reference": return CmdCrossReference(args);
                 case "plcsim_runtime": return CmdPlcsimRuntime(args);
                 case "sim_codec_self_test": return CmdSimCodecSelfTest();
-                case "escape_hatch": return CmdEscapeHatch(args);
 #else
                 case "sim_codec_self_test": return new { skipped = true, reason = "V16 bridge profile" };
 #endif
@@ -451,6 +450,10 @@ namespace TiaBridge
             Process[] simProcs = Process.GetProcessesByName("S7PLCSIMV20");
             res["plcsimV20Running"] = simProcs.Length > 0;
             res["plcsimV20Pids"] = simProcs.Select(x => x.Id).ToArray();
+#else
+            Process[] simProcs = Process.GetProcessesByName("Siemens.Simatic.PlcSim.Compact");
+            res["plcsimV16Running"] = simProcs.Length > 0;
+            res["plcsimV16Pids"] = simProcs.Select(x => x.Id).ToArray();
 #endif
             return res;
         }
@@ -712,13 +715,11 @@ namespace TiaBridge
 
             object hwId = ReadOptionalAttribute(item, "HardwareIdentifier");
             List<long> hwIds = new List<long>();
-#if !TIA_V16
             try
             {
                 foreach (HwIdentifier id in item.HwIdentifiers) hwIds.Add(id.Identifier);
             }
             catch (EngineeringException) { }
-#endif
             hwIds = hwIds.Distinct().ToList();
             if (hwId == null && hwIds.Count == 1) hwId = hwIds[0];
             if (isPlc || !string.IsNullOrEmpty(item.TypeIdentifier) || addresses.Count > 0 || hwId != null || hwIds.Count > 0)
@@ -760,9 +761,7 @@ namespace TiaBridge
                 else if (b is FC) kind = "FC";
                 else if (b is GlobalDB) kind = "GlobalDB";
                 else if (b is InstanceDB) kind = "InstanceDB";
-#if !TIA_V16
                 else if (b is ArrayDB) kind = "ArrayDB";
-#endif
 
                 outList.Add(new Dictionary<string, object>
                 {
@@ -992,16 +991,13 @@ namespace TiaBridge
         {
             PlcTarget plc = ResolvePlc(args);
             List<object> tos = new List<object>();
-#if !TIA_V16
             if (plc.Software.TechnologicalObjectGroup != null)
             {
                 WalkTechGroup(plc.Software.TechnologicalObjectGroup, "", tos);
             }
-#endif
-            return new Dictionary<string, object> { { "plc", plc.CpuItem.Name }, { "technologicalObjects", tos }, { "enumerationSupported", Program.PortalVersion == "20" } };
+            return new Dictionary<string, object> { { "plc", plc.CpuItem.Name }, { "technologicalObjects", tos }, { "enumerationSupported", true } };
         }
 
-#if !TIA_V16
         private void WalkTechGroup(TechnologicalInstanceDBGroup grp, string path, List<object> outList)
         {
             foreach (TechnologicalInstanceDB to in grp.TechnologicalObjects)
@@ -1014,14 +1010,14 @@ namespace TiaBridge
                     { "isConsistent", to.IsConsistent }
                 });
             }
+#if !TIA_V16
             foreach (TechnologicalInstanceDBUserGroup sub in grp.Groups)
             {
                 string subPath = string.IsNullOrEmpty(path) ? sub.Name : path + "/" + sub.Name;
                 WalkTechGroup(sub, subPath, outList);
             }
-        }
-
 #endif
+        }
 
         // Resolve and use the same live object in this bridge request, including its actual folder.
         private object CmdExistingObject(Dictionary<string, object> args)
@@ -1315,11 +1311,16 @@ namespace TiaBridge
             }
         }
 
-#if !TIA_V16
         private object CmdSimLaunch(Dictionary<string, object> args)
         {
+#if TIA_V16
+            string exe = GetStr(args, "exePath", @"C:\Program Files\Siemens\Automation\S7-PLCSIM V16\Bin\Siemens.Simatic.PlcSim.Compact.exe");
+            string procName = "Siemens.Simatic.PlcSim.Compact";
+#else
             string exe = GetStr(args, "exePath", @"C:\Program Files\Siemens\Automation\PLCSIM_V20\S7PLCSIMV20.exe");
-            Process[] existing = Process.GetProcessesByName("S7PLCSIMV20");
+            string procName = "S7PLCSIMV20";
+#endif
+            Process[] existing = Process.GetProcessesByName(procName);
             if (existing.Length > 0)
             {
                 return new Dictionary<string, object>
@@ -1328,7 +1329,7 @@ namespace TiaBridge
                     { "pids", existing.Select(p => p.Id).ToArray() }
                 };
             }
-            if (!File.Exists(exe)) throw new FileNotFoundException("S7-PLCSIM V20 executable not found: " + exe);
+            if (!File.Exists(exe)) throw new FileNotFoundException("S7-PLCSIM V" + Program.PortalVersion + " executable not found: " + exe);
 
             ProcessStartInfo psi = new ProcessStartInfo();
             psi.FileName = exe;
@@ -1413,14 +1414,33 @@ namespace TiaBridge
                 targetName = ti.Name;
                 if (!string.IsNullOrEmpty(targetAddrStr))
                 {
+#if TIA_V16
+                    ConfigurationAddressComposition addrList = pc.Subnets.Count > 0 ? pc.Subnets[0].Addresses : pc.Addresses;
+                    cfgAddr = addrList.Find(targetAddrStr) ?? addrList.Create(targetAddrStr);
+                    targetCfg = cfgAddr;
+#else
                     cfgAddr = ti.Addresses.Find(targetAddrStr) ?? ti.Addresses.Create(targetAddrStr);
+#endif
                 }
             }
             else if (pc.Subnets.Count > 0)
             {
+#if TIA_V16
+                if (!string.IsNullOrEmpty(targetAddrStr))
+                {
+                    cfgAddr = pc.Subnets[0].Addresses.Find(targetAddrStr) ?? pc.Subnets[0].Addresses.Create(targetAddrStr);
+                    targetCfg = cfgAddr;
+                    targetName = pc.Subnets[0].Name;
+                }
+                else
+                {
+                    throw new InvalidOperationException("Download through a subnet-only PC interface ('" + pc.Name + "') requires targetAddress or a PN/IE target interface.");
+                }
+#else
                 // ConfigurationSubnet is not an IConfiguration in the V20 Openness API, so it
                 // cannot be passed to DownloadProvider.Download.
                 throw new InvalidOperationException("Download through a subnet-only PC interface ('" + pc.Name + "') is not supported by TIA Openness V20. Select a PN/IE target interface instead.");
+#endif
             }
 
             List<string> log = new List<string>();
@@ -1469,7 +1489,11 @@ namespace TiaBridge
             DownloadResult res;
             try
             {
+#if TIA_V16
+                res = dp.Download(targetCfg, pre, post, opts);
+#else
                 res = cfgAddr != null ? dp.Download(targetCfg, cfgAddr, pre, post, opts) : dp.Download(targetCfg, pre, post, opts);
+#endif
             }
             catch (Exception ex)
             {
@@ -1573,6 +1597,5 @@ namespace TiaBridge
                 { "state", op.State.ToString() }
             };
         }
-#endif
     }
 }

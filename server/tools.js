@@ -288,7 +288,7 @@ const TOOLS = [
   {
     name: 'tia_create_ladder_block',
     annotations: toolAnnotations(false, true),
-    description: 'Create a brand-new LAD block (FB, FC, or OB) from interface specification and Ladder DSL networks, generate version-specific SimaticML XML, and import it into TIA Portal (or save offline). V16 generation supports simple contacts and coils.',
+    description: 'Create a brand-new LAD block (FB, FC, or OB) from interface specification and Ladder DSL networks, generate version-specific SimaticML XML, and import it into TIA Portal (or save offline).',
     inputSchema: {
       type: 'object',
       required: ['type', 'name'],

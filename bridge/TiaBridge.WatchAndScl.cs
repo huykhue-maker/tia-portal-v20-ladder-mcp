@@ -7,7 +7,9 @@ using System.Reflection;
 using System.Text;
 using Siemens.Engineering;
 using Siemens.Engineering.Connection;
+#if !TIA_V16
 using Siemens.Engineering.CrossReference;
+#endif
 using Siemens.Engineering.HW;
 using Siemens.Engineering.SW;
 using Siemens.Engineering.SW.Blocks;
@@ -146,11 +148,13 @@ namespace TiaBridge
             if (low.Contains("pointer") || low.Contains("any")) return PlcWatchAndForceTableDisplayFormat.Pointer;
             if (low.Contains("str")) return PlcWatchAndForceTableDisplayFormat.String;
             if (low.Contains("char")) return PlcWatchAndForceTableDisplayFormat.Character;
+#if !TIA_V16
             if (low.Contains("symbol")) return PlcWatchAndForceTableDisplayFormat.Symbolic;
+#endif
             return PlcWatchAndForceTableDisplayFormat.Undef;
         }
 
-        private static string GetEntryComment(PlcWatchTableEntry entry)
+        private static string GetEntryComment(PlcTableCommentEntry entry)
         {
             try
             {
@@ -168,7 +172,7 @@ namespace TiaBridge
             catch { return ""; }
         }
 
-        private static bool TrySetEntryAttr(PlcWatchTableEntry entry, string name, object value, out string error)
+        private static bool TrySetEntryAttr(PlcTableCommentEntry entry, string name, object value, out string error)
         {
             error = null;
             if (value == null) return false;
@@ -184,7 +188,7 @@ namespace TiaBridge
             }
         }
 
-        private static string FormatEntryAttr(PlcWatchTableEntry entry, string name)
+        private static string FormatEntryAttr(PlcTableCommentEntry entry, string name)
         {
             try
             {
@@ -221,14 +225,14 @@ namespace TiaBridge
             {
                 if (wt == null) throw new InvalidOperationException("Watch table '" + tableName + "' not found.");
                 List<object> rows = new List<object>();
-                foreach (PlcWatchTableEntry e in wt.Entries)
+                foreach (PlcTableCommentEntry e in wt.Entries)
                 {
                     rows.Add(new Dictionary<string, object>
                     {
-                        { "name", e.Name ?? "" },
-                        { "address", e.Address ?? "" },
-                        { "displayFormat", e.DisplayFormat.ToString() },
-                        { "modifyValue", e.ModifyValue ?? "" },
+                        { "name", FormatEntryAttr(e, "Name") },
+                        { "address", FormatEntryAttr(e, "Address") },
+                        { "displayFormat", FormatEntryAttr(e, "DisplayFormat") },
+                        { "modifyValue", FormatEntryAttr(e, "ModifyValue") },
                         { "comment", GetEntryComment(e) }
                     });
                 }
@@ -292,10 +296,12 @@ namespace TiaBridge
                 List<string> warnings = new List<string>();
                 if (args.TryGetValue("entries", out rawEntries) && rawEntries is ArrayList)
                 {
-                    Dictionary<string, PlcWatchTableEntry> existingMap = new Dictionary<string, PlcWatchTableEntry>(StringComparer.OrdinalIgnoreCase);
-                    foreach (PlcWatchTableEntry ex in wt.Entries)
+                    Dictionary<string, PlcTableCommentEntry> existingMap = new Dictionary<string, PlcTableCommentEntry>(StringComparer.OrdinalIgnoreCase);
+                    foreach (PlcTableCommentEntry ex in wt.Entries)
                     {
-                        string k = !string.IsNullOrEmpty(ex.Name) ? ex.Name : ex.Address;
+                        string exName = FormatEntryAttr(ex, "Name");
+                        string exAddr = FormatEntryAttr(ex, "Address");
+                        string k = !string.IsNullOrEmpty(exName) ? exName : exAddr;
                         if (!string.IsNullOrEmpty(k) && !existingMap.ContainsKey(k)) existingMap[k] = ex;
                     }
 
@@ -312,14 +318,11 @@ namespace TiaBridge
                         string key = !string.IsNullOrEmpty(eName) ? eName : eAddr;
                         if (string.IsNullOrEmpty(key)) continue;
 
-                        PlcWatchTableEntry entry;
+                        PlcTableCommentEntry entry;
                         bool isNew = false;
                         if (!existingMap.TryGetValue(key, out entry))
                         {
-                            // Entries.Create() returns a PlcTableCommentEntry; in a watch table it is a PlcWatchTableEntry.
-                            PlcTableCommentEntry created = wt.Entries.Create();
-                            entry = created as PlcWatchTableEntry;
-                            if (entry == null) throw new InvalidOperationException("Watch table entry creation returned " + created.GetType().Name + " instead of PlcWatchTableEntry.");
+                            entry = wt.Entries.Create();
                             existingMap[key] = entry;
                             isNew = true;
                         }
@@ -546,11 +549,15 @@ namespace TiaBridge
                 {
                     if (!string.IsNullOrEmpty(groupPath))
                     {
+#if TIA_V16
+                        throw new NotSupportedException("TIA V16 Openness generates SCL blocks into the root Program blocks folder; omit 'group'.");
+#else
                         PlcBlockGroup grp = FindOrCreateBlockGroup(plc.Software.BlockGroup, groupPath, true);
                         PlcBlockUserGroup ugrp = grp as PlcBlockUserGroup;
                         generated = ugrp != null
                             ? srcObj.GenerateBlocksFromSource(ugrp, GenerateBlockOption.KeepOnError)
                             : srcObj.GenerateBlocksFromSource(GenerateBlockOption.KeepOnError);
+#endif
                     }
                     else
                     {
@@ -589,6 +596,7 @@ namespace TiaBridge
             throw new ArgumentException("Unknown scl_source action: " + action);
         }
 
+#if !TIA_V16
         // -------------------- Project-Wide Cross-Reference --------------------
         private object CmdCrossReference(Dictionary<string, object> args)
         {
@@ -681,6 +689,7 @@ namespace TiaBridge
                 }
             }
         }
+#endif
 
         // -------------------- Station Upload from Physical PLC --------------------
         private object CmdStationUpload(Dictionary<string, object> args)
@@ -703,6 +712,20 @@ namespace TiaBridge
             if (pc == null) throw new InvalidOperationException("PC interface matching '" + pcFilter + "' not found.");
 
             ConfigurationAddress addr = null;
+#if TIA_V16
+            if (pc.Subnets.Count > 0)
+            {
+                addr = pc.Subnets[0].Addresses.Find(targetAddr) ?? pc.Subnets[0].Addresses.Create(targetAddr);
+            }
+            else if (pc.Addresses != null)
+            {
+                addr = pc.Addresses.Find(targetAddr) ?? pc.Addresses.Create(targetAddr);
+            }
+            else
+            {
+                throw new InvalidOperationException("No subnet or address collection on PC interface '" + pc.Name + "'.");
+            }
+#else
             if (pc.TargetInterfaces.Count > 0)
             {
                 addr = pc.TargetInterfaces[0].Addresses.Find(targetAddr) ?? pc.TargetInterfaces[0].Addresses.Create(targetAddr);
@@ -715,6 +738,7 @@ namespace TiaBridge
             {
                 throw new InvalidOperationException("No target interface or subnet on PC interface '" + pc.Name + "'.");
             }
+#endif
 
             List<string> log = new List<string>();
             UploadResult res = up.StationUpload(addr, delegate(UploadConfiguration cfg)

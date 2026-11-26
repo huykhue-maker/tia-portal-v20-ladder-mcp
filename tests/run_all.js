@@ -782,7 +782,7 @@ async function main() {
     const subClean = G.generateFlgNet(D.parseNetwork('NO(#En) => SUB(#A, #B, #C, Real)').flows, { learned: staleLearned }).xml;
     assert(!subClean.includes('Name="Card"'), 'Stale Card must be stripped from Sub');
     const limClean = G.generateFlgNet(D.parseNetwork('NO(#En) => LIMIT(0.0, #X, 10.0, #Y, Real)').flows, { learned: staleLearned }).xml;
-    assert(!limClean.includes('Name="Card"') && limClean.includes('Name="SrcType"'), 'Stale Card stripped and SrcType preserved on Limit');
+    assert(!limClean.includes('Name="Card"') && limClean.includes('Name="value_type"'), 'Stale Card stripped and value_type preserved on Limit');
     const rndClean = G.generateFlgNet(D.parseNetwork('NO(#En) => ROUND(#X, #Y, Real, DInt)').flows, { learned: staleLearned }).xml;
     assert(!rndClean.includes('Name="Card"') && rndClean.includes('Name="DestType"'), 'Stale Card stripped and DestType preserved on Round');
 

@@ -161,6 +161,7 @@ async function handleTool(name, args) {
         'RUNNING TIA V' + version + ' PROCESSES: ' + (s.runningTiaProcesses.length ? s.runningTiaProcesses.map(p => 'PID ' + p.id + ' [' + p.mode + '] ' + (p.projectPath || '(no project)')).join('; ') : 'none'),
       ];
       if (version === '20') lines.push('S7-PLCSIM V20 RUNNING: ' + s.plcsimV20Running + (s.plcsimV20Pids?.length ? ' (PID ' + s.plcsimV20Pids.join(',') + ')' : ''));
+      else lines.push('S7-PLCSIM V16 RUNNING: ' + !!s.plcsimV16Running + (s.plcsimV16Pids?.length ? ' (PID ' + s.plcsimV16Pids.join(',') + ')' : ''));
       if (!s.inOpennessGroup) {
         lines.push('ACTION NEEDED: Run in Administrator PowerShell: net localgroup "Siemens TIA Openness" "' + s.user.split('\\').pop() + '" /add  (then sign out & sign in once).');
       }
@@ -674,13 +675,12 @@ async function handleTool(name, args) {
     }
 
     case 'tia_sim_prepare': {
-      if (version === '16' && args.launchPlcsim !== false) throw new Error('PLCSIM launch is unavailable in the V16 profile. Set launchPlcsim:false to generate only the CSV.');
       const lines = [];
       if (args.launchPlcsim !== false) {
         const sim = await bridge.call('sim_launch', {});
         lines.push(sim.alreadyRunning
-          ? 'S7-PLCSIM V20 is already running (PID ' + sim.pids.join(',') + ').'
-          : 'Launched S7-PLCSIM V20 (PID ' + sim.pid + ').');
+          ? 'S7-PLCSIM V' + version + ' is already running (PID ' + sim.pids.join(',') + ').'
+          : 'Launched S7-PLCSIM V' + version + ' (PID ' + sim.pid + ').');
       }
       if (args.generateSimTable !== false) {
         let rows = args.signals;
@@ -693,7 +693,7 @@ async function handleTool(name, args) {
         }
         const csvPath = bridge.writeSimTableCsv(args.tableName || 'PLC', rows);
         lines.push('Generated SIM Table CSV (' + rows.length + ' signal(s)): ' + csvPath);
-        lines.push('Tip: In S7-PLCSIM V20, open SIM View -> Import SIM Table -> select this CSV, or use tia_download_and_online(action="download") after starting a virtual CPU instance.');
+        lines.push('Tip: In S7-PLCSIM V' + version + ', open SIM View -> Import SIM Table -> select this CSV, or use tia_download_and_online(action="download") after starting a virtual CPU instance.');
       }
       return { text: lines.join('\n') };
     }

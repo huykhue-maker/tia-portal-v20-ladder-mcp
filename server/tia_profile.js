@@ -6,8 +6,7 @@ function portalVersion(value = '20') {
 }
 
 const V16_UNAVAILABLE_TOOLS = new Set([
-  'tia_download_and_online', 'tia_watch_table', 'tia_show_in_editor', 'tia_scl_source',
-  'tia_cross_reference', 'tia_hardware_config', 'tia_network_config', 'tia_plcsim_runtime', 'tia_escape_hatch',
+  'tia_cross_reference', 'tia_plcsim_runtime',
 ]);
 
 module.exports = { portalVersion, V16_UNAVAILABLE_TOOLS };

@@ -25,20 +25,6 @@ function v16NetworkNamespace(block, nearby) {
   }
   return namespace || V16_FLG_NS;
 }
-
-// Keep new V16 networks within the parts and wire shapes shared by the basic LAD dialect.
-function checkV16Flows(flows) {
-  const operand = op => op && ['local', 'global', 'abs'].includes(op.k) && !op.idx && !op.slice;
-  function condition(node) {
-    return !node || node.t === 'true' ||
-      (node.t === 'contact' && operand(node.op)) ||
-      (node.t === 'and' && node.items.every(condition));
-  }
-  if (!flows.every(flow => condition(flow.cond) && flow.then.every(action =>
-    action.t === 'coil' && operand(action.op) && !action.next?.length))) {
-    throw new G.GenError('V16 LAD generation supports series contacts and coils. Use a native V16 export for other instructions.', 'E_TIA_VERSION');
-  }
-}
 const SECTION_ORDER = ['Input', 'Output', 'InOut', 'Static', 'Temp', 'Constant', 'Return', 'None'];
 
 // ---------------------------------------------------------------- parsing
@@ -195,7 +181,7 @@ function genCtx(b, ctx) {
   ctx = ctx || {};
   return {
     portalVersion: b.portalVersion, flgNamespace: ctx.flgNamespace,
-    callCatalog: ctx.callCatalog || {}, learned: b.portalVersion === '16' ? undefined : ctx.learned, resolveType: makeResolver(b, ctx.tags, ctx.dbs, ctx.udts),
+    callCatalog: ctx.callCatalog || {}, learned: ctx.learned, resolveType: makeResolver(b, ctx.tags, ctx.dbs, ctx.udts),
     fcReturn: fcReturnBinding(b),
     isLocalConstant: op => (b.interface.Constant || []).some(m => m.name === op.path.join('.')),
   };
@@ -203,7 +189,6 @@ function genCtx(b, ctx) {
 function roundtrips(dsl, gctx, localCalls) {
   try {
     const flows = D.parseNetwork(dsl).flows;
-    if (gctx.portalVersion === '16') checkV16Flows(flows);
     const c = { ...gctx, callCatalog: { ...gctx.callCatalog, ...localCalls } };
     const gen = G.generateFlgNet(flows, c);
     const back = R.readFlgNet(X.parse(gen.xml), { fcReturn: gctx.fcReturn });
@@ -221,7 +206,7 @@ function readBlock(src, opts) {
     const row = { index: n.index, title: n.title, comment: n.comment, language: n.lang };
     if (n.flg) {
       const r = R.readFlgNet(n.flg, { fcReturn: gctx.fcReturn });
-      if (b.portalVersion !== '16' && opts.ctx && opts.ctx.learned) L.learnFlgNet(n.flg, opts.ctx.learned);
+      if (opts.ctx && opts.ctx.learned) L.learnFlgNet(n.flg, opts.ctx.learned);
       row.dsl = r.dsl; row.flows = r.flows; row.notes = r.notes;
       if (opts.simulationOnly) {
         row.complete = r.complete;
@@ -320,7 +305,6 @@ function checkLocals(b, flows, decls, declare) {
 function buildNetworkNode(b, dsl, ctx, extra, nearby) {
   const flows = dsl && dsl.trim() ? D.parseNetwork(dsl).flows : [];
   if (b.portalVersion === '16') {
-    checkV16Flows(flows);
     ctx = { ...ctx, flgNamespace: v16NetworkNamespace(b, nearby) };
   }
   const gctx = genCtx(b, ctx);
@@ -513,7 +497,6 @@ function createBlockXml(spec, ctx) {
   const nodes = []; const decls = []; const dbInst = [];
   for (const n of (spec.networks || [])) {
     const flows = n.dsl && n.dsl.trim() ? D.parseNetwork(n.dsl).flows : [];
-    if (version === '16') checkV16Flows(flows);
     const gen = G.generateFlgNet(flows, genCtx(fakeBlock, { ...ctx, flgNamespace }));
     decls.push(...gen.decls); dbInst.push(...gen.dbInstances);
     checkLocals(fakeBlock, flows, gen.decls, spec.declare);
@@ -526,7 +509,8 @@ function createBlockXml(spec, ctx) {
   }
   for (const d of (spec.declare || [])) if (!Object.values(sections).flat().find(m => m.name === d.name)) { (sections[d.section] = sections[d.section] || []).push(d); }
   const secNodes = SECTION_ORDER.filter(s => sections[s]).map(s => E('Section', { Name: s }, sections[s].map(m => mkMemberNode(m, culture))));
-  const attrs = [E('Interface', {}, E('Sections', { xmlns: interfaceNamespace(version) }, secNodes)), E('MemoryLayout', {}, spec.memoryLayout || 'Optimized'), E('Name', {}, spec.name), E('Namespace', {})];
+  const attrs = [E('Interface', {}, E('Sections', { xmlns: interfaceNamespace(version) }, secNodes)), E('MemoryLayout', {}, spec.memoryLayout || 'Optimized'), E('Name', {}, spec.name)];
+  if (version !== '16') attrs.push(E('Namespace', {}));
   if (spec.number) attrs.push(E('Number', {}, String(spec.number))); else attrs.push(E('AutoNumber', {}, 'true'));
   attrs.push(E('ProgrammingLanguage', {}, 'LAD'));
   if (type === 'OB') attrs.push(E('SecondaryType', {}, spec.secondaryType || 'ProgramCycle'));
@@ -551,8 +535,8 @@ function createDbXml(spec) {
       E('InstanceOfName', {}, spec.instanceOf),
       E('InstanceOfType', {}, spec.instanceOfType || 'FB'),
       E('Name', {}, spec.name),
-      E('Namespace', {}),
     ];
+    if (version !== '16') attrs.push(E('Namespace', {}));
     if (spec.number) attrs.push(E('Number', {}, String(spec.number)));
     else attrs.push(E('AutoNumber', {}, 'true'));
     attrs.push(E('ProgrammingLanguage', {}, 'DB'));
@@ -565,7 +549,8 @@ function createDbXml(spec) {
   const secName = isUdt ? 'None' : 'Static';
   const attrs = [E('Interface', {}, E('Sections', { xmlns: interfaceNamespace(version) }, [E('Section', { Name: secName }, members)]))];
   if (!isUdt) attrs.push(E('MemoryLayout', {}, spec.memoryLayout || 'Optimized'));
-  attrs.push(E('Name', {}, spec.name), E('Namespace', {}));
+  attrs.push(E('Name', {}, spec.name));
+  if (version !== '16') attrs.push(E('Namespace', {}));
   if (!isUdt) {
     if (spec.number) attrs.push(E('Number', {}, String(spec.number)));
     else attrs.push(E('AutoNumber', {}, 'true'));

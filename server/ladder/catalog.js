@@ -183,7 +183,7 @@ const DEFAULT_TEMPLATES = {
   Floor: [['SrcType', 'Type'], ['DestType', 'DestType']],
   Normalize: [['SrcType', 'Type'], ['DestType', 'DestType']],
   Scale_X: [['SrcType', 'Type'], ['DestType', 'DestType']],
-  Limit: [['SrcType', 'Type']],
+  Limit: [['value_type', 'Type']],
   InRange: [['SrcType', 'Type']], OutRange: [['SrcType', 'Type']], Sel: [['value_type', 'Type']],
   TON: [['time_type', 'Type']], TOF: [['time_type', 'Type']], TP: [['time_type', 'Type']], TONR: [['time_type', 'Type']],
   CTU: [['value_type', 'Type']], CTD: [['value_type', 'Type']], CTUD: [['value_type', 'Type']],
@@ -206,7 +206,7 @@ const NO_CARD_PARTS = new Set([
 const DUAL_TYPE_PARTS = new Set(Object.values(CONV_OPS).filter(info => info.dualType).map(info => info.part));
 const TIMER_PARTS = new Set(['TON', 'TOF', 'TP', 'TONR']);
 const COUNTER_PARTS = new Set(['CTU', 'CTD', 'CTUD']);
-const VALUE_TYPE_PARTS = new Set(['Sel', 'Min', 'Max']);
+const VALUE_TYPE_PARTS = new Set(['Sel', 'Min', 'Max', 'Limit']);
 
 function templatesFor(partName, ctx, learned) {
   const L = learned && learned.parts && learned.parts[partName];
@@ -218,7 +218,7 @@ function templatesFor(partName, ctx, learned) {
       .filter(t => !(NO_CARD_PARTS.has(partName) && t.name === 'Card')
         && !(VALUE_TYPE_PARTS.has(partName) && (t.name === 'SrcType' || (partName === 'Sel' && t.name === 'Card'))))
       .map(t => [t.name, t.type, t.value]);
-    if (NO_CARD_PARTS.has(partName) && !defs.some(d => d[0] === 'SrcType')) defs.push(['SrcType', 'Type']);
+    if (NO_CARD_PARTS.has(partName) && !VALUE_TYPE_PARTS.has(partName) && !defs.some(d => d[0] === 'SrcType')) defs.push(['SrcType', 'Type']);
     if (VARIADIC_MATH.has(MATH_FROM_PART[partName])) {
       for (const template of DEFAULT_TEMPLATES[partName]) if (!defs.some(d => d[0] === template[0])) defs.push(template);
     }

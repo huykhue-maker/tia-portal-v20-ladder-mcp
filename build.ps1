@@ -54,7 +54,6 @@ $cscArgs = @(
 
 if ($PortalVersion -eq '16') {
     $cscArgs += '/define:TIA_V16'
-    $sources = $sources[0]
 } elseif (Test-Path $simApi) {
     Write-Host "Found PLCSIM V20 Runtime API: enabling WITH_PLCSIM_API..."
     $cscArgs += '/define:WITH_PLCSIM_API'

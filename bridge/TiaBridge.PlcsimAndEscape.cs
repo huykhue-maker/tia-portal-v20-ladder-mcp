@@ -143,6 +143,7 @@ namespace TiaBridge
         {
             try
             {
+#if !TIA_V16
                 EngineeringAttributeInfo ai = obj.GetAttributeInfos().FirstOrDefault(x => string.Equals(x.Name, attrName, StringComparison.OrdinalIgnoreCase));
                 if (ai != null && ai.SupportedTypes != null && ai.SupportedTypes.Any())
                 {
@@ -151,6 +152,7 @@ namespace TiaBridge
                         try { return CoerceToType(st, rawVal); } catch { }
                     }
                 }
+#endif
                 object cur = obj.GetAttribute(attrName);
                 if (cur != null) return CoerceToType(cur.GetType(), rawVal);
             }
@@ -331,7 +333,11 @@ namespace TiaBridge
                         {
                             { "name", ai.Name },
                             { "access", ai.AccessMode.ToString() },
+#if !TIA_V16
                             { "types", ai.SupportedTypes != null ? ai.SupportedTypes.Select(t => t.Name).ToArray() : new string[0] }
+#else
+                            { "types", new string[0] }
+#endif
                         };
                         if (readValues && ai.AccessMode != EngineeringAttributeAccessMode.Write)
                         {
