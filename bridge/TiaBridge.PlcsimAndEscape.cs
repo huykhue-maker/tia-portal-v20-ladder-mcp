@@ -46,7 +46,10 @@ namespace TiaBridge
             _handleRecency.Remove(id);
         }
 
-        private void ClearHandles()
+        private readonly Dictionary<string, object> _handles = new Dictionary<string, object>();
+        private int _nextHandleId = 1;
+
+        partial void ClearHandles()
         {
             _handles.Clear();
             _handleRecency.Clear();

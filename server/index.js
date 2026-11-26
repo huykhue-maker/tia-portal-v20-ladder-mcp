@@ -6,14 +6,16 @@
 const { BridgeClient } = require('./bridge_client');
 const { OnlineBackups } = require('./online_backups');
 const { TOOLS } = require('./tools');
+const { V16_UNAVAILABLE_TOOLS } = require('./tia_profile');
 const { createToolHandler } = require('./handlers');
 
-const SERVER_INFO = { name: 'tia-portal-v20-mcp', version: '1.0.0' };
 const SUPPORTED_PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 const PROTOCOL_VERSION = '2025-11-25';
 
 const bridge = new BridgeClient();
+const SERVER_INFO = { name: 'tia-portal-v' + bridge.portalVersion + '-mcp', version: '1.0.0' };
 const onlineBackups = new OnlineBackups(bridge);
+const tools = bridge.portalVersion === '16' ? TOOLS.filter(tool => !V16_UNAVAILABLE_TOOLS.has(tool.name)) : TOOLS;
 const { handleTool } = createToolHandler({ bridge, onlineBackups });
 
 // ------------------------------------------------------------------ MCP Stdio Protocol Loop
@@ -37,7 +39,9 @@ async function onMessage(msg) {
           protocolVersion: negotiated,
           capabilities: { tools: {} },
           serverInfo: SERVER_INFO,
-          instructions: 'Read tia_project_blueprint first. Run tia_analyze_ladder and tia_dry_run_ladder before downloading. Call tia_download_and_online with action=list_connections before action=download. Confirm the target and user intent before deleting or overwriting anything.',
+          instructions: bridge.portalVersion === '16'
+            ? 'TIA Portal V16 profile. Use native .ap16 projects and SimaticML XML. Read tia_project_blueprint first and verify changes with tia_analyze_ladder and tia_dry_run_ladder.'
+            : 'Read tia_project_blueprint first. Run tia_analyze_ladder and tia_dry_run_ladder before downloading. Call tia_download_and_online with action=list_connections before action=download. Confirm the target and user intent before deleting or overwriting anything.',
         },
       });
       return;
@@ -47,7 +51,7 @@ async function onMessage(msg) {
       return;
     }
     if (method === 'tools/list') {
-      send({ jsonrpc: '2.0', id, result: { tools: TOOLS } });
+      send({ jsonrpc: '2.0', id, result: { tools } });
       return;
     }
     if (method === 'tools/call') {

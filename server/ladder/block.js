@@ -10,9 +10,35 @@ const L = require('./learn');
 const O = require('./operand');
 const A = require('./ast');
 const render = require('./render');
+const { portalVersion } = require('../tia_profile');
 const { E, ser } = X;
 
 const IF_NS = 'http://www.siemens.com/automation/Openness/SW/Interface/v5';
+const V16_FLG_NS = G.FLG_NS.replace(/\/v5$/, '/v4');
+const interfaceNamespace = version => version === '16' ? IF_NS.replace(/\/v5$/, '/v4') : IF_NS;
+
+function v16NetworkNamespace(block, nearby) {
+  const sample = nearby?.flg || block.networks.find(network => network.flg)?.flg;
+  const namespace = sample?.attrs.xmlns;
+  if (namespace && !/^http:\/\/www\.siemens\.com\/automation\/Openness\/SW\/NetworkSource\/FlgNet\/v[1-4]$/.test(namespace)) {
+    throw new G.GenError('Unsupported V16 LAD namespace: ' + namespace, 'E_TIA_VERSION');
+  }
+  return namespace || V16_FLG_NS;
+}
+
+// Keep new V16 networks within the parts and wire shapes shared by the basic LAD dialect.
+function checkV16Flows(flows) {
+  const operand = op => op && ['local', 'global', 'abs'].includes(op.k) && !op.idx && !op.slice;
+  function condition(node) {
+    return !node || node.t === 'true' ||
+      (node.t === 'contact' && operand(node.op)) ||
+      (node.t === 'and' && node.items.every(condition));
+  }
+  if (!flows.every(flow => condition(flow.cond) && flow.then.every(action =>
+    action.t === 'coil' && operand(action.op) && !action.next?.length))) {
+    throw new G.GenError('V16 LAD generation supports series contacts and coils. Use a native V16 export for other instructions.', 'E_TIA_VERSION');
+  }
+}
 const SECTION_ORDER = ['Input', 'Output', 'InOut', 'Static', 'Temp', 'Constant', 'Return', 'None'];
 
 // ---------------------------------------------------------------- parsing
@@ -52,8 +78,7 @@ function allIds(el, acc) {
   for (const c of el.children) allIds(c, acc);
   return acc;
 }
-function parseBlock(src) {
-  const root = X.parse(src);
+function parseBlock(src, root = X.parse(src)) {
   if (!root) throw new Error('empty XML');
   const blockEl = root.children.find(c => /^SW\.Blocks\./.test(c.name) || c.name === 'SW.Types.PlcStruct');
   if (!blockEl) throw new Error('No SW.Blocks.* element in document (root is <' + root.name + '>)');
@@ -75,7 +100,7 @@ function parseBlock(src) {
   }
   const cultureEl = X.descendants(root, 'Culture')[0];
   return {
-    src, root, blockEl, kind: blockEl.name.replace('SW.Blocks.', ''), name: attr('Name'), number: attr('Number'),
+    src, root, blockEl, portalVersion: X.kid(root, 'Engineering')?.attrs.version?.replace(/^V/, ''), kind: blockEl.name.replace('SW.Blocks.', ''), name: attr('Name'), number: attr('Number'),
     language: attr('ProgrammingLanguage'), memoryLayout: attr('MemoryLayout'), interface: parseInterface(blockEl), networks, objectList: ol,
     culture: cultureEl ? X.textOf(cultureEl) : 'en-US',
     maxId: allIds(root, []).reduce((m, v) => Math.max(m, parseInt(v, 16) || 0), 0),
@@ -169,7 +194,8 @@ function makeResolver(b, tags, dbs, udts) {
 function genCtx(b, ctx) {
   ctx = ctx || {};
   return {
-    callCatalog: ctx.callCatalog || {}, learned: ctx.learned, resolveType: makeResolver(b, ctx.tags, ctx.dbs, ctx.udts),
+    portalVersion: b.portalVersion, flgNamespace: ctx.flgNamespace,
+    callCatalog: ctx.callCatalog || {}, learned: b.portalVersion === '16' ? undefined : ctx.learned, resolveType: makeResolver(b, ctx.tags, ctx.dbs, ctx.udts),
     fcReturn: fcReturnBinding(b),
     isLocalConstant: op => (b.interface.Constant || []).some(m => m.name === op.path.join('.')),
   };
@@ -177,6 +203,7 @@ function genCtx(b, ctx) {
 function roundtrips(dsl, gctx, localCalls) {
   try {
     const flows = D.parseNetwork(dsl).flows;
+    if (gctx.portalVersion === '16') checkV16Flows(flows);
     const c = { ...gctx, callCatalog: { ...gctx.callCatalog, ...localCalls } };
     const gen = G.generateFlgNet(flows, c);
     const back = R.readFlgNet(X.parse(gen.xml), { fcReturn: gctx.fcReturn });
@@ -185,7 +212,7 @@ function roundtrips(dsl, gctx, localCalls) {
 }
 function readBlock(src, opts) {
   opts = opts || {};
-  const b = parseBlock(src);
+  const b = parseBlock(src, opts.root);
   const gctx = genCtx(b, opts.ctx);
   const want = opts.networks && opts.networks.length ? new Set(opts.networks) : null;
   const nets = [];
@@ -194,7 +221,7 @@ function readBlock(src, opts) {
     const row = { index: n.index, title: n.title, comment: n.comment, language: n.lang };
     if (n.flg) {
       const r = R.readFlgNet(n.flg, { fcReturn: gctx.fcReturn });
-      if (opts.ctx && opts.ctx.learned) L.learnFlgNet(n.flg, opts.ctx.learned);
+      if (b.portalVersion !== '16' && opts.ctx && opts.ctx.learned) L.learnFlgNet(n.flg, opts.ctx.learned);
       row.dsl = r.dsl; row.flows = r.flows; row.notes = r.notes;
       if (opts.simulationOnly) {
         row.complete = r.complete;
@@ -290,8 +317,12 @@ function checkLocals(b, flows, decls, declare) {
   }
 }
 
-function buildNetworkNode(b, dsl, ctx, extra) {
+function buildNetworkNode(b, dsl, ctx, extra, nearby) {
   const flows = dsl && dsl.trim() ? D.parseNetwork(dsl).flows : [];
+  if (b.portalVersion === '16') {
+    checkV16Flows(flows);
+    ctx = { ...ctx, flgNamespace: v16NetworkNamespace(b, nearby) };
+  }
   const gctx = genCtx(b, ctx);
   const gen = G.generateFlgNet(flows, gctx);
   checkLocals(b, flows, gen.decls, extra && extra.declare);
@@ -371,7 +402,8 @@ function patchNetworks(src, ops, ctx) {
     if (['replace', 'delete', 'set_text'].includes(kind) && !unit) throw new G.GenError('Network ' + nw + ' does not exist (block has ' + b.networks.length + ' networks)', 'E_NW');
     if (kind === 'replace') {
       if (!unit.flg && unit.sourceKind && !op.force) throw new G.GenError('Network ' + nw + ' is ' + unit.lang + ', not Ladder; refusing to overwrite (pass force:true to replace it with Ladder)', 'E_NW');
-      const { gen } = buildNetworkNode(b, op.dsl, ctx, op);
+      if (b.portalVersion === '16' && !unit.flg && unit.sourceKind) throw new G.GenError('Replacing a non-LAD network is unavailable in V16.', 'E_TIA_VERSION');
+      const { gen } = buildNetworkNode(b, op.dsl, ctx, op, unit);
       allDecls.push(...gen.decls); dbInst.push(...gen.dbInstances);
       const nsEl = unit.nsEl;
       const pad = indentOf(src, nsEl.start);
@@ -383,7 +415,8 @@ function patchNetworks(src, ops, ctx) {
       if (op.comment !== undefined) { const s2 = setMlText(src, b2.networks[nw - 1].el, 'Comment', op.comment, culture); if (s2) src = s2; }
       changes.push('replaced NW' + nw);
     } else if (kind === 'insert' || kind === 'append') {
-      const { gen } = buildNetworkNode(b, op.dsl, ctx, op);
+      const nearby = kind === 'append' ? b.networks.at(-1) : unit;
+      const { gen } = buildNetworkNode(b, op.dsl, ctx, op, nearby);
       allDecls.push(...gen.decls); dbInst.push(...gen.dbInstances);
       const node = unitNode(nid, gen.node, op.title || '', op.comment || '', culture);
       const atEnd = kind === 'append' || !nw || nw > b.networks.length;
@@ -463,6 +496,8 @@ function mkMemberNode(m, culture) {
 function createBlockXml(spec, ctx) {
   ctx = ctx || {};
   const type = spec.type;
+  const version = portalVersion(spec.portalVersion);
+  const flgNamespace = version === '16' ? V16_FLG_NS : G.FLG_NS;
   const culture = spec.culture || ctx.culture || 'en-US';
   const sections = defaultSections(type, spec.secondaryType);
   for (const s of Object.keys(spec.interface || {})) {
@@ -474,11 +509,12 @@ function createBlockXml(spec, ctx) {
   // temporary block context for type resolution / local checks (flatten nested Struct members)
   const flatSections = {};
   for (const s of Object.keys(sections)) flatSections[s] = flattenSectionMembers(sections[s], '', []);
-  const fakeBlock = { name: spec.name, kind: type, interface: flatSections };
+  const fakeBlock = { name: spec.name, kind: type, portalVersion: version, interface: flatSections };
   const nodes = []; const decls = []; const dbInst = [];
   for (const n of (spec.networks || [])) {
     const flows = n.dsl && n.dsl.trim() ? D.parseNetwork(n.dsl).flows : [];
-    const gen = G.generateFlgNet(flows, genCtx(fakeBlock, ctx));
+    if (version === '16') checkV16Flows(flows);
+    const gen = G.generateFlgNet(flows, genCtx(fakeBlock, { ...ctx, flgNamespace }));
     decls.push(...gen.decls); dbInst.push(...gen.dbInstances);
     checkLocals(fakeBlock, flows, gen.decls, spec.declare);
     nodes.push({ gen, n });
@@ -490,20 +526,21 @@ function createBlockXml(spec, ctx) {
   }
   for (const d of (spec.declare || [])) if (!Object.values(sections).flat().find(m => m.name === d.name)) { (sections[d.section] = sections[d.section] || []).push(d); }
   const secNodes = SECTION_ORDER.filter(s => sections[s]).map(s => E('Section', { Name: s }, sections[s].map(m => mkMemberNode(m, culture))));
-  const attrs = [E('Interface', {}, E('Sections', { xmlns: IF_NS }, secNodes)), E('MemoryLayout', {}, spec.memoryLayout || 'Optimized'), E('Name', {}, spec.name), E('Namespace', {})];
+  const attrs = [E('Interface', {}, E('Sections', { xmlns: interfaceNamespace(version) }, secNodes)), E('MemoryLayout', {}, spec.memoryLayout || 'Optimized'), E('Name', {}, spec.name), E('Namespace', {})];
   if (spec.number) attrs.push(E('Number', {}, String(spec.number))); else attrs.push(E('AutoNumber', {}, 'true'));
   attrs.push(E('ProgrammingLanguage', {}, 'LAD'));
   if (type === 'OB') attrs.push(E('SecondaryType', {}, spec.secondaryType || 'ProgramCycle'));
   const objs = [mlNode(nid, 'Comment', culture, spec.comment || ''), mlNode(nid, 'Title', culture, spec.title || '')];
   for (const { gen, n } of nodes) objs.push(unitNode(nid, gen.node, n.title || '', n.comment || '', culture));
-  if (!nodes.length) objs.push(unitNode(nid, E('FlgNet', { xmlns: G.FLG_NS }, [E('Parts', {})]), '', '', culture));
-  const doc = E('Document', {}, [E('Engineering', { version: 'V20' }), E('SW.Blocks.' + type, { ID: '0' }, [E('AttributeList', {}, attrs), E('ObjectList', {}, objs)])]);
+  if (!nodes.length) objs.push(unitNode(nid, E('FlgNet', { xmlns: flgNamespace }, [E('Parts', {})]), '', '', culture));
+  const doc = E('Document', {}, [E('Engineering', { version: 'V' + version }), E('SW.Blocks.' + type, { ID: '0' }, [E('AttributeList', {}, attrs), E('ObjectList', {}, objs)])]);
   const xml = '<?xml version="1.0" encoding="utf-8"?>\n' + ser(doc, 0) + '\n';
   X.parse(xml);
   return { xml, dbInstances: dbInst, declared: decls };
 }
 
 function createDbXml(spec) {
+  const version = portalVersion(spec.portalVersion);
   const kind = spec.kind || 'GlobalDB';
   if (!spec.name) throw new G.GenError('name is required for DB/UDT XML.', 'E_DECL');
   const culture = spec.culture || 'en-US';
@@ -519,14 +556,14 @@ function createDbXml(spec) {
     if (spec.number) attrs.push(E('Number', {}, String(spec.number)));
     else attrs.push(E('AutoNumber', {}, 'true'));
     attrs.push(E('ProgrammingLanguage', {}, 'DB'));
-    const doc = E('Document', {}, [E('Engineering', { version: 'V20' }), E('SW.Blocks.InstanceDB', { ID: '0' }, [E('AttributeList', {}, attrs)])]);
+    const doc = E('Document', {}, [E('Engineering', { version: 'V' + version }), E('SW.Blocks.InstanceDB', { ID: '0' }, [E('AttributeList', {}, attrs)])]);
     const xml = '<?xml version="1.0" encoding="utf-8"?>\n' + ser(doc, 0) + '\n';
     X.parse(xml);
     return xml;
   }
   const isUdt = kind === 'UDT';
   const secName = isUdt ? 'None' : 'Static';
-  const attrs = [E('Interface', {}, E('Sections', { xmlns: IF_NS }, [E('Section', { Name: secName }, members)]))];
+  const attrs = [E('Interface', {}, E('Sections', { xmlns: interfaceNamespace(version) }, [E('Section', { Name: secName }, members)]))];
   if (!isUdt) attrs.push(E('MemoryLayout', {}, spec.memoryLayout || 'Optimized'));
   attrs.push(E('Name', {}, spec.name), E('Namespace', {}));
   if (!isUdt) {
@@ -535,7 +572,7 @@ function createDbXml(spec) {
     attrs.push(E('ProgrammingLanguage', {}, 'DB'));
   }
   const tag = isUdt ? 'SW.Types.PlcStruct' : 'SW.Blocks.GlobalDB';
-  const doc = E('Document', {}, [E('Engineering', { version: 'V20' }), E(tag, { ID: '0' }, [E('AttributeList', {}, attrs)])]);
+  const doc = E('Document', {}, [E('Engineering', { version: 'V' + version }), E(tag, { ID: '0' }, [E('AttributeList', {}, attrs)])]);
   const xml = '<?xml version="1.0" encoding="utf-8"?>\n' + ser(doc, 0) + '\n';
   X.parse(xml);
   return xml;

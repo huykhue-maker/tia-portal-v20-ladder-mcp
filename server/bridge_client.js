@@ -6,12 +6,11 @@ const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 const L = require('./ladder/learn');
+const { portalVersion } = require('./tia_profile');
 
 const ROOT = path.resolve(__dirname, '..');
-const BRIDGE_EXE = path.join(ROOT, 'bridge', 'TiaBridge.exe');
 const BACKUPS_DIR = path.join(ROOT, 'backups');
 const EXPORTS_DIR = path.join(ROOT, 'exports');
-const LEARNED_FILE = path.join(ROOT, 'exports', 'learned_catalog.json');
 
 function ensureDir(dir) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -30,12 +29,16 @@ function timestamp() {
 }
 
 class BridgeClient {
-  constructor() {
+  constructor({ version = process.env.TIA_PORTAL_VERSION } = {}) {
+    this.portalVersion = portalVersion(version);
+    const executable = this.portalVersion === '16' ? 'TiaBridge.V16.exe' : 'TiaBridge.exe';
+    this.executable = path.join(ROOT, 'bridge', executable);
     this.proc = null;
     this.nextId = 1;
     this.pending = new Map();
     this.buf = '';
     this.stderrBuf = '';
+    this.learnedFile = path.join(EXPORTS_DIR, this.portalVersion === '16' ? 'learned_catalog_v16.json' : 'learned_catalog.json');
     this.learned = this.loadLearned();
     this.projectPath = '';
     this.scopeKey = '';
@@ -46,8 +49,8 @@ class BridgeClient {
 
   loadLearned() {
     try {
-      if (fs.existsSync(LEARNED_FILE)) {
-        const saved = JSON.parse(fs.readFileSync(LEARNED_FILE, 'utf8'));
+      if (fs.existsSync(this.learnedFile)) {
+        const saved = JSON.parse(fs.readFileSync(this.learnedFile, 'utf8'));
         return { ...saved, calls: {} };
       }
     } catch { }
@@ -58,7 +61,7 @@ class BridgeClient {
     try {
       ensureDir(EXPORTS_DIR);
       const { calls, ...globalOnly } = this.learned;
-      fs.writeFileSync(LEARNED_FILE, JSON.stringify(globalOnly, null, 2), 'utf8');
+      fs.writeFileSync(this.learnedFile, JSON.stringify(globalOnly, null, 2), 'utf8');
     } catch { }
   }
 
@@ -105,10 +108,10 @@ class BridgeClient {
 
   ensureStarted() {
     if (this.proc && !this.proc.killed && this.proc.exitCode === null) return;
-    if (!fs.existsSync(BRIDGE_EXE)) {
-      throw new Error('TiaBridge.exe not found at ' + BRIDGE_EXE + '. Run build.ps1 first.');
+    if (!fs.existsSync(this.executable)) {
+      throw new Error(path.basename(this.executable) + ' not found at ' + this.executable + '. Run build.ps1 -PortalVersion ' + this.portalVersion + ' first.');
     }
-    this.proc = spawn(BRIDGE_EXE, [], {
+    this.proc = spawn(this.executable, [], {
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
     });
@@ -141,7 +144,7 @@ class BridgeClient {
       const suffix = tail ? ' | stderr: ' + tail : '';
       for (const [, waiter] of this.pending) {
         clearTimeout(waiter.timer);
-        waiter.reject(new Error('TiaBridge.exe exited unexpectedly (code ' + code + ')' + suffix));
+        waiter.reject(new Error(path.basename(this.executable) + ' exited unexpectedly (code ' + code + ')' + suffix));
       }
       this.pending.clear();
       this.proc = null;

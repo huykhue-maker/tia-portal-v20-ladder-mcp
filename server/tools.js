@@ -21,13 +21,13 @@ const TOOLS = [
   {
     name: 'tia_status',
     annotations: toolAnnotations(true),
-    description: 'Check TIA Portal V20 connection status, Windows "Siemens TIA Openness" group membership, running TIA V20 and S7-PLCSIM V20 processes, and open project.',
+    description: 'Check the selected TIA Portal version, Windows Siemens TIA Openness group membership, running processes, and open project.',
     inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'tia_connect',
     annotations: toolAnnotations(false),
-    description: 'Attach to a running TIA Portal V20 window or launch a new TIA Portal V20 instance (UI or Headless). Stays alive cleanly across tool calls.',
+    description: 'Attach to a running TIA Portal window or launch an instance of the configured version (UI or Headless). Stays alive cleanly across tool calls.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -39,12 +39,12 @@ const TOOLS = [
   {
     name: 'tia_open_project',
     annotations: toolAnnotations(false, true),
-    description: 'Open a TIA Portal V20 project (.ap20). Supports full Unicode/Vietnamese paths. Auto-connects if not connected.',
+    description: 'Open a project for the configured TIA Portal version (.ap16 or .ap20). Supports full Unicode/Vietnamese paths. Auto-connects if not connected.',
     inputSchema: {
       type: 'object',
       required: ['path'],
       properties: {
-        path: { type: 'string', description: 'Absolute path to the .ap20 file, e.g. D:\\Kì 7\\Đồ án 2\\Do_an2_cnc_V20\\Do_an2_cnc_V20.ap20' },
+        path: { type: 'string', description: 'Absolute path to the .ap16 or .ap20 file, e.g. D:\\Kì 7\\Đồ án 2\\Do_an2_cnc_V20\\Do_an2_cnc_V20.ap20' },
         mode: { type: 'string', enum: ['auto', 'attach', 'ui', 'headless'], description: 'Connection mode if not yet connected (default: auto).' },
         closeCurrent: { type: 'boolean', description: 'Close currently open project if different (default: false).' },
         upgrade: { type: 'boolean', description: 'Open with upgrade from an older TIA Portal version (default: false).' },
@@ -54,7 +54,7 @@ const TOOLS = [
   {
     name: 'tia_save_project',
     annotations: toolAnnotations(false, true),
-    description: 'Save the currently open TIA Portal V20 project (or Save As to a new directory).',
+    description: 'Save the currently open TIA Portal project (or Save As to a new directory).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -65,7 +65,7 @@ const TOOLS = [
   {
     name: 'tia_close_project',
     annotations: toolAnnotations(false, true),
-    description: 'Close the currently open TIA Portal V20 project and optionally disconnect.',
+    description: 'Close the currently open TIA Portal project and optionally disconnect.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -79,7 +79,7 @@ const TOOLS = [
   {
     name: 'tia_project_blueprint',
     annotations: toolAnnotations(true),
-    description: 'One-shot comprehensive overview of a (half-finished) TIA Portal V20 project: CPU/devices, all blocks (OB/FB/FC/DB) with language & consistency, PLC Tag Tables, UDTs, Technological Objects (e.g. CNC axes), and automatically learns block interfaces and UDTs for CALL and type validation.',
+    description: 'One-shot comprehensive overview of a TIA Portal project: CPU/devices, all blocks (OB/FB/FC/DB) with language & consistency, PLC Tag Tables, UDTs, Technological Objects (e.g. CNC axes), and automatically learns block interfaces and UDTs for CALL and type validation.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -288,12 +288,13 @@ const TOOLS = [
   {
     name: 'tia_create_ladder_block',
     annotations: toolAnnotations(false, true),
-    description: 'Create a brand-new LAD block (FB, FC, or OB) from interface specification and Ladder DSL networks, generate valid V20 SimaticML XML, and import it into TIA Portal (or save offline).',
+    description: 'Create a brand-new LAD block (FB, FC, or OB) from interface specification and Ladder DSL networks, generate version-specific SimaticML XML, and import it into TIA Portal (or save offline). V16 generation supports simple contacts and coils.',
     inputSchema: {
       type: 'object',
       required: ['type', 'name'],
       properties: {
         type: { type: 'string', enum: ['FB', 'FC', 'OB'] },
+        portalVersion: { type: 'string', enum: ['16', '20'], description: 'XML output version. Defaults to the configured TIA Portal version.' },
         secondaryType: { type: 'string', enum: ['ProgramCycle', 'Startup', 'CyclicInterrupt'], description: 'OB event class (default ProgramCycle).' },
         name: { type: 'string' },
         number: { type: 'integer', description: 'Optional block number (omit for AutoNumber).' },
@@ -378,11 +379,12 @@ const TOOLS = [
   {
     name: 'tia_test_ladder_project',
     annotations: toolAnnotations(true),
-    description: 'Analyze a directory of offline LAD XML blocks and run named regression scenarios. Paths in the suite JSON are relative to that file. Returns text, JSON or JUnit.',
+    description: 'Analyze offline LAD XML, DBs, UDTs and PLC tags and run named regression scenarios. Set strictSymbols in the suite JSON to validate symbol paths and scenario values. Optionally compare watched signals with a baseline XML directory. Paths are relative to the suite file. Returns text, JSON or JUnit.',
     inputSchema: {
       type: 'object', required: ['manifestPath'],
       properties: {
         manifestPath: { type: 'string', description: 'Path to the suite JSON file.' },
+        baselineBlockDir: { type: 'string', minLength: 1, description: 'Run the same cases against this baseline XML directory. Each case requires a watch list.' },
         format: { type: 'string', enum: ['text', 'json', 'junit'] },
         targetSymbol: { type: 'string', description: 'Exact variable/tag to assess before changing.' },
         targetBlock: { type: 'string', description: 'Block signature to assess before changing.' },
@@ -443,7 +445,7 @@ const TOOLS = [
   {
     name: 'tia_compile',
     annotations: toolAnnotations(false, true),
-    description: 'Compile PLC Software (and optionally Hardware) in TIA Portal V20. Enables "Support simulation during block compilation" by default and returns detailed compiler errors & warnings.',
+    description: 'Compile PLC Software (and optionally Hardware) in the configured TIA Portal version. Enables "Support simulation during block compilation" by default and returns detailed compiler errors & warnings.',
     inputSchema: {
       type: 'object',
       properties: {

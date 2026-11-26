@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Document>
+  <SW.Tags.PlcTagTable ID="0">
+    <AttributeList><Name>Inputs</Name></AttributeList>
+    <ObjectList>
+      <SW.Tags.PlcTag ID="1">
+        <AttributeList><DataTypeName>Bool</DataTypeName><LogicalAddress>%I0.0</LogicalAddress><Name>PartPresent</Name></AttributeList>
+      </SW.Tags.PlcTag>
+    </ObjectList>
+  </SW.Tags.PlcTagTable>
+</Document>

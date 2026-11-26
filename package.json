@@ -10,6 +10,7 @@
     "test:project": "node server/test-project.js",
     "test:tia-isolation": "node tests/run_all.js tia-isolation",
     "test:tia": "node tests/run_all.js tia",
+    "test:tia-v16": "node tests/tia_v16_smoke.js",
     "build": "powershell -ExecutionPolicy Bypass -File build.ps1"
   },
   "keywords": [

@@ -11,8 +11,10 @@ const A = require('./ladder/analyzer');
 const S = require('./ladder/simulator');
 const project = require('./ladder/project');
 const X = require('./ladder/xml');
+const { portalVersion, V16_UNAVAILABLE_TOOLS } = require('./tia_profile');
 
 function createToolHandler({ bridge, onlineBackups }) {
+const version = portalVersion(bridge.portalVersion);
 // ------------------------------------------------------------------ Helpers
 function getLadderCtx(extra) {
   return Object.assign({
@@ -146,6 +148,7 @@ function hardwareIoText(item) {
 async function handleTool(name, args) {
   bridge.setScope(undefined, args && args.plcName || '');
   args = args || {};
+  if (version === '16' && V16_UNAVAILABLE_TOOLS.has(name)) throw new Error(name + ' is unavailable in the TIA V16 profile.');
   switch (name) {
     case 'tia_status': {
       const s = await bridge.call('status');
@@ -155,9 +158,9 @@ async function handleTool(name, args) {
         'CONNECTED: ' + s.connected + ' (mode: ' + s.mode + ', attachedExisting: ' + s.attachedExisting + ')',
         'PROJECT: ' + (s.projectOpen ? s.projectName + ' (' + s.projectPath + ')' : 'none'),
         'OPENNESS ACCESSIBLE: ' + s.opennessAccessible + (s.opennessError ? ' — ' + s.opennessError : ''),
-        'RUNNING TIA V20 PROCESSES: ' + (s.runningTiaProcesses.length ? s.runningTiaProcesses.map(p => 'PID ' + p.id + ' [' + p.mode + '] ' + (p.projectPath || '(no project)')).join('; ') : 'none'),
-        'S7-PLCSIM V20 RUNNING: ' + s.plcsimV20Running + (s.plcsimV20Pids.length ? ' (PID ' + s.plcsimV20Pids.join(',') + ')' : ''),
+        'RUNNING TIA V' + version + ' PROCESSES: ' + (s.runningTiaProcesses.length ? s.runningTiaProcesses.map(p => 'PID ' + p.id + ' [' + p.mode + '] ' + (p.projectPath || '(no project)')).join('; ') : 'none'),
       ];
+      if (version === '20') lines.push('S7-PLCSIM V20 RUNNING: ' + s.plcsimV20Running + (s.plcsimV20Pids?.length ? ' (PID ' + s.plcsimV20Pids.join(',') + ')' : ''));
       if (!s.inOpennessGroup) {
         lines.push('ACTION NEEDED: Run in Administrator PowerShell: net localgroup "Siemens TIA Openness" "' + s.user.split('\\').pop() + '" /add  (then sign out & sign in once).');
       }
@@ -167,10 +170,13 @@ async function handleTool(name, args) {
     case 'tia_connect': {
       const s = await bridge.call('connect', { mode: args.mode || 'auto', processId: args.processId || 0 });
       bridge.clearProjectScope(); bridge.setScope(s.projectPath || '', '');
-      return { text: 'Connected to TIA Portal V20 (mode: ' + s.mode + ', project: ' + (s.projectName || 'none') + ').', json: s };
+      return { text: 'Connected to TIA Portal V' + version + ' (mode: ' + s.mode + ', project: ' + (s.projectName || 'none') + ').', json: s };
     }
 
     case 'tia_open_project': {
+      if (version === '16' && (typeof args.path !== 'string' || path.extname(args.path).toLowerCase() !== '.ap16' || args.upgrade)) {
+        throw new Error('The TIA V16 profile opens native .ap16 projects. Select a matching project and omit upgrade.');
+      }
       const s = await bridge.call('open_project', {
         path: args.path,
         mode: args.mode || 'auto',
@@ -287,6 +293,7 @@ async function handleTool(name, args) {
         lines.push('');
         lines.push('PLC DATA TYPES (UDT): ' + types.types.map(t => t.name).join(', '));
       }
+      if (tos.enumerationSupported === false) lines.push('Technological object enumeration is unavailable in the TIA V16 profile.');
       if ((tos.technologicalObjects || []).length) {
         lines.push('');
         lines.push('TECHNOLOGICAL OBJECTS (Motion/CNC/PID): ' + tos.technologicalObjects.map(t => t.name + ' (DB' + t.number + ')').join(', '));
@@ -313,6 +320,7 @@ async function handleTool(name, args) {
           tagsCount: totalTags,
           udts: (types.types || []).map(t => t.name),
           techObjects: (tos.technologicalObjects || []).map(t => ({ name: t.name, number: t.number })),
+          ...(tos.enumerationSupported === false && { techObjectsSupported: false }),
           learnedBlocksCount,
           groupFilter: groupFilter || null,
         },
@@ -391,6 +399,7 @@ async function handleTool(name, args) {
         const dbKind = kind === 'instance_db' ? 'InstanceDB' : (kind === 'udt' ? 'UDT' : 'GlobalDB');
         const xml = B.createDbXml({
           kind: dbKind,
+          portalVersion: version,
           name: args.name,
           instanceOf: args.instanceOf,
           instanceOfType: args.instanceOfType || 'FB',
@@ -485,8 +494,12 @@ async function handleTool(name, args) {
     }
 
     case 'tia_create_ladder_block': {
+      const shouldImport = args.importToTia !== undefined ? args.importToTia : !args.outXmlPath;
+      const xmlVersion = portalVersion(args.portalVersion === undefined ? version : args.portalVersion);
+      if (shouldImport && xmlVersion !== version) throw new Error('XML version V' + xmlVersion + ' does not match the V' + version + ' bridge.');
       const created = B.createBlockXml({
         type: args.type,
+        portalVersion: xmlVersion,
         secondaryType: args.secondaryType,
         name: args.name,
         number: args.number,
@@ -501,7 +514,6 @@ async function handleTool(name, args) {
       ensureDir(path.dirname(outPath));
       fs.writeFileSync(outPath, created.xml, 'utf8');
 
-      const shouldImport = args.importToTia !== undefined ? args.importToTia : !args.outXmlPath;
       let statusLine = 'Generated LAD XML at ' + outPath;
       const createdDbs = [];
       if (shouldImport) {
@@ -514,7 +526,7 @@ async function handleTool(name, args) {
             const key = d.name.toLowerCase();
             if (existing.has(key) || seen.has(key)) continue;
             seen.add(key);
-            const dbXml = B.createDbXml({ kind: 'InstanceDB', name: d.name, instanceOf: d.type, instanceOfType: 'FB' });
+            const dbXml = B.createDbXml({ kind: 'InstanceDB', portalVersion: xmlVersion, name: d.name, instanceOf: d.type, instanceOfType: 'FB' });
             const dbPath = bridge.exportFilePath(d.name, '.xml');
             ensureDir(path.dirname(dbPath));
             fs.writeFileSync(dbPath, dbXml, 'utf8');
@@ -609,7 +621,7 @@ async function handleTool(name, args) {
     }
 
     case 'tia_test_ladder_project': {
-      const report = project.runProject(args.manifestPath, { targetSymbol: args.targetSymbol, targetBlock: args.targetBlock });
+      const report = project.runProject(args.manifestPath, { targetSymbol: args.targetSymbol, targetBlock: args.targetBlock, baselineBlockDir: args.baselineBlockDir });
       return { text: project.formatReport(report, args.format), json: report };
     }
     case 'tia_dry_run_ladder': {
@@ -662,6 +674,7 @@ async function handleTool(name, args) {
     }
 
     case 'tia_sim_prepare': {
+      if (version === '16' && args.launchPlcsim !== false) throw new Error('PLCSIM launch is unavailable in the V16 profile. Set launchPlcsim:false to generate only the CSV.');
       const lines = [];
       if (args.launchPlcsim !== false) {
         const sim = await bridge.call('sim_launch', {});
