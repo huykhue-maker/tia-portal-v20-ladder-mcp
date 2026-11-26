@@ -3,6 +3,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Threading;
@@ -23,16 +24,44 @@ namespace TiaBridge
     internal partial class BridgeHost
     {
         // ==================== 1. UNIVERSAL ESCAPE HATCH (DYNAMIC REFLECTION) ====================
+        private const int HandleCapacity = 500;
+        private readonly LinkedList<string> _handleRecency = new LinkedList<string>();
+
+        private void TouchHandle(string id)
+        {
+            _handleRecency.Remove(id);
+            _handleRecency.AddLast(id);
+        }
+
+        private bool TryGetHandle(string id, out object value)
+        {
+            if (!_handles.TryGetValue(id, out value)) return false;
+            TouchHandle(id);
+            return true;
+        }
+
+        private void RemoveHandle(string id)
+        {
+            _handles.Remove(id);
+            _handleRecency.Remove(id);
+        }
+
+        private void ClearHandles()
+        {
+            _handles.Clear();
+            _handleRecency.Clear();
+        }
+
         private string RegisterHandle(object obj)
         {
             if (obj == null) return null;
             List<string> dead = null;
+            string id = null;
             foreach (KeyValuePair<string, object> kv in _handles)
             {
-                if (object.ReferenceEquals(kv.Value, obj)) return kv.Key;
                 try
                 {
-                    if (kv.Value != null && kv.Value.Equals(obj)) return kv.Key;
+                    if (object.Equals(kv.Value, obj)) { id = kv.Key; break; }
                 }
                 catch
                 {
@@ -42,10 +71,15 @@ namespace TiaBridge
             }
             if (dead != null)
             {
-                foreach (string k in dead) _handles.Remove(k);
+                foreach (string k in dead) RemoveHandle(k);
             }
-            string id = "obj:" + (_nextHandleId++);
-            _handles[id] = obj;
+            if (id == null)
+            {
+                if (_handles.Count >= HandleCapacity) RemoveHandle(_handleRecency.First.Value);
+                id = "obj:" + (_nextHandleId++);
+                _handles[id] = obj;
+            }
+            TouchHandle(id);
             return id;
         }
 
@@ -76,12 +110,16 @@ namespace TiaBridge
         private object CoerceToType(Type targetType, object raw)
         {
             if (raw == null || targetType == null) return raw;
+            targetType = Nullable.GetUnderlyingType(targetType) ?? targetType;
             if (targetType.IsAssignableFrom(raw.GetType())) return raw;
             string s = Convert.ToString(raw, CultureInfo.InvariantCulture);
-            if (raw is string && s.StartsWith("obj:") && _handles.ContainsKey(s))
+            object handle;
+            if (raw is string && s.StartsWith("obj:", StringComparison.Ordinal) && TryGetHandle(s, out handle))
             {
-                return _handles[s];
+                return handle;
             }
+            if (targetType == typeof(FileInfo)) return new FileInfo(s);
+            if (targetType == typeof(DirectoryInfo)) return new DirectoryInfo(s);
             if (targetType.IsEnum) return Enum.Parse(targetType, s, true);
             if (targetType == typeof(bool)) return Convert.ToBoolean(raw, CultureInfo.InvariantCulture);
             if (targetType == typeof(int)) return Convert.ToInt32(raw, CultureInfo.InvariantCulture);
@@ -135,14 +173,14 @@ namespace TiaBridge
         private object ResolveTargetObject(Dictionary<string, object> args)
         {
             string target = GetStr(args, "target", "project").Trim();
+            object handle;
             if (target.StartsWith("obj:", StringComparison.OrdinalIgnoreCase))
             {
                 int spIdx = target.IndexOf(' ');
                 string key = spIdx > 0 ? target.Substring(0, spIdx) : target;
-                if (_handles.ContainsKey(key)) return _handles[key];
+                if (TryGetHandle(key, out handle)) return handle;
                 throw new InvalidOperationException("Object handle '" + key + "' not found or already released.");
             }
-            if (_handles.ContainsKey(target)) return _handles[target];
             if (string.Equals(target, "tia", StringComparison.OrdinalIgnoreCase)) { EnsureConnected(); return _tia; }
             if (string.Equals(target, "project", StringComparison.OrdinalIgnoreCase)) { EnsureProject(); return _project; }
 
@@ -216,6 +254,10 @@ namespace TiaBridge
             List<PlcTarget> plcs = FindPlcs();
             if (plcs.Count < 2) return;
             string selector = GetStr(args, "target", "project").Trim();
+            Device device = target as Device;
+            if (device != null && selector.StartsWith("device:", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(device.Name, selector.Substring("device:".Length), StringComparison.OrdinalIgnoreCase) &&
+                !plcs.Any(p => object.Equals(p.Device, device))) return;
             string requested = GetStr(args, "plcName", "");
             int colon = selector.IndexOf(':');
             if (string.IsNullOrWhiteSpace(requested) && colon > 0 &&
@@ -258,9 +300,9 @@ namespace TiaBridge
             if (action == "release_handles")
             {
                 string h = GetStr(args, "handle", "");
-                if (!string.IsNullOrEmpty(h)) { _handles.Remove(h); return new Dictionary<string, object> { { "released", h } }; }
+                if (!string.IsNullOrEmpty(h)) { RemoveHandle(h); return new Dictionary<string, object> { { "released", h } }; }
                 int c = _handles.Count;
-                _handles.Clear();
+                ClearHandles();
                 return new Dictionary<string, object> { { "releasedAll", c } };
             }
 

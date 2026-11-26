@@ -68,7 +68,7 @@ class BridgeClient {
     if (plcName && !this.defaultPlcs.has(projectKey)) this.defaultPlcs.set(projectKey, plcName);
     const resolvedPlc = plcName || this.defaultPlcs.get(projectKey) || '';
     const key = JSON.stringify([projectKey, String(resolvedPlc).toLowerCase()]);
-    if (!this.scopes.has(key)) this.scopes.set(key, { tags: {}, dbs: {}, calls: {} });
+    if (!this.scopes.has(key)) this.scopes.set(key, { tags: {}, dbs: {}, udts: {}, calls: {} });
     this.scopeKey = key;
     this.learned.calls = this.scopes.get(key).calls;
   }
@@ -85,7 +85,7 @@ class BridgeClient {
   invalidateObject(name) {
     for (const [key, cache] of this.scopes) {
       if (key !== this.scopeKey) continue;
-      for (const map of [cache.dbs, cache.calls]) for (const entry of Object.keys(map)) if (entry.toLowerCase() === name.toLowerCase()) delete map[entry];
+      for (const map of [cache.dbs, cache.udts, cache.calls]) for (const entry of Object.keys(map)) if (entry.toLowerCase() === name.toLowerCase()) delete map[entry];
     }
   }
 
@@ -100,6 +100,8 @@ class BridgeClient {
   set tagsCache(value) { this.scopes.get(this.scopeKey).tags = value; }
   get dbsCache() { return this.scopes.get(this.scopeKey).dbs; }
   set dbsCache(value) { this.scopes.get(this.scopeKey).dbs = value; }
+  get udtsCache() { return this.scopes.get(this.scopeKey).udts; }
+  set udtsCache(value) { this.scopes.get(this.scopeKey).udts = value; }
 
   ensureStarted() {
     if (this.proc && !this.proc.killed && this.proc.exitCode === null) return;

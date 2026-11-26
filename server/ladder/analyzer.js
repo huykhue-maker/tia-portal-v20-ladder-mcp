@@ -5,6 +5,7 @@ const A = require('./ast');
 const D = require('./dsl');
 const O = require('./operand');
 const S = require('./simulator');
+const L = require('./learn');
 
 function canonicalSymbol(raw) {
   if (!raw) return null;
@@ -65,6 +66,11 @@ function impactAnalysis(blockReads, opts) {
 
 function analyze(blockReads, opts) {
   opts = opts || {};
+  const calleeMap = Object.create(null);
+  for (const [name, entry] of Object.entries(opts.callCatalog || {})) calleeMap[name.toLowerCase()] = entry;
+  for (const { block, interface: iface } of blockReads) {
+    if (block.type === 'FC' || block.type === 'FB') calleeMap[block.name.toLowerCase()] = L.callEntryFromInterface(block.type, iface);
+  }
   const findings = []; const xref = new Map();
   const writes = new Map(); // key -> [{block, nw, kind}]
   const add = (level, code, message, where) => findings.push({ level, code, message, where });
@@ -104,7 +110,7 @@ function analyze(blockReads, opts) {
           writes.get(writeKey).push({ block: bname, nw: n.index, kind, key });
           if (op.k !== 'local') { if (!globalWrite.has(key)) globalWrite.set(key, new Set()); globalWrite.get(key).add(bname); }
         }
-      });
+      }, calleeMap);
       // undeclared locals
       A.walkFlows(n.flows, (op) => {
         if (op && op.k === 'local' && !declared.has(op.path[0])) add('error', 'UNDECLARED', '#' + op.path[0] + ' is not declared in the block interface', bname + ' NW' + n.index);

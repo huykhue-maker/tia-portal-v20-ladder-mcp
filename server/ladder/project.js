@@ -53,9 +53,9 @@ function loadBlocks(directory) {
       const where = name + ' NW' + nw + ': ';
       if (!callee) throw new Error(where + 'missing CALL target ' + target);
       if (callee.block.type !== call.blockType) throw new Error(where + 'CALL expects ' + call.blockType + ' but ' + target + ' is ' + callee.block.type);
-      const pins = ['Input', 'Output', 'InOut', 'Return'].flatMap(section => callee.interface[section] || []);
+      const pins = new Set(['Input', 'Output', 'InOut', 'Return'].flatMap(section => (callee.interface[section] || []).map(m => m.name.toLowerCase())));
       for (const pin of Object.keys(call.args)) {
-        if (!pins.some(p => p.name === pin)) throw new Error(where + 'unknown parameter ' + target + '.' + pin);
+        if (!pins.has(pin.toLowerCase())) throw new Error(where + 'unknown parameter ' + target + '.' + pin);
       }
       visit(target);
     }

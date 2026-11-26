@@ -36,11 +36,21 @@ function parseTime(s) {
 }
 function litValue(op) {
   const v = op.value;
-  if (op.type === 'Bool' || /^(TRUE|FALSE)$/i.test(v)) return /^TRUE$/i.test(v);
+  if (op.type === 'Bool' || /^(TRUE|FALSE)$/i.test(v)) return /^(TRUE|1)$/i.test(v);
   if (op.type === 'Time' || op.type === 'LTime' || op.type === 'S5Time' || /^(?:L?(?:TIME|T)|S5TIME|S5T)#/i.test(v)) return parseTime(v) || 0;
   const h = /^(\d+)#([0-9A-Fa-f_]+)$/.exec(v);
   if (h) return parseInt(h[2].replace(/_/g, ''), parseInt(h[1], 10));
   const n = Number(v); return Number.isNaN(n) ? v : n;
+}
+function startValue(member) {
+  const type = C.dataType(member.type) || member.type;
+  const value = String(member.startValue);
+  if (/^(W?String|W?Char)(?:\[|$)/i.test(type)) {
+    const text = /^(?:[A-Z]+#)?(['"])(.*)\1$/is.exec(value);
+    return text ? text[2].replaceAll(text[1] + text[1], text[1]) : value;
+  }
+  const literal = value.replace(/^(?:[A-Z][A-Z0-9_]*#)(?=-?\d)/i, '');
+  return litValue(O.lit(type, /^(Time|LTime|S5Time)$/i.test(type) ? value : literal.replace(/(?<=\d)_(?=\d)/g, '')));
 }
 const num = v => (typeof v === 'boolean' ? (v ? 1 : 0) : (typeof v === 'number' ? v : (Number(v) || 0)));
 
@@ -56,9 +66,15 @@ class Simulator {
     this.globals = new Map(); this.gTimers = new Map(); this.gCounters = new Map(); this.gInst = new Map();
     this.axes = new Map(); // axisKey -> { pos, vel, enabled, homed, error, activeMove }
     this.mcInst = new Map(); // mcInstKey -> { execPrev, busy, done, aborted, error, target, speed }
-    this.root = new Frame(); this.warnings = new Set(); this.types = opts.types || (() => null);
+    this.root = this.createFrame(this.program.blocks[this.entry]);
+    this.warnings = new Set(); this.types = opts.types || (() => null);
     this.operands = new Map();
     this.prev = new Map(); this.timeline = [];
+  }
+  createFrame(block) {
+    const frame = new Frame();
+    for (const member of (block?.initialMembers || [])) frame.locals.set(O.text(O.local(member.name.split('.'))), startValue(member));
+    return frame;
   }
 
   // Resolve dynamic array indices e.g. #Arr[#i] -> #Arr[2]
@@ -68,7 +84,7 @@ class Simulator {
     for (const [compIdx, dims] of Object.entries(op.idx)) {
       resolvedIdx[compIdx] = dims.map(d => O.lit('DInt', String(Math.trunc(num(this.read(d, f))))));
     }
-    const copy = op.k === 'local' ? O.local(op.path, resolvedIdx) : O.global(op.path, resolvedIdx);
+    const copy = op.k === 'local' ? O.local(op.path, resolvedIdx, op.slice) : O.global(op.path, resolvedIdx, op.slice);
     return O.text(copy);
   }
 
@@ -94,6 +110,17 @@ class Simulator {
   storeOf(op, f) { return op.k === 'local' ? { timers: f.timers, counters: f.counters } : { timers: this.gTimers, counters: this.gCounters }; }
   read(op, f) {
     if (op.k === 'lit') return litValue(op);
+    if (op.slice) {
+      const s = O.parseSlice(op.slice);
+      if (s) {
+        const base = op.k === 'local' ? O.local(op.path, op.idx) : O.global(op.path, op.idx);
+        const raw = (Math.trunc(num(this.read(base, f))) >>> 0);
+        if (s.kind === 'X') return ((raw >>> s.index) & 1) !== 0;
+        if (s.kind === 'B') return (raw >>> (s.index * 8)) & 0xFF;
+        if (s.kind === 'W') return (raw >>> (s.index * 16)) & 0xFFFF;
+        if (s.kind === 'D') return s.index === 0 ? raw : 0;
+      }
+    }
     if (op.path && op.path.length >= 2 && (!op.idx || !Object.keys(op.idx).length)) {
       const base = { k: op.k, path: op.path.slice(0, -1) }, field = op.path[op.path.length - 1];
       const st = this.storeOf(base, f), bk = O.text(base);
@@ -108,6 +135,20 @@ class Simulator {
   }
   write(op, v, f) {
     if (op.k === 'lit') return;
+    if (op.slice) {
+      const s = O.parseSlice(op.slice);
+      if (s) {
+        const base = op.k === 'local' ? O.local(op.path, op.idx) : O.global(op.path, op.idx);
+        let cur = (Math.trunc(num(this.read(base, f))) >>> 0);
+        const iv = typeof v === 'boolean' ? (v ? 1 : 0) : (Math.trunc(num(v)) >>> 0);
+        if (s.kind === 'X') cur = iv ? (cur | (1 << s.index)) >>> 0 : (cur & ~(1 << s.index)) >>> 0;
+        else if (s.kind === 'B') { const sh = s.index * 8; cur = ((cur & ~(0xFF << sh)) | ((iv & 0xFF) << sh)) >>> 0; }
+        else if (s.kind === 'W') { const sh = s.index * 16; cur = ((cur & ~(0xFFFF << sh)) | ((iv & 0xFFFF) << sh)) >>> 0; }
+        else if (s.kind === 'D' && s.index === 0) cur = iv >>> 0;
+        this.write(base, cur, f);
+        return;
+      }
+    }
     const key = this.resolveKey(op, f);
     if (typeof v === 'number' && this.types(op) === 'Bool') v = v !== 0;
     this.mapOf(op, f).set(key, v);
@@ -133,6 +174,15 @@ class Simulator {
         const memKey = this.resolveKey(n.mem, f), map = this.mapOf(n.mem, f); const old = !!map.get(memKey);
         map.set(memKey, rlo);
         return n.t === 'rtrig' ? (rlo && !old) : (!rlo && old);
+      }
+      case 'edgeContact': {
+        const on = !!num(this.read(n.op, f)), previous = !!num(this.read(n.mem, f));
+        this.write(n.mem, on, f);
+        return rlo && (n.rising ? on && !previous : !on && previous);
+      }
+      case 'range': {
+        const [min, value, max] = n.inputs.map(op => num(this.read(op, f)));
+        return rlo && (n.fn === 'IN_RANGE' ? min <= value && value <= max : value < min || value > max);
       }
       case 'cmp': {
         const a = num(this.read(n.a, f)), b = num(this.read(n.b, f));
@@ -179,23 +229,56 @@ class Simulator {
         if (rlo) { const v = this.read(a.src, f); for (const d of a.dst) this.write(d, v === undefined ? 0 : v, f); }
         return this.next(a, rlo, f);
       }
+      case 'select': {
+        if (rlo) {
+          const value = this.read(a.inputs[this.paramBool(a.gate, f) ? 1 : 0], f);
+          this.write(a.dst, value === undefined ? 0 : value, f);
+        }
+        return this.next(a, rlo, f);
+      }
+      case 'latch': {
+        const secondary = a.secondary ? this.paramBool(a.secondary, f) : false;
+        if (secondary || rlo) this.write(a.op, a.fn === 'SR' ? !secondary : secondary, f);
+        const q = !!num(this.read(a.op, f));
+        if (a.out) this.write(a.out, q, f);
+        return this.next(a, q, f);
+      }
       case 'math': {
         let eno = rlo;
         if (rlo) {
-          const x = num(this.read(a.a, f)), y = num(this.read(a.b, f));
-          const type = a.type || this.types(a.dst) || (Number.isInteger(x) && Number.isInteger(y) ? 'Int' : 'Real');
+          const values = C.mathInputs(a).map(op => num(this.read(op, f)));
+          const [x, y] = values;
+          const isBit = a.fn === 'W_AND' || a.fn === 'W_OR' || a.fn === 'W_XOR';
+          const type = a.type || this.types(a.dst) || (isBit ? 'Word' : (values.every(Number.isInteger) ? 'Int' : 'Real'));
+          const bitMask = type === 'Byte' ? 0xFF : (type === 'Word' ? 0xFFFF : 0xFFFFFFFF);
           let r;
           switch (a.fn) {
-            case 'ADD': r = x + y; break;
+            case 'ADD': r = values.reduce((sum, v) => sum + v); break;
             case 'SUB': r = x - y; break;
-            case 'MUL': r = x * y; break;
+            case 'MUL': r = values.reduce((product, v) => product * v); break;
             case 'DIV': if (y === 0) { eno = false; break; } r = INTEGER.has(type) ? Math.trunc(x / y) : x / y; break;
             case 'MOD': if (y === 0) { eno = false; break; } r = x % y; break;
-            case 'MIN': r = Math.min(x, y); break;
-            case 'MAX': r = Math.max(x, y); break;
+            case 'MIN': r = values.reduce((min, v) => Math.min(min, v)); break;
+            case 'MAX': r = values.reduce((max, v) => Math.max(max, v)); break;
+            case 'W_AND': r = (values.reduce((acc, v) => (acc & (Math.trunc(v) >>> 0)) >>> 0, bitMask) & bitMask) >>> 0; break;
+            case 'W_OR': r = (values.reduce((acc, v) => (acc | (Math.trunc(v) >>> 0)) >>> 0, 0) & bitMask) >>> 0; break;
+            case 'W_XOR': r = (values.reduce((acc, v) => (acc ^ (Math.trunc(v) >>> 0)) >>> 0, 0) & bitMask) >>> 0; break;
             default:
           }
           if (eno) eno = this.storeNumber(a.dst, r, type, a.fn, f);
+        }
+        return this.next(a, eno, f);
+      }
+      case 'shift': {
+        let eno = rlo;
+        if (rlo) {
+          const x = Math.trunc(num(this.read(a.src, f))) >>> 0;
+          const n = Math.max(0, Math.trunc(num(this.read(a.count, f))));
+          const type = a.type || this.types(a.dst) || 'Word';
+          const width = (type === 'Byte' || type === 'USInt' || type === 'SInt') ? 8 : ((type === 'Word' || type === 'UInt' || type === 'Int') ? 16 : 32);
+          const mask = width === 8 ? 0xFF : (width === 16 ? 0xFFFF : 0xFFFFFFFF);
+          const r = n >= width ? 0 : (a.fn === 'SHL' ? (((x << n) & mask) >>> 0) : (((x & mask) >>> n) >>> 0));
+          eno = this.storeNumber(a.dst, r, type, a.fn, f);
         }
         return this.next(a, eno, f);
       }
@@ -415,19 +498,21 @@ class Simulator {
     let child;
     if (callee.type === 'FB' && a.inst) {
       const st = a.inst.k === 'local' ? f.inst : this.gInst; const k = this.resolveKey(a.inst, f);
-      if (!st.has(k)) st.set(k, new Frame());
+      if (!st.has(k)) st.set(k, this.createFrame(callee));
       child = st.get(k);
-    } else child = new Frame();
+    } else child = this.createFrame(callee);
     this.resetTemps(callee, child);
     for (const k of Object.keys(a.args)) {
-      const P = a.args[k]; const isOutOnly = (callee.outputs || []).includes(k);
-      if (isOutOnly) continue;
-      child.locals.set('#' + k, this.paramVal(P, f));
+      const key = k.toLowerCase();
+      if ((callee.outputs || []).some(pin => pin.toLowerCase() === key)) continue;
+      const pin = [...(callee.inputs || []), ...(callee.inouts || [])].find(name => name.toLowerCase() === key) || k;
+      child.locals.set(O.text(O.local([pin])), this.paramVal(a.args[k], f));
     }
     this.runFlows(callee.flows, child);
     for (const k of Object.keys(a.args)) {
       const P = a.args[k];
-      if (P.v === 'op' && ((callee.outputs || []).includes(k) || (callee.inouts || []).includes(k))) this.write(P.op, child.locals.get('#' + k), f);
+      const pin = [...(callee.outputs || []), ...(callee.inouts || [])].find(name => name.toLowerCase() === k.toLowerCase());
+      if (P.v === 'op' && pin) this.write(P.op, child.locals.get(O.text(O.local([pin]))), f);
     }
     return this.next(a, true, f);
   }
@@ -492,6 +577,7 @@ function buildProgram(blockReads, entry) {
       inouts: (r.interface.InOut || []).map(m => m.name),
       inputs: (r.interface.Input || []).map(m => m.name),
       temps: (r.interface.Temp || []).map(m => ({ name: m.name, type: m.type })),
+      initialMembers: [...(r.interface.Static || []), ...(r.interface.Constant || [])].filter(m => m.startValue !== undefined),
     };
   }
   return { blocks, entry };

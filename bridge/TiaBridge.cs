@@ -434,7 +434,7 @@ namespace TiaBridge
                 try { if (!_attachedExisting) _tia.Dispose(); } catch { }
                 _tia = null;
                 _project = null;
-                _handles.Clear();
+                ClearHandles();
                 _mode = "none";
                 _attachedExisting = false;
             }
@@ -494,7 +494,7 @@ namespace TiaBridge
                 catch { }
                 _tia = null;
                 _project = null;
-                _handles.Clear();
+                ClearHandles();
                 _mode = "none";
                 _attachedExisting = false;
             }
@@ -525,7 +525,7 @@ namespace TiaBridge
                 {
                     existing.Close();
                     _project = null;
-                    _handles.Clear();
+                    ClearHandles();
                 }
                 else
                 {
@@ -556,7 +556,7 @@ namespace TiaBridge
                 {
                     _tia.Projects[0].Close();
                     _project = null;
-                    _handles.Clear();
+                    ClearHandles();
                 }
                 else
                 {
@@ -595,7 +595,7 @@ namespace TiaBridge
             string name = _project.Name;
             _project.Close();
             _project = null;
-            _handles.Clear();
+            ClearHandles();
             return new Dictionary<string, object> { { "closed", true }, { "project", name } };
         }
 
@@ -632,23 +632,67 @@ namespace TiaBridge
         {
             foreach (DeviceItem item in items)
             {
-                SoftwareContainer sc = item.GetService<SoftwareContainer>();
-                bool isPlc = sc != null && sc.Software is PlcSoftware;
-                if (isPlc || !string.IsNullOrEmpty(item.TypeIdentifier))
+                CollectItemDescription(item, outList);
+            }
+        }
+
+        private static object ReadOptionalAttribute(IEngineeringObject obj, string name)
+        {
+            if (obj == null) return null;
+            try { return obj.GetAttribute(name); }
+            catch (Exception) { return null; }
+        }
+
+        private void CollectItemDescription(DeviceItem item, List<object> outList)
+        {
+            SoftwareContainer sc = item.GetService<SoftwareContainer>();
+            bool isPlc = sc != null && sc.Software is PlcSoftware;
+            List<object> addresses = new List<object>();
+            try
+            {
+                foreach (Address address in item.Addresses)
                 {
-                    outList.Add(new Dictionary<string, object>
+                    try
                     {
-                        { "name", item.Name },
-                        { "typeIdentifier", item.TypeIdentifier },
-                        { "isPlc", isPlc },
-                        { "plcSoftwareName", isPlc ? sc.Software.Name : null }
-                    });
-                }
-                if (item.DeviceItems != null && item.DeviceItems.Count > 0)
-                {
-                    CollectItemDescriptions(item.DeviceItems, outList);
+                        Dictionary<string, object> row = new Dictionary<string, object>
+                        {
+                            { "ioType", address.IoType.ToString() },
+                            { "startAddress", address.StartAddress },
+                            { "length", address.Length }
+                        };
+                        object bitOffset = ReadOptionalAttribute(address as IEngineeringObject, "BitOffset");
+                        if (bitOffset != null) row["bitOffset"] = bitOffset;
+                        addresses.Add(row);
+                    }
+                    catch (EngineeringException) { }
                 }
             }
+            catch (EngineeringException) { }
+
+            object hwId = ReadOptionalAttribute(item, "HardwareIdentifier");
+            List<long> hwIds = new List<long>();
+            try
+            {
+                foreach (HwIdentifier id in item.HwIdentifiers) hwIds.Add(id.Identifier);
+            }
+            catch (EngineeringException) { }
+            hwIds = hwIds.Distinct().ToList();
+            if (hwId == null && hwIds.Count == 1) hwId = hwIds[0];
+            if (isPlc || !string.IsNullOrEmpty(item.TypeIdentifier) || addresses.Count > 0 || hwId != null || hwIds.Count > 0)
+            {
+                Dictionary<string, object> row = new Dictionary<string, object>
+                {
+                    { "name", item.Name },
+                    { "typeIdentifier", item.TypeIdentifier },
+                    { "isPlc", isPlc },
+                    { "plcSoftwareName", isPlc ? sc.Software.Name : null },
+                    { "addresses", addresses }
+                };
+                if (hwId != null) row["hardwareIdentifier"] = hwId;
+                if (hwIds.Count > 0) row["hardwareIdentifiers"] = hwIds;
+                outList.Add(row);
+            }
+            if (item.DeviceItems != null && item.DeviceItems.Count > 0) CollectItemDescriptions(item.DeviceItems, outList);
         }
 
         private object CmdListBlocks(Dictionary<string, object> args)
@@ -1287,9 +1331,8 @@ namespace TiaBridge
             List<string> log = new List<string>();
             bool allowStop = GetBool(args, "allowStopModules", false);
             bool allowDifferent = GetBool(args, "allowDifferentTargetConfiguration", false);
-            DownloadConfigurationDelegate pre = delegate(DownloadConfiguration cfg)
+            DownloadConfigurationDelegate configurePre = delegate(DownloadConfiguration cfg)
             {
-                log.Add("pre: " + cfg.GetType().Name + " (" + cfg.Message + ")");
                 StopModules sm = cfg as StopModules;
                 if (sm != null) {
                     if (!allowStop) throw new InvalidOperationException("Download requires stopping running modules. Set allowStopModules=true explicitly if intended.");
@@ -1316,9 +1359,8 @@ namespace TiaBridge
                     return;
                 }
             };
-            DownloadConfigurationDelegate post = delegate(DownloadConfiguration cfg)
+            DownloadConfigurationDelegate configurePost = delegate(DownloadConfiguration cfg)
             {
-                log.Add("post: " + cfg.GetType().Name + " (" + cfg.Message + ")");
                 StartModules st = cfg as StartModules;
                 if (st != null)
                 {
@@ -1326,10 +1368,19 @@ namespace TiaBridge
                 }
             };
 
+            DownloadConfigurationDelegate pre = LogDownloadConfiguration("pre", log, configurePre);
+            DownloadConfigurationDelegate post = LogDownloadConfiguration("post", log, configurePost);
             DownloadOptions opts = includeHardware ? (DownloadOptions.Hardware | DownloadOptions.Software) : DownloadOptions.Software;
-            DownloadResult res = cfgAddr != null
-                ? dp.Download(targetCfg, cfgAddr, pre, post, opts)
-                : dp.Download(targetCfg, pre, post, opts);
+            DownloadResult res;
+            try
+            {
+                res = cfgAddr != null ? dp.Download(targetCfg, cfgAddr, pre, post, opts) : dp.Download(targetCfg, pre, post, opts);
+            }
+            catch (Exception ex)
+            {
+                if (log.Count == 0) throw;
+                throw new InvalidOperationException(ex.Message + Environment.NewLine + string.Join(Environment.NewLine, log), ex);
+            }
             List<object> msgs = new List<object>();
             CollectDownloadMessages(res.Messages, msgs);
             return new Dictionary<string, object>
@@ -1349,6 +1400,38 @@ namespace TiaBridge
                 { "configLog", log },
                 { "messages", msgs }
             };
+        }
+
+        private static DownloadConfigurationDelegate LogDownloadConfiguration(string phase, List<string> log, DownloadConfigurationDelegate configure)
+        {
+            return delegate(DownloadConfiguration cfg)
+            {
+                string name = phase + ": " + cfg.GetType().Name;
+                log.Add(name + " (" + cfg.Message + ")");
+                try { configure(cfg); }
+                finally
+                {
+                    if (cfg is DownloadSelectionConfiguration) log.Add(name + " " + DescribeDownloadSelection(cfg));
+                }
+            };
+        }
+
+        private static string DescribeDownloadSelection(DownloadConfiguration cfg)
+        {
+            string current = "unavailable";
+            string choices = "unavailable";
+            try
+            {
+                PropertyInfo property = cfg.GetType().GetProperty("CurrentSelection", BindingFlags.Instance | BindingFlags.Public);
+                if (property != null && property.GetIndexParameters().Length == 0)
+                {
+                    Type type = Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType;
+                    if (type.IsEnum) choices = string.Join(", ", Enum.GetNames(type));
+                    if (property.CanRead) current = Convert.ToString(property.GetValue(cfg, null), CultureInfo.InvariantCulture);
+                }
+            }
+            catch (Exception) { }
+            return "CurrentSelection=" + current + "; availableSelections=[" + choices + "]";
         }
 
         private void CollectDownloadMessages(DownloadResultMessageComposition msgs, List<object> outList)

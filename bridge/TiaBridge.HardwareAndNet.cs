@@ -165,12 +165,15 @@ namespace TiaBridge
                     throw new InvalidOperationException("Cannot plug '" + typeId + "' into slot " + slot + " on device '" + plc.Device.Name + "'. Check module compatibility and slot number (S7-1200 expansion slots start at 2, Signal Board is 1, Comm modules are 101..103).");
                 }
                 DeviceItem plugged = rack.PlugNew(typeId, modName, slot);
+                List<object> items = new List<object>();
+                CollectItemDescription(plugged, items);
                 return new Dictionary<string, object>
                 {
                     { "plugged", true },
                     { "name", plugged.Name },
                     { "slot", slot },
-                    { "typeIdentifier", typeId }
+                    { "typeIdentifier", typeId },
+                    { "items", items }
                 };
             }
 
@@ -661,6 +664,78 @@ namespace TiaBridge
                 {
                     { "device", device.Name },
                     { "interface", chosen.Key.Name },
+                    { "changes", changes },
+                    { "warnings", warnings }
+                };
+            }
+
+            if (action == "connect_io_system")
+            {
+                string ioSysName = GetStr(args, "ioSystemName", "");
+                if (string.IsNullOrWhiteSpace(ioSysName)) throw new ArgumentException("ioSystemName is required for connect_io_system.");
+                List<IoSystem> allIoSys = new List<IoSystem>();
+                foreach (Subnet s in _project.Subnets)
+                {
+                    foreach (IoSystem ios in s.IoSystems) allIoSys.Add(ios);
+                }
+                List<IoSystem> matchedIo = allIoSys.Where(x => string.Equals(x.Name, ioSysName, StringComparison.OrdinalIgnoreCase)).ToList();
+                if (matchedIo.Count == 0)
+                {
+                    string avail = allIoSys.Count > 0 ? string.Join(", ", allIoSys.Select(x => x.Name).ToArray()) : "(none)";
+                    throw new InvalidOperationException("IO System '" + ioSysName + "' not found. Available: " + avail);
+                }
+                if (matchedIo.Count > 1) throw new InvalidOperationException("IO System '" + ioSysName + "' is ambiguous (" + matchedIo.Count + " matches).");
+                IoSystem targetIo = matchedIo[0];
+
+                string deviceName = GetStr(args, "deviceName", "");
+                Device device;
+                if (!string.IsNullOrEmpty(deviceName))
+                {
+                    List<Device> matches = AllNetworkDevices().Where(d => string.Equals(d.Name, deviceName, StringComparison.OrdinalIgnoreCase)).ToList();
+                    if (matches.Count != 1) throw new InvalidOperationException("deviceName '" + deviceName + "' matches " + matches.Count + " devices; provide an exact unique name.");
+                    device = matches[0];
+                }
+                else device = ResolvePlc(args, true).Device;
+
+                string ifaceFilter = GetStr(args, "interfaceName", "");
+                List<KeyValuePair<DeviceItem, NetworkInterface>> devNis = new List<KeyValuePair<DeviceItem, NetworkInterface>>();
+                CollectNetworkInterfaces(device.DeviceItems, device.Name, devNis);
+                List<KeyValuePair<DeviceItem, NetworkInterface>> matchesIface = devNis.Where(x =>
+                    (string.IsNullOrEmpty(ifaceFilter) || x.Key.Name.IndexOf(ifaceFilter, StringComparison.OrdinalIgnoreCase) >= 0) &&
+                    x.Value.IoConnectors.Count > 0).ToList();
+                if (matchesIface.Count == 0) throw new InvalidOperationException("No NetworkInterface with IoConnectors found on '" + device.Name + "'.");
+                if (matchesIface.Count > 1) throw new InvalidOperationException("interfaceName '" + ifaceFilter + "' is ambiguous on '" + device.Name + "': " + string.Join(", ", matchesIface.Select(x => x.Key.Name).ToArray()));
+                KeyValuePair<DeviceItem, NetworkInterface> chosen = matchesIface[0];
+
+                List<string> changes = new List<string>();
+                List<string> warnings = new List<string>();
+                IoConnector conn = chosen.Value.IoConnectors[0];
+                if (conn.ConnectedToIoSystem != targetIo)
+                {
+                    conn.ConnectToIoSystem(targetIo);
+                    changes.Add("connected IoConnector to IoSystem '" + targetIo.Name + "'");
+                }
+
+                string pnDeviceName = GetStr(args, "pnDeviceName", "");
+                if (!string.IsNullOrEmpty(pnDeviceName))
+                {
+                    if (chosen.Value.Nodes.Count > 0)
+                    {
+                        try
+                        {
+                            chosen.Value.Nodes[0].SetAttribute("PnDeviceName", pnDeviceName);
+                            changes.Add("PnDeviceName=" + pnDeviceName);
+                        }
+                        catch (Exception ex) { warnings.Add("PnDeviceName='" + pnDeviceName + "' failed: " + ex.Message); }
+                    }
+                    else warnings.Add("PnDeviceName='" + pnDeviceName + "' skipped: interface has no Nodes.");
+                }
+
+                return new Dictionary<string, object>
+                {
+                    { "device", device.Name },
+                    { "interface", chosen.Key.Name },
+                    { "ioSystem", targetIo.Name },
                     { "changes", changes },
                     { "warnings", warnings }
                 };

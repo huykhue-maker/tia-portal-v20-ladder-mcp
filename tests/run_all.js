@@ -14,6 +14,7 @@ const B = require('../server/ladder/block');
 const A = require('../server/ladder/analyzer');
 const S = require('../server/ladder/simulator');
 const X = require('../server/ladder/xml');
+const L = require('../server/ladder/learn');
 
 let passed = 0;
 let total = 0;
@@ -895,6 +896,328 @@ async function main() {
         fs.rmSync(dir, { recursive: true, force: true });
       }
     });
+  });
+
+  await test('Phase 1: FC return signature survives network learning and simulates case-insensitive pins', () => {
+    const fc = B.readBlock(B.createBlockXml({
+      type: 'FC', name: 'FC_Result',
+      interface: {
+        Input: [{ name: 'In1', type: 'Int' }], Output: [{ name: 'Copy', type: 'Int' }],
+        Return: [{ name: 'Ret_Val', type: 'Int' }],
+      },
+      networks: [{ dsl: 'ADD(#In1, 1, #Ret_Val, Int) => MOVE(#In1, #Copy)' }],
+    }).xml);
+    assert.deepStrictEqual(fc.interface.Return.map(m => [m.name, m.type]), [['Ret_Val', 'Int']]);
+    assert.match(fc.doc.src, /<Component Name="FC_Result"/);
+    assert(fc.networks[0].editable);
+    const entry = L.callEntryFromInterface('FC', fc.interface);
+    assert.deepStrictEqual(entry.params.map(p => [p.name, p.section]), [['In1', 'Input'], ['Copy', 'Output'], ['Ret_Val', 'Return']]);
+    assert.deepStrictEqual(L.callEntryFromInterface('FC', { Return: [{ name: 'Ret_Val', type: 'Void' }] }).params, []);
+
+    const learned = L.emptyLearned();
+    learned.calls.FC_Result = entry;
+    L.learnFlgNet(X.parse('<FlgNet><Parts><Call UId="1"><CallInfo Name="FC_Result" BlockType="FC" Version="1.0"><Parameter Name="In1" Section="Input" Type="Int" /></CallInfo></Call></Parts></FlgNet>'), learned);
+    assert.deepStrictEqual(learned.calls.FC_Result, { ...entry, version: '1.0' });
+    const callerXml = B.createBlockXml({
+      type: 'FB', name: 'Caller',
+      interface: { Output: [{ name: 'Result', type: 'Int' }, { name: 'Echo', type: 'Int' }] },
+      networks: [{ dsl: 'CALL("FC_Result", in1=41, COPY=#Echo, RET_VAL=#Result)' }],
+    }, { callCatalog: learned.calls }).xml;
+    assert.match(callerXml, /<Parameter Name="Ret_Val" Section="Return" Type="Int"/);
+    assert.match(callerXml, /<NameCon UId="\d+" Name="Ret_Val"/);
+    const caller = B.readBlock(callerXml.replaceAll('Name="Ret_Val"', 'Name="RET_VAL"').replaceAll('Name="Copy"', 'Name="COPY"'));
+    assert(caller.networks[0].editable);
+    const result = S.runScenario(S.buildProgram([caller, fc], 'Caller'), { steps: [{ run: 1, expect: { '#Result': 42, '#Echo': 41 } }] });
+    assert(result.ok, JSON.stringify(result));
+  });
+
+  await test('Phase 1: CALL XREF and Temp initialization follow the callee pin directions', () => {
+    const callee = B.readBlock(B.createBlockXml({
+      type: 'FC', name: 'FC_Pins', interface: {
+        Input: [{ name: 'InPin', type: 'Int' }], Output: [{ name: 'OutPin', type: 'Int' }], InOut: [{ name: 'IoPin', type: 'Int' }],
+      }, networks: [{ dsl: 'MOVE(#InPin, #OutPin, #IoPin)' }],
+    }).xml);
+    const catalog = { FC_Pins: L.callEntryFromInterface('FC', callee.interface) };
+    const caller = B.readBlock(B.createBlockXml({
+      type: 'FB', name: 'Caller',
+      interface: { Temp: ['Good', 'Bad', 'Both'].map(name => ({ name, type: 'Int' })) },
+      networks: [
+        { dsl: 'CALL("FC_Pins", OutPin=#Good, InPin=1, IoPin=#Both)' },
+        { dsl: 'CALL("FC_Pins", OutPin=#Bad, InPin=#Bad)' },
+        { dsl: 'CALL("FC_Pins", InPin=#Good)' },
+      ],
+    }, { callCatalog: catalog }).xml);
+    for (const [reads, opts] of [[[caller, callee], {}], [[caller], { callCatalog: catalog }], [[caller], {}]]) {
+      const analysis = A.analyze(reads, opts);
+      const warnings = analysis.findings.filter(f => f.code === 'TEMP_READ_BEFORE_WRITE').map(f => f.message.split(' ')[0]);
+      assert.deepStrictEqual(warnings, ['#Both', '#Bad']);
+      const access = symbol => A.analyze(reads, { ...opts, symbol }).xref['#' + symbol].map(x => x.access);
+      assert.deepStrictEqual(access('Good'), ['write', 'read']);
+      assert.deepStrictEqual(access('Bad'), ['read', 'write']);
+      assert.deepStrictEqual(access('Both'), ['read/write']);
+    }
+  });
+
+  await test('Phase 1: DB/UDT and interface retain start values, with fresh simulator frame defaults', () => {
+    const saved = { name: 'Count', type: 'Int', startValue: 0, retain: true };
+    const db = B.parseBlock(B.createDbXml({ name: 'DB_Values', members: [saved] }));
+    assert.deepStrictEqual(db.interface.Static[0], { ...saved, startValue: '0', comment: '' });
+    const udt = B.createDbXml({ kind: 'UDT', name: 'UDT_Values' });
+    const editedUdt = B.parseBlock(B.addMembers(udt, [{ section: 'None', name: 'Mode', type: 'Bool', startValue: false }]));
+    assert.strictEqual(editedUdt.interface.None[0].startValue, 'FALSE');
+    assert.match(B.interfaceText(editedUdt.interface), /Mode:Bool = FALSE/);
+
+    const sampleXml = B.createBlockXml({
+      type: 'FB', name: 'FB_Values',
+      interface: {
+        Static: [{ name: 'Seed', type: 'Int', startValue: 7, retain: true }],
+        Constant: [{ name: 'Limit', type: 'Real', startValue: '1500.0' }],
+        Output: [{ name: 'Count', type: 'Int' }, { name: 'Reading', type: 'Real' }],
+      },
+      networks: [{ dsl: 'ADD(#Seed, 1, #Seed, Int) => MOVE(#Seed, #Count) => MOVE(#Limit, #Reading)' }],
+    }).xml;
+    const patched = B.addMembers(sampleXml, [{ section: 'Constant', name: 'Flag', type: 'Bool', startValue: true }]);
+    assert.match(patched, /Scope="LocalConstant"[^>]*>\s*<Constant Name="Limit"/);
+    assert.match(patched, /Name="Seed" Datatype="Int" Remanence="Retain"/);
+    const sample = B.readBlock(patched, { format: 'both' });
+    assert(sample.networks[0].editable);
+    assert.match(B.interfaceText(sample.interface), /Seed:Int = 7 \[Retain\]/);
+    assert.match(B.interfaceText(sample.interface), /Limit:Real = 1500\.0, Flag:Bool = TRUE/);
+    const catalog = { FB_Values: L.callEntryFromInterface('FB', sample.interface) };
+    const caller = B.readBlock(B.createBlockXml({ type: 'FB', name: 'Parent', networks: [
+      { dsl: 'CALL("FB_Values", inst=#First, Count="CountA", Reading="ReadingA")' },
+      { dsl: 'NO("EnableB") => CALL("FB_Values", inst=#Second, Count="CountB")' },
+    ] }, { callCatalog: catalog }).xml);
+    const nested = S.runScenario(S.buildProgram([sample, caller], 'Parent'), { steps: [
+      { run: 1, expect: { CountA: 8, ReadingA: 1500 } },
+      { set: { EnableB: true }, run: 1, expect: { CountA: 9, CountB: 8, ReadingA: 1500 } },
+    ] });
+    assert(nested.ok, JSON.stringify(nested));
+    const root = S.runScenario(S.buildProgram([sample], 'FB_Values'), { init: { '#Seed': 20, '#Limit': 999 }, steps: [
+      { run: 2, expect: { '#Count': 22, '#Reading': 999, '#Flag': true } },
+    ] });
+    assert(root.ok, JSON.stringify(root));
+  });
+
+  await test('Phase 1: latch, range, select, operand edges and variadic math round-trip and simulate', () => {
+    const dsl = [
+      'NO(#Set) => SR(#SrBit, R1=NO(#Reset), Q=#SrQ)',
+      'NO(#Reset) => RS(#RsBit, S1=NO(#Set)) => COIL(#RsQ)',
+      'NO(#Enable) & IN_RANGE(5, #Value, 10, Int) => COIL(#Inside)',
+      'NO(#Enable) & OUT_RANGE(5, #Value, 10, Int) => COIL(#Outside)',
+      'NO(#Enable) => SEL(#Switch, 10, 20, #Selected, Int)',
+      'NO(#Enable) & PCONTACT(#Signal, #RiseMem) => COIL(#Rise)',
+      'NO(#Enable) & NCONTACT(#Signal, #FallMem) => COIL(#Fall)',
+      'ADD(1, 2, 3, #Sum3, Int), ADD(1, 2, 3, 4, #Sum4, Int)',
+      'MUL(2, 3, 4, #Product, Int), MIN(9, 4, 2, 8, #Min, Int), MAX(3, 8, 2, #Max, Int)',
+      'ADD(1, 2, #Pair, Int), ADD(1, 2, #Value, "GlobalTotal")',
+      'SEL(1, 10, 20, "LiteralSelected", Int)',
+    ];
+    const members = (names, type) => names.split(' ').map(name => ({ name, type }));
+    const xml = B.createBlockXml({ type: 'FB', name: 'Industrial', interface: {
+      Input: [...members('Set Reset Enable Switch Signal', 'Bool'), ...members('Value', 'Int')],
+      Output: [...members('SrQ RsQ Inside Outside Rise Fall', 'Bool'), ...members('Selected Sum3 Sum4 Product Min Max Pair', 'Int')],
+      Static: members('SrBit RsBit', 'Bool'),
+    }, networks: dsl.map(d => ({ dsl: d })) }).xml;
+    // TIA V20 exports the system instructions with uppercase part names and data pins.
+    const exported = xml.replace(/<Part Name="(Sel|Min|Max)"/g, (_, name) => '<Part Name="' + name.toUpperCase() + '"');
+    const block = B.readBlock(exported, { format: 'both' });
+    for (const [i, row] of block.networks.entries()) {
+      assert(row.editable, row.dsl + ' ' + row.notes.join(', '));
+      const expected = dsl[i].replace('"GlobalTotal")', '"GlobalTotal", Int)').replace('SEL(1,', 'SEL(TRUE,');
+      assert.strictEqual(row.dsl, expected);
+    }
+    for (const part of ['Sr', 'Rs', 'InRange', 'OutRange', 'Sel', 'PContact', 'NContact']) assert(xml.includes('<Part Name="' + part + '"'));
+    assert.match(xml, /Name="Card" Type="Cardinality">4</);
+    assert.match(xml, /Name="in4"/);
+    const ascii = block.networks.map(row => row.ascii).join('\n');
+    for (const text of ['SR(', 'RS(', 'IN_RANGE(', 'OUT_RANGE(', 'SEL(', 'PCONTACT(', 'NCONTACT(', '1 + 2 + 3 + 4']) assert(ascii.includes(text), text);
+    const result = S.runScenario(S.buildProgram([block], 'Industrial'), { steps: [
+      { set: { '#Enable': true, '#Set': true, '#Reset': true, '#Value': 5 }, run: 1,
+        expect: { '#SrQ': false, '#RsQ': true, '#Inside': true, '#Outside': false, '#Selected': 10,
+          '#Sum3': 6, '#Sum4': 10, '#Pair': 3, '#Product': 24, '#Min': 2, '#Max': 8, GlobalTotal: 8, LiteralSelected: 20 } },
+      { set: { '#Set': false, '#Reset': false, '#Value': 10, '#Switch': true, '#Signal': true }, run: 1,
+        expect: { '#SrQ': false, '#RsQ': true, '#Inside': true, '#Outside': false, '#Selected': 20, '#Rise': true, '#Fall': false } },
+      { set: { '#Value': 11 }, run: 1, expect: { '#Inside': false, '#Outside': true, '#Rise': false, '#Fall': false } },
+      { set: { '#Signal': false, '#Value': 4, '#Set': true }, run: 1,
+        expect: { '#SrQ': true, '#RsQ': true, '#Inside': false, '#Outside': true, '#Rise': false, '#Fall': true } },
+      { set: { '#Signal': true, '#Enable': false, '#Switch': false, '#Set': false, '#Reset': true }, run: 1,
+        expect: { '#SrQ': false, '#RsQ': false, '#Inside': false, '#Outside': false, '#Selected': 20, '#Rise': false } },
+      { set: { '#Enable': true }, run: 1, expect: { '#Selected': 10, '#Rise': false, '#Fall': false } },
+    ] });
+    assert(result.ok, JSON.stringify(result));
+  });
+
+  await test('Phase 1: MCP initialize instructions, 31 annotated tools and member schemas', () => withMcpServer(async rpc => {
+    const init = (await rpc('initialize', { protocolVersion: '2025-11-25', capabilities: {} })).result;
+    for (const hint of ['tia_project_blueprint', 'tia_analyze_ladder', 'tia_dry_run_ladder', 'list_connections', 'deleting', 'overwriting']) {
+      assert(init.instructions.includes(hint), hint);
+    }
+    const { tools } = (await rpc('tools/list', {})).result;
+    assert.strictEqual(new Set(tools.map(t => t.name)).size, 31);
+    assert.strictEqual(tools.length, 31);
+    for (const tool of tools) for (const hint of ['readOnlyHint', 'destructiveHint', 'idempotentHint', 'openWorldHint']) {
+      assert.strictEqual(typeof tool.annotations?.[hint], 'boolean', tool.name + ' ' + hint);
+    }
+    const tool = name => tools.find(t => t.name === name);
+    assert.strictEqual(tool('tia_analyze_ladder').annotations.readOnlyHint, true);
+    assert.strictEqual(tool('tia_download_and_online').annotations.openWorldHint, true);
+    assert.strictEqual(tool('tia_edit_db_udt').annotations.destructiveHint, true);
+    const props = name => tool(name).inputSchema.properties;
+    for (const schema of [props('tia_edit_db_udt').add, props('tia_edit_block_interface').add, props('tia_create_ladder_block').interface.properties.Constant]) {
+      assert(schema.items.properties.startValue);
+      assert.strictEqual(schema.items.properties.retain.type, 'boolean');
+      assert.strictEqual(schema.items.properties.members.type, 'array');
+    }
+    assert(props('tia_project_blueprint').group);
+    assert(props('tia_project_blueprint').maxLearnBlocks);
+    assert(props('tia_network_config').action.enum.includes('connect_io_system'));
+    assert(props('tia_network_config').ioSystemName);
+    assert(props('tia_network_config').pnDeviceName);
+  }));
+
+  await test('Phase 2: Slice access (.%X/.%B/.%W) and Bitwise/Shift round-trip and simulate', () => {
+    const dsl = [
+      'NO(#Ctrl.%X0) => COIL(#Bit0Out)',
+      'NO(#SetHigh) => COIL(#Status.%X3)',
+      'MOVE(16#AB, #Status.%B1)',
+      'AND_WORD(#WordA, #WordB, #AndOut, Word)',
+      'W_OR(#WordA, #WordB, #WordC, #OrOut, Word)',
+      'XOR_WORD(#WordA, #WordB, #XorOut, Word)',
+      'SHL(#WordA, 2, #ShlOut, Word)',
+      'SHR(#WordB, 1, #ShrOut, Word)',
+    ];
+    const xml = B.createBlockXml({
+      type: 'FB', name: 'FB_BitSlice',
+      interface: {
+        Input: [
+          { name: 'Ctrl', type: 'Word' },
+          { name: 'SetHigh', type: 'Bool' },
+          { name: 'WordA', type: 'Word' },
+          { name: 'WordB', type: 'Word' },
+          { name: 'WordC', type: 'Word' },
+        ],
+        Output: [
+          { name: 'Bit0Out', type: 'Bool' },
+          { name: 'AndOut', type: 'Word' },
+          { name: 'OrOut', type: 'Word' },
+          { name: 'XorOut', type: 'Word' },
+          { name: 'ShlOut', type: 'Word' },
+          { name: 'ShrOut', type: 'Word' },
+        ],
+        Static: [{ name: 'Status', type: 'Word' }],
+      },
+      networks: dsl.map(d => ({ dsl: d })),
+    }).xml;
+    assert(xml.includes('SliceAccessModifier="x0"'));
+    assert(xml.includes('SliceAccessModifier="x3"'));
+    assert(xml.includes('SliceAccessModifier="b1"'));
+    for (const part of ['And', 'Or', 'Xor', 'Shl', 'Shr']) assert(xml.includes('<Part Name="' + part + '"'), part);
+    const block = B.readBlock(xml, { format: 'both' });
+    for (const row of block.networks) assert(row.editable, row.dsl + ' ' + (row.notes || []).join(', '));
+    const res = S.runScenario(S.buildProgram([block], 'FB_BitSlice'), {
+      steps: [{
+        set: { '#Ctrl': 0x0001, '#SetHigh': true, '#WordA': 0x00F0, '#WordB': 0x003C, '#WordC': 0x0003 },
+        run: 1,
+        expect: {
+          '#Bit0Out': true,
+          '#Status': 0xAB08,
+          '#Status.%X3': true,
+          '#Status.%B1': 0xAB,
+          '#AndOut': 0x0030,
+          '#OrOut': 0x00FF,
+          '#XorOut': 0x00CC,
+          '#ShlOut': 0x03C0,
+          '#ShrOut': 0x001E,
+        },
+      }],
+    });
+    assert(res.ok, S.formatResults(res));
+  });
+
+  await test('Phase 2: Nested Struct XML and multi-level UDT type resolution', () => {
+    const dbXml = B.createDbXml({
+      kind: 'GlobalDB', name: 'DB_Line',
+      members: [
+        {
+          name: 'Header', type: 'Struct',
+          members: [
+            { name: 'Speed', type: 'Real', startValue: '12.5', retain: true },
+            { name: 'Enabled', type: 'Bool', startValue: true },
+          ],
+        },
+        { name: 'Motor1', type: '"UDT_Motor"' },
+      ],
+    });
+    assert(dbXml.includes('<Member Name="Header" Datatype="Struct">'));
+    assert(dbXml.includes('<Member Name="Speed" Datatype="Real" Remanence="Retain">'));
+    const parsedDb = B.parseBlock(dbXml);
+    assert(parsedDb.interface.Static.some(m => m.name === 'Header.Speed' && m.type === 'Real' && m.startValue === '12.5' && m.retain === true));
+
+    const udts = {
+      UDT_Motor: { None: [{ name: 'Cfg', type: '"UDT_Cfg"' }, { name: 'Running', type: 'Bool' }] },
+      UDT_Cfg: { None: [{ name: 'MaxSpeed', type: 'Real' }, { name: 'Steps', type: 'Array[0..3] of DInt' }] },
+    };
+    const fbXml = B.createBlockXml({
+      type: 'FB', name: 'FB_UdtTest',
+      interface: {
+        Static: [
+          { name: 'LocalMotor', type: '"UDT_Motor"' },
+          { name: 'SumSpeed', type: 'Real' },
+          { name: 'StepOut', type: 'DInt' },
+        ],
+      },
+      networks: [
+        { dsl: 'ADD("DB_Line".Motor1.Cfg.MaxSpeed, #LocalMotor.Cfg.MaxSpeed, #SumSpeed)' },
+        { dsl: 'ADD("DB_Line".Motor1.Cfg.Steps[1], 10, #StepOut)' },
+      ],
+    }, { dbs: { DB_Line: parsedDb.interface }, udts }).xml;
+    assert(fbXml.includes('<TemplateValue Name="SrcType" Type="Type">Real</TemplateValue>'));
+    assert(fbXml.includes('<TemplateValue Name="SrcType" Type="Type">DInt</TemplateValue>'));
+  });
+
+  await test('Phase 2: Modular blueprint filtering, UDT learning and structuredContent', async () => {
+    const { BridgeClient } = require('../server/bridge_client');
+    const { createToolHandler } = require('../server/handlers');
+    const client = new BridgeClient();
+    const calls = [];
+    const udtXml = B.createDbXml({ kind: 'UDT', name: 'UDT_Axis', members: [{ name: 'TargetPos', type: 'Real' }] });
+    const dbXml = B.createDbXml({ kind: 'GlobalDB', name: 'DB_Axis', members: [{ name: 'Axis1', type: '"UDT_Axis"' }] });
+    const fbXml = B.createBlockXml({ type: 'FB', name: 'FB_Axis', interface: { Input: [{ name: 'En', type: 'Bool' }] } }).xml;
+    client.call = async (cmd, args) => {
+      calls.push({ cmd, args });
+      if (cmd === 'list_devices') return { project: 'DemoProj', devices: [{ name: 'Station_1', items: [{ name: 'PLC_1', isPlc: true, typeIdentifier: 'CPU' }] }] };
+      if (cmd === 'list_blocks') return {
+        plc: 'PLC_1',
+        blocks: [
+          { name: 'FB_Axis', number: 1, type: 'FB', language: 'LAD', group: 'Motion/Axes', isConsistent: true },
+          { name: 'DB_Axis', number: 2, type: 'GlobalDB', language: 'DB', group: 'Motion', isConsistent: true },
+          { name: 'FB_Other', number: 3, type: 'FB', language: 'LAD', group: 'Other', isConsistent: true },
+        ],
+      };
+      if (cmd === 'list_tags') return { plc: 'PLC_1', tables: [{ table: 'Default', tags: [{ name: 'Start', type: 'Bool', address: '%I0.0' }] }] };
+      if (cmd === 'list_types') return { plc: 'PLC_1', types: [{ name: 'UDT_Axis', group: '', isConsistent: true }] };
+      if (cmd === 'list_tech_objects') return { plc: 'PLC_1', technologicalObjects: [] };
+      if (cmd === 'export_block') {
+        fs.writeFileSync(args.outPath, args.blockName === 'DB_Axis' ? dbXml : fbXml, 'utf8');
+        return { path: args.outPath };
+      }
+      if (cmd === 'export_type') {
+        fs.writeFileSync(args.outPath, udtXml, 'utf8');
+        return { path: args.outPath };
+      }
+      throw new Error('Unexpected cmd: ' + cmd);
+    };
+    const { handleTool } = createToolHandler({ bridge: client, onlineBackups: {} });
+    const res = await handleTool('tia_project_blueprint', { group: 'Motion', maxLearnBlocks: 3 });
+    assert.strictEqual(res.json.blocksCount, 2);
+    assert.strictEqual(res.json.totalBlocksCount, 3);
+    assert.strictEqual(res.json.tagsCount, 1);
+    assert.deepStrictEqual(res.json.udts, ['UDT_Axis']);
+    assert.strictEqual(res.json.learnedBlocksCount, 3);
+    assert.strictEqual(res.json.groupFilter, 'Motion');
+    assert(client.udtsCache.UDT_Axis, 'UDT_Axis should be cached in udtsCache');
+    assert(!calls.some(c => c.cmd === 'export_block' && c.args.blockName === 'FB_Other'));
   });
 
   if (suite === 'tia-isolation') {

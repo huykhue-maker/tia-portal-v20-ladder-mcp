@@ -1,7 +1,7 @@
 'use strict';
 // Ladder DSL: tokenizer, parser (text -> AST) and canonical printer (AST -> text).
 
-const { local, global, lit, abs, text } = require('./operand');
+const { local, global, lit, abs, text, parseSlice } = require('./operand');
 const C = require('./catalog');
 
 class DslError extends Error {
@@ -78,6 +78,16 @@ function tokenize(src) {
     idxMap[pathArr.length - 1] = dims;
   }
 
+  function readSlice(pos0) {
+    if (src[i] !== '.' || src[i + 1] !== '%') return null;
+    const m = /^\.%([A-Za-z]\d+)/.exec(src.slice(i));
+    if (!m) throw new DslError('invalid slice access (use .%X0, .%B0, .%W0, .%D0)', src, pos0);
+    const parsed = parseSlice(m[1]);
+    if (!parsed) throw new DslError('invalid slice access ".%' + m[1] + '"', src, pos0);
+    i += m[0].length;
+    return parsed.text;
+  }
+
   function readMembers(pathArr, idxMap, pos0) {
     while (src[i] === '.' && (ID_START.test(src[i + 1] || '') || src[i + 1] === '"')) {
       i++;
@@ -100,14 +110,16 @@ function tokenize(src) {
       const p = [readName(pos)]; const idx = {};
       readSubscript(p, idx, pos);
       readMembers(p, idx, pos);
-      push('op', pos, { op: local(p, idx) });
+      const sl = readSlice(pos);
+      push('op', pos, { op: local(p, idx, sl) });
       continue;
     }
     if (c === '"') {
       const p = [readName(pos)]; const idx = {};
       readSubscript(p, idx, pos);
       readMembers(p, idx, pos);
-      push('op', pos, { op: global(p, idx) });
+      const sl = readSlice(pos);
+      push('op', pos, { op: global(p, idx, sl) });
       continue;
     }
     if (c === '%') {
@@ -145,17 +157,19 @@ function tokenize(src) {
         const p = [head]; const idx = {};
         readSubscript(p, idx, pos);
         readMembers(p, idx, pos);
-        push('op', pos, { op: global(p, idx) });
+        const sl = readSlice(pos);
+        push('op', pos, { op: global(p, idx, sl) });
         continue;
       }
       const full = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*/.exec(src.slice(i))[0];
-      if (src[i + full.length] === '[') {
+      if (src[i + full.length] === '[' || (src[i + full.length] === '.' && src[i + full.length + 1] === '%')) {
         const segs = full.split('.');
         i += full.length;
         const idx = {};
         readSubscript(segs, idx, pos);
         readMembers(segs, idx, pos);
-        push('op', pos, { op: global(segs, idx) });
+        const sl = readSlice(pos);
+        push('op', pos, { op: global(segs, idx, sl) });
         continue;
       }
       push('id', pos, { v: full }); i += full.length; continue;
@@ -328,6 +342,11 @@ class Parser {
     if (!P || P.v !== 'op') this.err(what + ' must be an operand (#local, "tag", %I0.0 or literal)', tok);
     return P.op;
   }
+  typeArg(args, positional, tok) {
+    const named = Object.entries(args.named).find(([k]) => /^(type|srctype)$/i.test(k));
+    const param = named ? named[1] : positional;
+    return param ? cleanTypeArg(this.needOp(param, 'type', tok)) : null;
+  }
   buildCond(up, args, tok) {
     switch (up) {
       case 'NO': case 'NC':
@@ -338,6 +357,12 @@ class Parser {
       case 'RTRIG': case 'FTRIG':
         if (args.pos.length !== 1) this.err(up + '(mem_bit) takes exactly 1 memory-bit operand', tok);
         return { t: up === 'RTRIG' ? 'rtrig' : 'ftrig', mem: this.needOp(args.pos[0], up + ' memory bit', tok) };
+      case 'PCONTACT': case 'NCONTACT':
+        if (args.pos.length !== 2 || Object.keys(args.named).length) this.err(up + '(operand, memory_bit) takes exactly 2 operands', tok);
+        return { t: 'edgeContact', rising: up === 'PCONTACT', op: this.needOp(args.pos[0], up + ' operand', tok), mem: this.needOp(args.pos[1], up + ' memory bit', tok) };
+      case 'IN_RANGE': case 'OUT_RANGE':
+        if (args.pos.length < 3 || args.pos.length > 4) this.err(up + '(min, val, max[, Type]) takes 3 operands and an optional type', tok);
+        return { t: 'range', fn: up, inputs: C.RANGE_PINS.map((pin, i) => this.needOp(args.pos[i], up + ' ' + pin, tok)), type: this.typeArg(args, args.pos[3], tok) };
       default: {
         if (args.pos.length < 2 || args.pos.length > 3) this.err(up + '(a, b[, Type]) takes 2 operands and an optional type', tok);
         const a = this.needOp(args.pos[0], up + ' first operand', tok), b = this.needOp(args.pos[1], up + ' second operand', tok);
@@ -366,6 +391,7 @@ class Parser {
     return this.buildAction(up, args, t);
   }
   buildAction(up, args, tok) {
+    up = C.BITWISE_ALIASES[up] || up;
     if (C.COILS[up]) {
       if (args.pos.length !== 1 || Object.keys(args.named).length) this.err(up + '(operand) takes exactly 1 operand', tok);
       return { t: 'coil', kind: up, op: this.needOp(args.pos[0], up + ' operand', tok) };
@@ -376,13 +402,39 @@ class Parser {
       return { t: 'move', src: ops[0], dst: ops.slice(1) };
     }
     if (C.MATH[up]) {
-      if (args.pos.length < 3 || args.pos.length > 4) this.err(up + '(a, b, dst[, Type]) takes 3 operands and an optional type', tok);
-      const ops = args.pos.slice(0, 3).map((P, i) => this.needOp(P, up + ' argument ' + (i + 1), tok));
-      let type = null;
-      if (args.pos[3]) type = cleanTypeArg(this.needOp(args.pos[3], 'type', tok));
-      const P = args.named.TYPE || args.named.type || args.named.Type;
-      if (P) type = cleanTypeArg(this.needOp(P, 'type', tok));
-      return { t: 'math', fn: up, a: ops[0], b: ops[1], dst: ops[2], type };
+      const variadic = C.VARIADIC_MATH.has(up);
+      if (args.pos.length < 3 || (!variadic && args.pos.length > 4)) this.err(up + '(a, b, dst[, Type]) needs at least 2 inputs and a destination', tok);
+      const pos = args.pos.slice();
+      const last = pos[pos.length - 1];
+      const candidate = last.v === 'op' && cleanTypeArg(last.op);
+      const knownType = candidate && C.dataType(candidate);
+      const explicitType = Object.keys(args.named).some(k => /^(type|srctype)$/i.test(k));
+      // Recognize a trailing PLC type while keeping symbolic destinations valid.
+      const hasType = pos.length > 3 && (!variadic || (knownType && last.op.k === 'global' && !explicitType));
+      const type = this.typeArg(args, hasType ? pos.pop() : null, tok);
+      const ops = pos.map((P, i) => this.needOp(P, up + ' argument ' + (i + 1), tok));
+      const dst = ops.pop();
+      return ops.length === 2 ? { t: 'math', fn: up, a: ops[0], b: ops[1], dst, type } : { t: 'math', fn: up, inputs: ops, dst, type };
+    }
+    if (C.SHIFT[up]) {
+      if (args.pos.length < 3 || args.pos.length > 4) this.err(up + '(in, n, dst[, Type]) takes 3 operands and an optional type', tok);
+      const src = this.needOp(args.pos[0], up + ' input', tok);
+      const count = this.needOp(args.pos[1], up + ' shift count', tok);
+      const dst = this.needOp(args.pos[2], up + ' output', tok);
+      return { t: 'shift', fn: up, src, count, dst, type: this.typeArg(args, args.pos[3], tok) };
+    }
+    if (up === 'SEL') {
+      if (args.pos.length < 4 || args.pos.length > 5) this.err('SEL(G, IN0, IN1, OUT[, Type]) takes 4 operands and an optional type', tok);
+      return { t: 'select', gate: args.pos[0], inputs: args.pos.slice(1, 3).map((P, i) => this.needOp(P, 'SEL IN' + i, tok)),
+        dst: this.needOp(args.pos[3], 'SEL OUT', tok), type: this.typeArg(args, args.pos[4], tok) };
+    }
+    if (C.LATCHES[up]) {
+      const info = C.LATCHES[up];
+      if (args.pos.length < 1 || args.pos.length > 2) this.err(up + '(operand, ' + info.secondary + '=..., Q=...) needs a memory bit', tok);
+      const pins = Object.fromEntries(Object.entries(args.named).map(([k, v]) => [k.toUpperCase(), v]));
+      for (const pin of Object.keys(pins)) if (pin !== info.secondary && pin !== 'Q') this.err(up + ' has no named pin "' + pin + '"', tok);
+      return { t: 'latch', fn: up, op: this.needOp(args.pos[0], up + ' operand', tok), secondary: pins[info.secondary] || args.pos[1],
+        out: pins.Q ? this.needOp(pins.Q, up + ' Q', tok) : null };
     }
     if (C.UNARY_MATH[up]) {
       if (args.pos.length < 2 || args.pos.length > 3) this.err(up + '(src, dst[, Type]) takes 2 operands and an optional type', tok);
@@ -474,6 +526,8 @@ function printCond(n, prec) {
     case 'not': return 'NOT()';
     case 'rtrig': return 'RTRIG(' + opT(n.mem) + ')';
     case 'ftrig': return 'FTRIG(' + opT(n.mem) + ')';
+    case 'edgeContact': return (n.rising ? 'PCONTACT(' : 'NCONTACT(') + opT(n.op) + ', ' + opT(n.mem) + ')';
+    case 'range': return n.fn + '(' + [...n.inputs.map(opT), ...(n.type ? [n.type] : [])].join(', ') + ')';
     case 'cmp': return n.rel + '(' + opT(n.a) + ', ' + opT(n.b) + (n.type ? ', ' + n.type : '') + ')';
     case 'ref': return 'REF(' + n.id + '.' + n.pin + ')';
     case 'open': return 'OPEN()';
@@ -487,7 +541,17 @@ function printAction(a) {
   switch (a.t) {
     case 'coil': s = a.kind + '(' + opT(a.op) + ')'; break;
     case 'move': s = 'MOVE(' + [a.src, ...a.dst].map(opT).join(', ') + ')'; break;
-    case 'math': s = a.fn + '(' + [opT(a.a), opT(a.b), opT(a.dst)].concat(a.type ? [a.type] : []).join(', ') + ')'; break;
+    case 'math': s = a.fn + '(' + [...C.mathInputs(a), a.dst].map(opT)
+      .concat(a.type ? [C.VARIADIC_MATH.has(a.fn) && !C.dataType(a.type) ? 'Type="' + a.type + '"' : a.type] : []).join(', ') + ')'; break;
+    case 'shift': s = a.fn + '(' + [opT(a.src), opT(a.count), opT(a.dst)].concat(a.type ? [a.type] : []).join(', ') + ')'; break;
+    case 'select': s = 'SEL(' + [printParam(a.gate), ...a.inputs.map(opT), opT(a.dst)].concat(a.type ? [a.type] : []).join(', ') + ')'; break;
+    case 'latch': {
+      const args = [opT(a.op)];
+      if (a.secondary) args.push(C.LATCHES[a.fn].secondary + '=' + printParam(a.secondary));
+      if (a.out) args.push('Q=' + opT(a.out));
+      s = a.fn + '(' + args.join(', ') + ')';
+      break;
+    }
     case 'unary': s = a.fn + '(' + [opT(a.src), opT(a.dst)].concat(a.type ? [a.type] : []).join(', ') + ')'; break;
     case 'conv': {
       const info = C.CONV_OPS[a.fn];

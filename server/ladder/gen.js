@@ -10,11 +10,8 @@ const O = require('./operand');
 const FLG_NS = 'http://www.siemens.com/automation/Openness/SW/NetworkSource/FlgNet/v5';
 class GenError extends Error { constructor(msg, code) { super(msg); this.name = 'GenError'; this.code = code || 'E_GEN'; } }
 
-const KNOWN_TYPES = ['Bool', 'Byte', 'Word', 'DWord', 'LWord', 'SInt', 'Int', 'DInt', 'LInt', 'USInt', 'UInt', 'UDInt', 'ULInt', 'Real', 'LReal', 'Time', 'LTime', 'Char', 'WChar', 'String', 'S5Time'];
 function canonType(t) {
-  if (!t) return t;
-  const f = KNOWN_TYPES.find(k => k.toLowerCase() === String(t).toLowerCase());
-  return f || t;
+  return C.dataType(t) || t;
 }
 
 class Gen {
@@ -47,6 +44,7 @@ class Gen {
   // ---------------------------------------------------------------- operands
   typeOf(op) {
     if (!op) return null;
+    if (op.slice) return O.sliceType(op.slice);
     if (op.k === 'lit') return op.type && op.type !== 'auto' ? canonType(op.type) : null;
     if (op.k === 'abs') return canonType(op.type);
     const r = this.ctx.resolveType ? this.ctx.resolveType(op) : null;
@@ -62,9 +60,12 @@ class Gen {
   }
   componentNodes(op) {
     return op.path.map((n, i) => {
+      const attrs = { Name: n };
       const dims = op.idx && op.idx[i];
-      if (!dims || !dims.length) return E('Component', { Name: n });
-      return E('Component', { Name: n, AccessModifier: 'Array' }, dims.map(d => this.accessNode(d, undefined, 'DInt')));
+      if (dims && dims.length) attrs.AccessModifier = 'Array';
+      if (op.slice && i === op.path.length - 1) attrs.SliceAccessModifier = op.slice.toLowerCase();
+      if (!dims || !dims.length) return E('Component', attrs);
+      return E('Component', attrs, dims.map(d => this.accessNode(d, undefined, 'DInt')));
     });
   }
   accessNode(op, uid, hint) {
@@ -72,7 +73,15 @@ class Gen {
     switch (op.k) {
       case 'local':
       case 'global':
+        if (op.k === 'local' && this.ctx.isLocalConstant?.(op)) {
+          attrs.Scope = 'LocalConstant';
+          return E('Access', attrs, E('Constant', { Name: op.path.join('.') }));
+        }
         attrs.Scope = op.k === 'local' ? 'LocalVariable' : 'GlobalVariable';
+        // The FC return pin is Ret_Val at CALL sites and the FC name inside its body.
+        if (op.k === 'local' && this.ctx.fcReturn && op.path.length === 1 && /^Ret_Val$/i.test(op.path[0])) {
+          op = { ...op, path: [this.ctx.fcReturn.blockName] };
+        }
         return E('Access', attrs, E('Symbol', {}, this.componentNodes(op)));
       case 'abs':
         attrs.Scope = 'Address';
@@ -89,7 +98,8 @@ class Gen {
           return E('Access', attrs, E('Constant', {}, [E('ConstantValue', {}, op.value)]));
         }
         attrs.Scope = 'LiteralConstant';
-        return E('Access', attrs, E('Constant', {}, [E('ConstantType', {}, ctype), E('ConstantValue', {}, op.value)]));
+        const value = ctype === 'Bool' && /^[01]$/.test(op.value) ? (op.value === '1' ? 'TRUE' : 'FALSE') : op.value;
+        return E('Access', attrs, E('Constant', {}, [E('ConstantType', {}, ctype), E('ConstantValue', {}, value)]));
       }
       default: throw new GenError('unsupported operand ' + JSON.stringify(op));
     }
@@ -109,7 +119,7 @@ class Gen {
     if (o.instance) content.push(o.instance);
     for (const t of (o.templates || [])) content.push(E('TemplateValue', { Name: t.name, Type: t.type }, String(t.value)));
     for (const n of (o.negated || [])) content.push(E('Negated', { Name: n }));
-    return E('Part', { Name: name, Version: o.version, UId: uid }, content);
+    return E('Part', { Name: name, Version: o.version, UId: uid, DisabledENO: o.disabledEno }, content);
   }
   addPart(name, o) { const uid = this.nid(); this.items.push(this.partNode(name, uid, o)); return uid; }
 
@@ -155,6 +165,23 @@ class Gen {
         this.connect(srcs, this.pin(uid, 'in', 'dst'));
         this.bind(n.mem, this.pin(uid, 'bit', 'dst'), 'read', 'Bool');
         this.noteMem(n.mem);
+        return [this.pin(uid, 'out', 'src')];
+      }
+      case 'edgeContact': {
+        const name = n.rising ? 'PContact' : 'NContact';
+        const uid = this.addPart(name, { version: C.versionFor(name, this.ctx.learned) });
+        this.connect(srcs, this.pin(uid, C.COND_FLOW_IN[name], 'dst'));
+        this.bind(n.op, this.pin(uid, 'operand', 'dst'), 'read', 'Bool');
+        this.bind(n.mem, this.pin(uid, 'bit', 'dst'), 'read', 'Bool');
+        this.noteMem(n.mem);
+        return [this.pin(uid, 'out', 'src')];
+      }
+      case 'range': {
+        const type = this.inferType(n.inputs, n.type, n.fn);
+        const name = C.RANGE[n.fn];
+        const uid = this.addPart(name, { version: C.versionFor(name, this.ctx.learned), templates: C.templatesFor(name, { type }, this.ctx.learned) });
+        this.connect(srcs, this.pin(uid, C.COND_FLOW_IN[name], 'dst'));
+        C.RANGE_PINS.forEach((pin, i) => this.bind(n.inputs[i], this.pin(uid, pin, 'dst'), 'read', type));
         return [this.pin(uid, 'out', 'src')];
       }
       case 'not': {
@@ -206,14 +233,48 @@ class Gen {
         return this.nextFlows(a, this.pin(uid, 'eno', 'src'));
       }
       case 'math': {
-        const type = this.inferType([a.a, a.b, a.dst], a.type, a.fn);
+        const inputs = C.mathInputs(a);
+        const fallback = (a.fn === 'W_AND' || a.fn === 'W_OR' || a.fn === 'W_XOR') ? 'Word' : undefined;
+        const type = this.inferType([...inputs, a.dst], a.type, a.fn, fallback);
         const nm = C.MATH[a.fn];
-        const uid = this.addPart(nm, { version: C.versionFor(nm, this.ctx.learned), templates: C.templatesFor(nm, { type, card: 2 }, this.ctx.learned) });
+        const uid = this.addPart(nm, { version: C.versionFor(nm, this.ctx.learned), templates: C.templatesFor(nm, { type, card: inputs.length }, this.ctx.learned),
+          disabledEno: a.fn === 'MIN' || a.fn === 'MAX' ? 'false' : undefined });
         this.connect(srcs, this.pin(uid, 'en', 'dst'));
-        this.bind(a.a, this.pin(uid, 'in1', 'dst'), 'read', type);
-        this.bind(a.b, this.pin(uid, 'in2', 'dst'), 'read', type);
+        inputs.forEach((op, i) => this.bind(op, this.pin(uid, 'in' + (i + 1), 'dst'), 'read', type));
         this.bind(a.dst, this.pin(uid, 'out', 'src'), 'write');
         return this.nextFlows(a, this.pin(uid, 'eno', 'src'));
+      }
+      case 'shift': {
+        const type = this.inferType([a.src, a.dst], a.type, a.fn, 'Word');
+        const nm = C.SHIFT[a.fn];
+        const uid = this.addPart(nm, { version: C.versionFor(nm, this.ctx.learned), templates: C.templatesFor(nm, { type }, this.ctx.learned) });
+        this.connect(srcs, this.pin(uid, 'en', 'dst'));
+        this.bind(a.src, this.pin(uid, 'in', 'dst'), 'read', type);
+        this.bind(a.count, this.pin(uid, 'n', 'dst'), 'read', 'UInt');
+        this.bind(a.dst, this.pin(uid, 'out', 'src'), 'write');
+        return this.nextFlows(a, this.pin(uid, 'eno', 'src'));
+      }
+      case 'select': {
+        const type = this.inferType([...a.inputs, a.dst], a.type, 'SEL');
+        const uid = this.addPart('Sel', { version: C.versionFor('Sel', this.ctx.learned), templates: C.templatesFor('Sel', { type }, this.ctx.learned) });
+        this.connect(srcs, this.pin(uid, 'en', 'dst'));
+        this.paramPin(a.gate, this.pin(uid, 'g', 'dst'), 'Bool');
+        a.inputs.forEach((op, i) => this.bind(op, this.pin(uid, 'in' + i, 'dst'), 'read', type));
+        this.bind(a.dst, this.pin(uid, 'out', 'src'), 'write');
+        return this.nextFlows(a, this.pin(uid, 'eno', 'src'));
+      }
+      case 'latch': {
+        const info = C.LATCHES[a.fn];
+        const uid = this.addPart(info.part, { version: C.versionFor(info.part, this.ctx.learned) });
+        this.connect(srcs, this.pin(uid, info.main, 'dst'));
+        this.bind(a.op, this.pin(uid, 'operand', 'dst'), 'read', 'Bool');
+        const secondary = this.pin(uid, info.secondary.toLowerCase(), 'dst');
+        if (a.secondary) this.paramPin(a.secondary, secondary, 'Bool');
+        else this.union(this.openPin('src'), secondary);
+        const q = this.pin(uid, 'q', 'src');
+        if (a.out) this.bind(a.out, q, 'write');
+        else if (!a.next?.length) this.union(q, this.openPin('dst'));
+        return this.nextFlows(a, q);
       }
       case 'unary': {
         const defT = ['SIN', 'COS', 'TAN', 'ASIN', 'ACOS', 'ATAN', 'SQRT', 'EXP', 'LN'].includes(a.fn) ? 'Real' : null;
@@ -315,14 +376,14 @@ class Gen {
     this.items.push(E('Call', { UId: uid }, [E('CallInfo', attrs, info)]));
     this.connect(srcs, this.pin(uid, 'en', 'dst'));
     for (const k of Object.keys(a.args)) {
-      const p = cat.params.find(x => x.name === k);
+      const p = cat.params.find(x => x.name.toLowerCase() === k.toLowerCase());
       if (!p) throw new GenError('Block "' + a.name + '" has no parameter "' + k + '". Parameters: ' + cat.params.map(x => x.name + ':' + x.section).join(', '), 'E_CALL');
       const P = a.args[k];
-      if (p.section === 'Input') this.paramPin(P, this.pin(uid, k, 'dst'), p.type);
+      if (p.section === 'Input') this.paramPin(P, this.pin(uid, p.name, 'dst'), p.type);
       else {
         if (P.v !== 'op') throw new GenError('Parameter ' + k + ' of "' + a.name + '" is ' + p.section + '; give it a variable', 'E_CALL');
-        if (p.section === 'InOut') this.bind(P.op, this.pin(uid, k, 'dst'), 'read');
-        else this.bind(P.op, this.pin(uid, k, 'src'), 'write');
+        if (p.section === 'InOut') this.bind(P.op, this.pin(uid, p.name, 'dst'), 'read');
+        else this.bind(P.op, this.pin(uid, p.name, 'src'), 'write');
       }
     }
     return this.nextFlows(a, this.pin(uid, 'eno', 'src'));

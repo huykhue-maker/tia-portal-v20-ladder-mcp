@@ -7,26 +7,30 @@ const C = require('./catalog');
 const O = require('./operand');
 const D = require('./dsl');
 
-function readComponents(comps, notes) {
+function readComponents(comps, notes, fcReturn) {
   const path = [];
   const idx = {};
+  let slice = null;
   comps.forEach((c, i) => {
     path.push(c.attrs.Name);
     const accs = X.kids(c, 'Access');
-    if (accs.length) idx[i] = accs.map(a => readOperand(a, notes));
+    if (accs.length) idx[i] = accs.map(a => readOperand(a, notes, fcReturn));
+    if (c.attrs.SliceAccessModifier) slice = c.attrs.SliceAccessModifier.toUpperCase();
   });
-  return { path, idx };
+  return { path, idx, slice };
 }
 
-function readOperand(el, notes) {
+function readOperand(el, notes, fcReturn) {
   const scope = el.attrs.Scope;
   const sym = X.kid(el, 'Symbol');
   if (sym) {
     const comps = X.kids(sym, 'Component');
     if (comps.length) {
-      const { path, idx } = readComponents(comps, notes);
+      const { path, idx, slice } = readComponents(comps, notes, fcReturn);
+      if (scope === 'LocalVariable' && fcReturn && path.length === 1 &&
+          (path[0]?.toLowerCase() === fcReturn.blockName.toLowerCase() || /^Ret_Val$/i.test(path[0]))) path[0] = fcReturn.member.name;
       if (X.kids(sym, 'Address').length || X.kids(sym, 'AbsoluteOffset').length) notes.push('mixed symbolic/absolute access');
-      return (scope === 'LocalVariable' || scope === 'LocalConstant') ? O.local(path, idx) : O.global(path, idx);
+      return (scope === 'LocalVariable' || scope === 'LocalConstant') ? O.local(path, idx, slice) : O.global(path, idx, slice);
     }
   }
   const addr = X.kid(el, 'Address');
@@ -37,6 +41,7 @@ function readOperand(el, notes) {
   const con = X.kid(el, 'Constant');
   if (con) {
     const type = X.textOf(X.kid(con, 'ConstantType')), value = X.textOf(X.kid(con, 'ConstantValue'));
+    if (scope === 'LocalConstant' && con.attrs.Name) return O.local([con.attrs.Name]);
     if (!value && con.attrs.Name) return O.global([con.attrs.Name]);
     return O.lit(type || 'auto', value);
   }
@@ -90,7 +95,7 @@ function readFlgNet(flg, opts) {
   const partsEl = X.kid(flg, 'Parts');
   for (const el of (partsEl ? partsEl.children : [])) {
     const uid = el.attrs.UId;
-    if (el.name === 'Access') parts.set(uid, { uid, kind: 'access', op: readOperand(el, notes) });
+    if (el.name === 'Access') parts.set(uid, { uid, kind: 'access', op: readOperand(el, notes, opts.fcReturn) });
     else if (el.name === 'Part') {
       const inst = X.kid(el, 'Instance');
       parts.set(uid, {
@@ -119,18 +124,19 @@ function readFlgNet(flg, opts) {
       else { net.members.push({ k: 'open' }); notes.push('unknown wire connection ' + m.name); }
     }
     const idx = nets.push(net) - 1;
-    for (const m of net.members) if (m.k === 'name') pinNet.set(m.uid + ':' + m.pin, idx);
+    for (const m of net.members) if (m.k === 'name') pinNet.set(m.uid + ':' + m.pin.toLowerCase(), idx);
   }
   const isOut = (part, pin) => {
     if (!part) return false;
     if (part.kind === 'call') {
-      if (pin === 'en') return false; if (pin === 'eno') return true;
-      const p = part.params.find(x => x.name === pin);
+      const key = pin.toLowerCase();
+      if (key === 'en') return false; if (key === 'eno') return true;
+      const p = part.params.find(x => x.name.toLowerCase() === key);
       return p ? (p.section === 'Output' || p.section === 'Return') : C.isOutputPin(pin);
     }
     return C.isOutputPin(pin, part.name);
   };
-  const netOf = (uid, pin) => pinNet.get(uid + ':' + pin);
+  const netOf = (uid, pin) => pinNet.get(uid + ':' + pin.toLowerCase());
 
   const condCache = new Map();
   function dataOperand(uid, pin) {
@@ -139,7 +145,7 @@ function readFlgNet(flg, opts) {
     const net = nets[ni];
     const id = net.members.find(m => m.k === 'ident');
     if (id) { const a = parts.get(id.uid); return a && a.kind === 'access' ? a.op : { k: 'raw', value: '?' }; }
-    const src = net.members.find(m => m.k === 'name' && isOut(parts.get(m.uid), m.pin) && !(m.uid === uid && m.pin === pin));
+    const src = net.members.find(m => m.k === 'name' && isOut(parts.get(m.uid), m.pin) && !(m.uid === uid && m.pin.toLowerCase() === pin.toLowerCase()));
     if (src) {
       const sp = parts.get(src.uid);
       if (sp && sp.inst) return sp.inst.k === 'raw' ? sp.inst : { k: sp.inst.k, path: [...sp.inst.path, src.pin], idx: sp.inst.idx };
@@ -148,6 +154,7 @@ function readFlgNet(flg, opts) {
     }
     return null;
   }
+  const operand = (uid, pin) => dataOperand(uid, pin) || { k: 'raw', value: '?' };
   function tpl(part, name) { const t = part.templates.find(x => x.name === name); return t ? t.value : null; }
   function condNode(part) {
     if (condCache.has(part.uid)) return condCache.get(part.uid);
@@ -156,6 +163,12 @@ function readFlgNet(flg, opts) {
       case 'Contact': n = { t: 'contact', op: dataOperand(part.uid, 'operand') || { k: 'raw', value: '?' }, neg: part.negated.has('operand') }; break;
       case 'PBox': n = { t: 'rtrig', mem: dataOperand(part.uid, 'bit') || { k: 'raw', value: '?' } }; break;
       case 'NBox': n = { t: 'ftrig', mem: dataOperand(part.uid, 'bit') || { k: 'raw', value: '?' } }; break;
+      case 'PContact': case 'NContact':
+        n = { t: 'edgeContact', rising: part.name === 'PContact', op: operand(part.uid, 'operand'), mem: operand(part.uid, 'bit') };
+        break;
+      case 'InRange': case 'OutRange':
+        n = { t: 'range', fn: C.RANGE_FROM_PART[part.name], inputs: C.RANGE_PINS.map(pin => operand(part.uid, pin)), type: tpl(part, 'SrcType') };
+        break;
       case 'Not': n = { t: 'not' }; break;
       default: {
         const rel = C.REL_FROM_PART[part.name];
@@ -166,6 +179,7 @@ function readFlgNet(flg, opts) {
   }
   const sigMemo = new Map(), outMemo = new Map(), visiting = new Set();
   function outSignal(uid, pin) {
+    pin = pin.toLowerCase();
     const key = uid + ':' + pin;
     if (outMemo.has(key)) return outMemo.get(key);
     const part = parts.get(uid);
@@ -231,7 +245,8 @@ function readFlgNet(flg, opts) {
     if (part.kind === 'call') return 'eno';
     const bk = C.BOX_FROM_PART[part.name];
     if (bk) return C.BOXES[bk].flowOut;
-    if (part.name === 'Move' || C.MATH_FROM_PART[part.name] || C.UNARY_FROM_PART[part.name] || C.CONV_FROM_PART[part.name]) return 'eno';
+    if (C.LATCH_FROM_PART[part.name]) return 'q';
+    if (part.name === 'Move' || /^sel$/i.test(part.name) || C.MATH_FROM_PART[part.name] || C.SHIFT_FROM_PART[part.name] || C.UNARY_FROM_PART[part.name] || C.CONV_FROM_PART[part.name]) return 'eno';
     return null;
   }
   function buildAction(part) {
@@ -242,12 +257,18 @@ function readFlgNet(flg, opts) {
         const P = paramFrom(u, p.name, p.section === 'Input' ? 'flow' : 'out') || (p.section === 'InOut' ? paramFrom(u, p.name, 'val') : null);
         if (P) args[p.name] = P;
       }
-      return { t: 'call', name: part.name, inst: part.inst, args, blockType: part.blockType };
+      return { t: 'call', name: part.name, inst: part.inst, args, blockType: part.blockType, params: part.params };
     }
     switch (part.name) {
       case 'Coil': return { t: 'coil', kind: part.negated.has('operand') ? 'NCOIL' : 'COIL', op: dataOperand(u, 'operand') || { k: 'raw', value: '?' } };
       case 'SCoil': return { t: 'coil', kind: 'SET', op: dataOperand(u, 'operand') || { k: 'raw', value: '?' } };
       case 'RCoil': return { t: 'coil', kind: 'RESET', op: dataOperand(u, 'operand') || { k: 'raw', value: '?' } };
+      case 'Sr': case 'Rs': {
+        const fn = C.LATCH_FROM_PART[part.name];
+        return { t: 'latch', fn, op: operand(u, 'operand'), secondary: paramFrom(u, C.LATCHES[fn].secondary, 'flow'), out: paramFrom(u, 'Q', 'out')?.op || null };
+      }
+      case 'Sel': case 'SEL': return { t: 'select', gate: paramFrom(u, 'g', 'flow') || { v: 'op', op: { k: 'raw', value: '?' } },
+        inputs: ['in0', 'in1'].map(pin => operand(u, pin)), dst: operand(u, 'out'), type: tpl(part, 'value_type') || tpl(part, 'SrcType') };
       case 'Move': {
         const dst = [];
         for (let i = 1; netOf(u, 'out' + i) !== undefined; i++) {
@@ -260,8 +281,17 @@ function readFlgNet(flg, opts) {
       default:
     }
     if (C.MATH_FROM_PART[part.name]) {
-      if (netOf(u, 'in3') !== undefined) notes.push(part.name + ' with more than 2 inputs');
-      return { t: 'math', fn: C.MATH_FROM_PART[part.name], a: dataOperand(u, 'in1') || { k: 'raw', value: '?' }, b: dataOperand(u, 'in2') || { k: 'raw', value: '?' }, dst: dataOperand(u, 'out') || { k: 'raw', value: '?' }, type: tpl(part, 'SrcType') };
+      const fn = C.MATH_FROM_PART[part.name];
+      const inputs = [operand(u, 'in1'), operand(u, 'in2')];
+      if (C.VARIADIC_MATH.has(fn)) {
+        for (let i = 3; netOf(u, 'in' + i) !== undefined; i++) inputs.push(operand(u, 'in' + i));
+        if (Number(tpl(part, 'Card')) > inputs.length) notes.push(part.name + ' has unconnected inputs');
+      } else if (netOf(u, 'in3') !== undefined) notes.push(part.name + ' with more than 2 inputs');
+      const operands = inputs.length === 2 ? { a: inputs[0], b: inputs[1] } : { inputs };
+      return { t: 'math', fn, ...operands, dst: operand(u, 'out'), type: tpl(part, 'value_type') || tpl(part, 'SrcType') };
+    }
+    if (C.SHIFT_FROM_PART[part.name]) {
+      return { t: 'shift', fn: C.SHIFT_FROM_PART[part.name], src: operand(u, 'in'), count: operand(u, 'n'), dst: operand(u, 'out'), type: tpl(part, 'SrcType') };
     }
     if (C.UNARY_FROM_PART[part.name]) {
       return { t: 'unary', fn: C.UNARY_FROM_PART[part.name], src: dataOperand(u, 'in') || { k: 'raw', value: '?' }, dst: dataOperand(u, 'out') || { k: 'raw', value: '?' }, type: tpl(part, 'SrcType') };
@@ -297,7 +327,7 @@ function readFlgNet(flg, opts) {
     let parent = null, rest = Ex;
     if (items[0].t === 'ref') {
       const pp = parts.get(items[0].id);
-      if (pp && flowOutPin(pp) === items[0].pin && actionPartKind(pp)) { parent = items[0].id; rest = mkAnd(items.slice(1)); }
+      if (pp && flowOutPin(pp)?.toLowerCase() === items[0].pin && actionPartKind(pp)) { parent = items[0].id; rest = mkAnd(items.slice(1)); }
     }
     if (!parent && containsRef(Ex)) notes.push('power flow joins several box outputs at ' + (part.name || '?') + '#' + part.uid);
     if (rest.t === 'open') notes.push('unconnected input on ' + (part.name || '?') + '#' + part.uid);

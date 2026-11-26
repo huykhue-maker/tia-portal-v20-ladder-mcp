@@ -13,7 +13,7 @@ const render = require('./render');
 const { E, ser } = X;
 
 const IF_NS = 'http://www.siemens.com/automation/Openness/SW/Interface/v5';
-const SECTION_ORDER = ['Input', 'Output', 'InOut', 'Static', 'Temp', 'Constant', 'Return'];
+const SECTION_ORDER = ['Input', 'Output', 'InOut', 'Static', 'Temp', 'Constant', 'Return', 'None'];
 
 // ---------------------------------------------------------------- parsing
 function mlText(el, composition) {
@@ -31,8 +31,13 @@ function memberComment(m) {
 function walkMembers(parent, prefix, arr) {
   for (const m of X.kids(parent, 'Member')) {
     const name = prefix + m.attrs.Name;
-    arr.push({ name, type: m.attrs.Datatype || '', comment: memberComment(m) });
+    const member = { name, type: m.attrs.Datatype || '', comment: memberComment(m) };
+    const startValue = X.kid(m, 'StartValue');
+    if (startValue) member.startValue = X.textOf(startValue);
+    if (m.attrs.Remanence !== undefined) member.retain = m.attrs.Remanence === 'Retain';
+    arr.push(member);
     walkMembers(m, name + '.', arr);
+    for (const section of X.kids(X.kid(m, 'Sections'), 'Section')) walkMembers(section, name + '.', arr);
   }
 }
 function parseInterface(blockEl) {
@@ -50,7 +55,7 @@ function allIds(el, acc) {
 function parseBlock(src) {
   const root = X.parse(src);
   if (!root) throw new Error('empty XML');
-  const blockEl = root.children.find(c => /^SW\.Blocks\./.test(c.name));
+  const blockEl = root.children.find(c => /^SW\.Blocks\./.test(c.name) || c.name === 'SW.Types.PlcStruct');
   if (!blockEl) throw new Error('No SW.Blocks.* element in document (root is <' + root.name + '>)');
   const al = X.kid(blockEl, 'AttributeList');
   const attr = n => X.textOf(X.kid(al, n));
@@ -78,31 +83,82 @@ function parseBlock(src) {
 }
 
 // ---------------------------------------------------------------- type resolution
+function fcReturnBinding(block) {
+  if (block.kind !== 'FC') return;
+  const member = block.interface.Return?.find(m => /^Ret_Val$/i.test(m.name) && m.type && !/^Void$/i.test(m.type));
+  if (member) return { blockName: block.name, member };
+}
+
 function stripArrayType(t, hasIdx) {
   if (!t || !hasIdx) return t;
   const m = /^Array\s*\[[^\]]+\]\s*of\s+(.+)$/i.exec(t.trim());
   return m ? m[1].trim().replace(/^"|"$/g, '') : t;
 }
-function makeResolver(b, tags, dbs) {
-  const findLocal = nm => { for (const sec of Object.keys(b.interface)) { const m = b.interface[sec].find(x => x.name === nm); if (m) return m.type; } return null; };
+function lookupByName(map, name) {
+  if (!map || !name) return null;
+  if (Object.prototype.hasOwnProperty.call(map, name)) return map[name];
+  const lower = String(name).toLowerCase();
+  const key = Object.keys(map).find(k => k.toLowerCase() === lower);
+  return key === undefined ? null : map[key];
+}
+function flattenSectionMembers(list, prefix, out) {
+  for (const m of (list || [])) {
+    const name = prefix + m.name;
+    out.push({ ...m, name });
+    if (Array.isArray(m.members) && m.members.length) flattenSectionMembers(m.members, name + '.', out);
+  }
+  return out;
+}
+function makeResolver(b, tags, dbs, udts) {
+  const fcReturn = fcReturnBinding(b);
   const instMember = (type, pin) => {
     const t = /^(TON|TOF|TP|TONR)_/.exec(type || ''); if (t) return pin === 'ET' ? 'Time' : pin === 'Q' ? 'Bool' : null;
     const c = /^(CTU|CTD|CTUD)_(\w+)/.exec(type || ''); if (c) return pin === 'CV' ? c[2].replace(/^INT$/, 'Int').replace(/^DINT$/, 'DInt').replace(/^UINT$/, 'UInt') : /^Q/.test(pin) ? 'Bool' : null;
     return null;
   };
+  const findInSections = (sections, dotted) => {
+    if (!sections) return null;
+    for (const sec of Object.keys(sections)) {
+      const m = (sections[sec] || []).find(x => x.name === dotted || x.name.toLowerCase() === dotted.toLowerCase());
+      if (m) return m.type;
+    }
+    return null;
+  };
+  const resolveNested = (sections, segs, idxMap, offset, depth) => {
+    if (!sections || !segs.length || depth > 10) return null;
+    const full = findInSections(sections, segs.join('.'));
+    if (full) return stripArrayType(full, !!(idxMap && idxMap[offset + segs.length - 1]));
+    for (let k = segs.length - 1; k >= 1; k--) {
+      const baseType = findInSections(sections, segs.slice(0, k).join('.'));
+      if (!baseType) continue;
+      const elemType = stripArrayType(baseType, !!(idxMap && idxMap[offset + k - 1]));
+      const rest = segs.slice(k);
+      if (rest.length === 1) {
+        const im = instMember(elemType, rest[0]);
+        if (im) return im;
+      }
+      const udtName = String(elemType || '').trim().replace(/^"|"$/g, '');
+      const udt = lookupByName(udts, udtName);
+      if (udt) {
+        const resolved = resolveNested(udt, rest, idxMap, offset + k, depth + 1);
+        if (resolved) return resolved;
+      }
+    }
+    return null;
+  };
   return op => {
-    const hasIdx = !!(op.idx && Object.keys(op.idx).length);
     if (op.k === 'local') {
-      const full = findLocal(op.path.join('.')); if (full) return stripArrayType(full, hasIdx);
-      if (op.path.length === 2) { const it = findLocal(op.path[0]); return instMember(it, op.path[1]); }
-      return null;
+      if (fcReturn && op.path.length === 1 && op.path[0].toLowerCase() === fcReturn.blockName.toLowerCase()) return fcReturn.member.type;
+      return resolveNested(b.interface, op.path, op.idx, 0, 0);
     }
     if (op.k === 'global') {
-      if (op.path.length === 1 && tags && tags[op.path[0]]) return stripArrayType(tags[op.path[0]].type, hasIdx);
-      const db = dbs && dbs[op.path[0]];
-      if (db && op.path.length > 1) {
-        const nm = op.path.slice(1).join('.');
-        for (const sec of Object.keys(db)) { const m = db[sec].find(x => x.name === nm); if (m) return stripArrayType(m.type, hasIdx); }
+      if (op.path.length === 1 && tags && tags[op.path[0]]) return stripArrayType(tags[op.path[0]].type, !!(op.idx && op.idx[0]));
+      const db = lookupByName(dbs, op.path[0]);
+      if (db && op.path.length > 1) return resolveNested(db, op.path.slice(1), op.idx, 1, 0);
+      if (op.path.length > 1 && tags && tags[op.path[0]]) {
+        const tagType = stripArrayType(tags[op.path[0]].type, !!(op.idx && op.idx[0]));
+        const udt = lookupByName(udts, String(tagType || '').trim().replace(/^"|"$/g, ''));
+        if (udt) return resolveNested(udt, op.path.slice(1), op.idx, 1, 0);
       }
     }
     return null;
@@ -112,14 +168,18 @@ function makeResolver(b, tags, dbs) {
 // ---------------------------------------------------------------- reading
 function genCtx(b, ctx) {
   ctx = ctx || {};
-  return { callCatalog: ctx.callCatalog || {}, learned: ctx.learned, resolveType: makeResolver(b, ctx.tags, ctx.dbs) };
+  return {
+    callCatalog: ctx.callCatalog || {}, learned: ctx.learned, resolveType: makeResolver(b, ctx.tags, ctx.dbs, ctx.udts),
+    fcReturn: fcReturnBinding(b),
+    isLocalConstant: op => (b.interface.Constant || []).some(m => m.name === op.path.join('.')),
+  };
 }
 function roundtrips(dsl, gctx, localCalls) {
   try {
     const flows = D.parseNetwork(dsl).flows;
-    const c = Object.assign({}, gctx, { callCatalog: Object.assign({}, gctx.callCatalog, localCalls) });
+    const c = { ...gctx, callCatalog: { ...gctx.callCatalog, ...localCalls } };
     const gen = G.generateFlgNet(flows, c);
-    const back = R.readFlgNet(X.parse(gen.xml));
+    const back = R.readFlgNet(X.parse(gen.xml), { fcReturn: gctx.fcReturn });
     return back.dsl === dsl;
   } catch (e) { return false; }
 }
@@ -133,7 +193,7 @@ function readBlock(src, opts) {
     if (want && !want.has(n.index)) continue;
     const row = { index: n.index, title: n.title, comment: n.comment, language: n.lang };
     if (n.flg) {
-      const r = R.readFlgNet(n.flg);
+      const r = R.readFlgNet(n.flg, { fcReturn: gctx.fcReturn });
       if (opts.ctx && opts.ctx.learned) L.learnFlgNet(n.flg, opts.ctx.learned);
       row.dsl = r.dsl; row.flows = r.flows; row.notes = r.notes;
       if (opts.simulationOnly) {
@@ -157,7 +217,9 @@ function interfaceText(iface) {
   const lines = [];
   for (const s of SECTION_ORDER) {
     const m = iface[s]; if (!m || !m.length) continue;
-    lines.push('  ' + s.padEnd(8) + ': ' + m.map(x => x.name + ':' + x.type + (x.comment ? ' //' + x.comment : '')).join(', '));
+    lines.push('  ' + s.padEnd(8) + ': ' + m.map(x => x.name + ':' + x.type
+      + (x.startValue !== undefined ? ' = ' + x.startValue : '') + (x.retain ? ' [Retain]' : '')
+      + (x.comment ? ' //' + x.comment : '')).join(', '));
   }
   return lines.join('\n');
 }
@@ -215,6 +277,8 @@ function setMlText(src, unitEl, composition, text, culture) {
 function checkLocals(b, flows, decls, declare) {
   const have = new Set();
   for (const sec of Object.keys(b.interface)) for (const m of b.interface[sec]) { have.add(m.name.split('.')[0]); }
+  const fcReturn = fcReturnBinding(b);
+  if (fcReturn) have.add(fcReturn.blockName);
   for (const d of (declare || [])) have.add(d.name);
   for (const d of decls) have.add(d.name);
   const missing = new Set();
@@ -235,16 +299,23 @@ function buildNetworkNode(b, dsl, ctx, extra) {
 }
 
 function addMembers(src, add) {
-  // add: [{section,name,type,comment}] ; returns new src
+  // Add members with optional comments, start values, and remanence.
   for (const m of add) {
     const b = parseBlock(src);
     const secs = X.path(b.blockEl, 'AttributeList/Interface/Sections');
     if (!secs) throw new Error('block has no Interface/Sections');
-    if (b.interface[m.section] && b.interface[m.section].find(x => x.name === m.name)) continue;
+    const existing = (b.interface[m.section] || []).find(x => x.name === m.name);
+    const secEl = X.kids(secs, 'Section').find(s => s.attrs.Name === m.section);
+    if (existing) {
+      if (b.kind === 'FC' && m.section === 'Return' && /^Void$/i.test(existing.type) && !/^Void$/i.test(m.type)) {
+        const old = X.kids(secEl, 'Member').find(x => x.attrs.Name === m.name);
+        src = splice(src, old.start, old.end, reindent(ser(mkMemberNode(m, b.culture), 0), indentOf(src, old.start)));
+      }
+      continue;
+    }
     if (b.kind === 'FC' && m.section === 'Static') throw new G.GenError('FC has no Static section; use Temp or a global DB / FB', 'E_DECL');
     if (b.kind === 'OB' && m.section === 'Static') throw new G.GenError('OB has no Static section; use Temp or a global DB', 'E_DECL');
-    const memNode = E('Member', { Name: m.name, Datatype: m.type }, m.comment ? [E('Comment', {}, E('MultiLanguageText', { Lang: b.culture }, m.comment))] : []);
-    const secEl = X.kids(secs, 'Section').find(s => s.attrs.Name === m.section);
+    const memNode = mkMemberNode(m, b.culture);
     if (secEl) {
       const pad = indentOf(src, secEl.start) + '  ';
       const xml = reindent(ser(memNode, 0), pad);
@@ -376,7 +447,17 @@ function defaultSections(type, secondaryType = 'ProgramCycle') {
 function mkMemberNode(m, culture) {
   const attrs = { Name: m.name, Datatype: m.type };
   if (m.informative) attrs.Informative = 'true';
-  return E('Member', attrs, m.comment ? [E('Comment', {}, E('MultiLanguageText', { Lang: culture }, m.comment))] : []);
+  if (m.retain === true) attrs.Remanence = 'Retain';
+  const children = [];
+  if (m.comment) children.push(E('Comment', {}, E('MultiLanguageText', { Lang: culture }, m.comment)));
+  if (m.startValue !== undefined && m.startValue !== null) {
+    const value = typeof m.startValue === 'boolean' ? String(m.startValue).toUpperCase() : String(m.startValue);
+    children.push(E('StartValue', {}, value));
+  }
+  if (Array.isArray(m.members) && m.members.length) {
+    for (const sub of m.members) children.push(mkMemberNode(sub, culture));
+  }
+  return E('Member', attrs, children);
 }
 
 function createBlockXml(spec, ctx) {
@@ -386,11 +467,14 @@ function createBlockXml(spec, ctx) {
   const sections = defaultSections(type, spec.secondaryType);
   for (const s of Object.keys(spec.interface || {})) {
     if (!sections[s]) sections[s] = [];
-    for (const m of spec.interface[s]) sections[s].push({ name: m.name, type: m.type, comment: m.comment });
+    if (type === 'FC' && s === 'Return' && spec.interface[s].length) sections[s] = [];
+    sections[s].push(...spec.interface[s]);
   }
   let idn = 0; const nid = () => hex(++idn);
-  // temporary block context for type resolution / local checks
-  const fakeBlock = { name: spec.name, kind: type, interface: sections };
+  // temporary block context for type resolution / local checks (flatten nested Struct members)
+  const flatSections = {};
+  for (const s of Object.keys(sections)) flatSections[s] = flattenSectionMembers(sections[s], '', []);
+  const fakeBlock = { name: spec.name, kind: type, interface: flatSections };
   const nodes = []; const decls = []; const dbInst = [];
   for (const n of (spec.networks || [])) {
     const flows = n.dsl && n.dsl.trim() ? D.parseNetwork(n.dsl).flows : [];
@@ -459,5 +543,5 @@ function createDbXml(spec) {
 
 module.exports = {
   parseBlock, readBlock, formatBlock, interfaceText, patchNetworks, addMembers, removeMembers, createBlockXml, createDbXml,
-  makeResolver, parseInterface, SECTION_ORDER,
+  makeResolver, parseInterface, fcReturnBinding, SECTION_ORDER,
 };

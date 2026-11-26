@@ -55,7 +55,7 @@ TIA_Portal_V20_MCP/
    - `tia_close_project`: Đóng dự án; `disconnect`/`closeTia` vẫn hoạt động khi phiên chưa mở project.
 
 2. **Dữ liệu & Cấu trúc (6 tools):**
-   - `tia_project_blueprint`: Đọc sơ đồ tổng thể PLC, Blocks, DB, TO, Tags.
+   - `tia_project_blueprint`: Đọc sơ đồ tổng thể PLC, Blocks, DB, TO, Tags (hỗ trợ lọc `group`, giới hạn `maxLearnBlocks`, tự học UDT và trả `structuredContent`).
    - `tia_list_blocks`: Liệt kê các khối OB, FB, FC, DB.
    - `tia_read_tags`: Đọc bảng PLC Tags.
    - `tia_upsert_tags`: Thêm, cập nhật hoặc xóa PLC Tags bằng `delete: ["TagName"]`.
@@ -86,9 +86,27 @@ TIA_Portal_V20_MCP/
 
 6. **Phần cứng, Mạng công nghiệp, PLCSIM Runtime & Escape Hatch (4 tools mới):**
    - `tia_hardware_config`: Tra cứu Hardware Catalog, xem preset mã đặt hàng, thêm CPU PLC (giữ nguyên bảo vệ mặc định, trừ khi yêu cầu thay đổi rõ ràng), cắm module mở rộng vào slot, cấu hình System/Clock Memory Byte, PUT/GET và tạo Technological Object (`TO_PositioningAxis`, `PID_Compact`...).
-   - `tia_network_config`: Kiểm tra cả thiết bị trong DeviceGroups; đặt IP/kết nối Subnet bằng `plcName` hoặc `deviceName`, từ chối tên interface mơ hồ, cấu hình PROFINET IO-System và OPC UA.
+   - `tia_network_config`: Kiểm tra cả thiết bị trong DeviceGroups; đặt IP/kết nối Subnet bằng `plcName` hoặc `deviceName`, từ chối tên interface mơ hồ, cấu hình PROFINET IO-System (`createIoSystem`, `connect_io_system`, `pnDeviceName`) và OPC UA.
    - `tia_plcsim_runtime`: Điều khiển CPU ảo qua S7-PLCSIM Advanced Runtime Manager khi có kết nối API (đăng ký/gắn CPU ảo, Power/Run/Stop, đọc/ghi tín hiệu và chạy kịch bản test).
    - `tia_escape_hatch`: Công cụ phản chiếu động vạn năng trên `IEngineeringObject` — cho phép soi thuộc tính/composition/service/method (`inspect`), đọc/ghi thuộc tính động (`get`/`set`), gọi phương thức (`invoke`) và quản lý handle `obj:N`.
+
+### LAD, interface và I/O trong Đợt 1
+
+- `CALL("FC_X", Ret_Val=#Out)` nối kết quả FC khi section `Return` khai báo `Ret_Val` có kiểu khác `Void`. Blueprint học chữ ký đầy đủ từ interface. Phân tích tĩnh tính `Input` là đọc, `Output` và `Return` là ghi, `InOut` là đọc/ghi.
+- Các tool tạo/sửa DB, UDT và interface nhận `startValue` và `retain`. Ví dụ `{"name":"Speed","type":"Real","startValue":"1500.0","retain":true}` sinh `StartValue` và `Remanence="Retain"`. Dry-run nạp `Static` và `Constant` có giá trị khởi tạo khi tạo frame. `scenario.init` có thể đặt giá trị ban đầu cho frame gốc.
+- Blueprint và thao tác `add_plc`/`plug_module` trả địa chỉ I/O và HwID khi Openness cung cấp. `plug_module` liệt kê cả các mục con để tìm kênh I/O của module.
+- `configLog` của download ghi `CurrentSelection` và các lựa chọn enum của mỗi hộp thoại chọn cấu hình mà Openness báo. Escape Hatch giữ tối đa 500 handle theo thứ tự dùng gần nhất, nhận đường dẫn cho tham số `FileInfo`/`DirectoryInfo` và nhận tham số `Nullable<T>`. Với thiết bị ngoài PLC, dùng `target: "device:<Name>"`.
+- MCP cung cấp `annotations` cho cả 31 tool. `initialize` hướng dẫn đọc blueprint, chạy analyze và dry-run, gọi `list_connections` trước khi download, rồi xác nhận đích và ý định trước khi xóa hoặc ghi đè.
+
+| Lệnh | Ví dụ DSL |
+| --- | --- |
+| Chốt ưu tiên Reset hoặc Set | `NO(#Set) => SR(#Bit, R1=NO(#Reset), Q=#State)` · `NO(#Reset) => RS(#Bit, S1=NO(#Set)) => COIL(#State)` |
+| So sánh khoảng có tính biên | `IN_RANGE(0, #Val, 100, Int) => COIL(#Inside)` · `OUT_RANGE(0, #Val, 100, Int) => COIL(#Outside)` |
+| Chọn dữ liệu theo cờ G | `SEL(#UseHigh, #Low, #High, #Result, Int)` |
+| Slice Access & Bitwise/Shift | `NO(#Ctrl.%X0) => COIL(#Status.%X3)` · `W_AND(#A, #B, #Out, Word)` · `SHL(#A, 2, #Out, Word)` · `SHR(#B, 1, #Out, Word)` |
+| `Struct` lồng nhau & suy luận `UDT` | Khai báo `type: "Struct", members: [...]` trong DB/UDT/interface; tự suy luận kiểu xuyên UDT nhiều cấp (`"DB_Line".Motor1.Cfg.MaxSpeed`) |
+| Bắt cạnh của operand với bit nhớ riêng | `PCONTACT(#Signal, #RiseMem) => COIL(#Rise)` · `NCONTACT(#Signal, #FallMem) => COIL(#Fall)` |
+| Math nhiều đầu vào | `ADD(#A, #B, #C, #D, #Sum, Int)`. `MUL`, `MIN` và `MAX` dùng cùng cú pháp. Dạng hai đầu vào `ADD(#A, #B, #Sum, Int)` vẫn dùng được. |
 
 ---
 

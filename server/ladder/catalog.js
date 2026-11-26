@@ -7,9 +7,24 @@ const REL = { EQ: 'Eq', NE: 'Ne', GT: 'Gt', LT: 'Lt', GE: 'Ge', LE: 'Le' };
 const REL_FROM_PART = { Eq: 'EQ', Ne: 'NE', Gt: 'GT', Lt: 'LT', Ge: 'GE', Le: 'LE' };
 const REL_SYM = { EQ: '==', NE: '<>', GT: '>', LT: '<', GE: '>=', LE: '<=' };
 
-const MATH = { ADD: 'Add', SUB: 'Sub', MUL: 'Mul', DIV: 'Div', MOD: 'Mod', MIN: 'Min', MAX: 'Max' };
-const MATH_FROM_PART = { Add: 'ADD', Sub: 'SUB', Mul: 'MUL', Div: 'DIV', Mod: 'MOD', Min: 'MIN', Max: 'MAX' };
-const MATH_SYM = { ADD: '+', SUB: '-', MUL: '*', DIV: '/', MOD: 'MOD', MIN: 'MIN', MAX: 'MAX' };
+const MATH = { ADD: 'Add', SUB: 'Sub', MUL: 'Mul', DIV: 'Div', MOD: 'Mod', MIN: 'Min', MAX: 'Max', W_AND: 'And', W_OR: 'Or', W_XOR: 'Xor' };
+const MATH_FROM_PART = { Add: 'ADD', Sub: 'SUB', Mul: 'MUL', Div: 'DIV', Mod: 'MOD', Min: 'MIN', Max: 'MAX', MIN: 'MIN', MAX: 'MAX', And: 'W_AND', Or: 'W_OR', Xor: 'W_XOR' };
+const MATH_SYM = { ADD: '+', SUB: '-', MUL: '*', DIV: '/', MOD: 'MOD', MIN: 'MIN', MAX: 'MAX', W_AND: '&', W_OR: '|', W_XOR: '^' };
+const BITWISE_ALIASES = { AND_WORD: 'W_AND', OR_WORD: 'W_OR', XOR_WORD: 'W_XOR' };
+const VARIADIC_MATH = new Set(['ADD', 'MUL', 'MIN', 'MAX', 'W_AND', 'W_OR', 'W_XOR']);
+const SHIFT = { SHL: 'Shl', SHR: 'Shr' };
+const SHIFT_FROM_PART = { Shl: 'SHL', Shr: 'SHR' };
+const mathInputs = a => a.inputs || [a.a, a.b];
+const PLC_TYPES = ['Bool', 'Byte', 'Word', 'DWord', 'LWord', 'SInt', 'Int', 'DInt', 'LInt', 'USInt', 'UInt', 'UDInt', 'ULInt', 'Real', 'LReal', 'Time', 'LTime', 'Char', 'WChar', 'String', 'S5Time'];
+const dataType = type => PLC_TYPES.find(t => t.toLowerCase() === String(type).toLowerCase());
+const RANGE = { IN_RANGE: 'InRange', OUT_RANGE: 'OutRange' };
+const RANGE_FROM_PART = { InRange: 'IN_RANGE', OutRange: 'OUT_RANGE' };
+const RANGE_PINS = ['min', 'in', 'max'];
+const LATCHES = {
+  SR: { part: 'Sr', main: 's', secondary: 'R1' },
+  RS: { part: 'Rs', main: 'r', secondary: 'S1' },
+};
+const LATCH_FROM_PART = { Sr: 'SR', Rs: 'RS' };
 
 // Unary math & trig (single SrcType): FN(in, out[, Type])
 const UNARY_MATH = {
@@ -100,10 +115,12 @@ function boxInstanceType(name, type) {
   return name + '_' + String(type || 'Int').toUpperCase();
 }
 
-const COND_FUNCS = new Set(['NO', 'NC', 'NOT', 'RTRIG', 'FTRIG', 'TRUE', 'EQ', 'NE', 'GT', 'LT', 'GE', 'LE']);
+const COND_FUNCS = new Set(['NO', 'NC', 'NOT', 'RTRIG', 'FTRIG', 'PCONTACT', 'NCONTACT', 'TRUE', ...Object.keys(REL), ...Object.keys(RANGE)]);
 const ACTION_FUNCS = new Set([
-  'COIL', 'NCOIL', 'SET', 'RESET', 'MOVE', 'CALL',
+  'COIL', 'NCOIL', 'SET', 'RESET', 'MOVE', 'CALL', 'SEL', ...Object.keys(LATCHES),
   ...Object.keys(MATH),
+  ...Object.keys(BITWISE_ALIASES),
+  ...Object.keys(SHIFT),
   ...Object.keys(UNARY_MATH),
   ...Object.keys(CONV_OPS),
   ...Object.keys(BOXES),
@@ -119,10 +136,12 @@ function isOutputPin(pin, partName) {
 }
 
 const PART_KIND = {
-  Contact: 'cond', PBox: 'cond', NBox: 'cond', Not: 'cond', O: 'cond',
+  Contact: 'cond', PBox: 'cond', NBox: 'cond', PContact: 'cond', NContact: 'cond', Not: 'cond', O: 'cond',
+  InRange: 'cond', OutRange: 'cond', Sr: 'action', Rs: 'action', Sel: 'action', SEL: 'action',
   Eq: 'cond', Ne: 'cond', Gt: 'cond', Lt: 'cond', Ge: 'cond', Le: 'cond',
   Coil: 'action', SCoil: 'action', RCoil: 'action', Move: 'action',
-  Add: 'action', Sub: 'action', Mul: 'action', Div: 'action', Mod: 'action', Min: 'action', Max: 'action',
+  Add: 'action', Sub: 'action', Mul: 'action', Div: 'action', Mod: 'action', Min: 'action', Max: 'action', MIN: 'action', MAX: 'action',
+  And: 'action', Or: 'action', Xor: 'action', Shl: 'action', Shr: 'action',
   TON: 'action', TOF: 'action', TP: 'action', TONR: 'action', CTU: 'action', CTD: 'action', CTUD: 'action',
 };
 for (const part of Object.values(UNARY_MATH)) PART_KIND[part] = 'action';
@@ -130,10 +149,11 @@ for (const part of Object.keys(CONV_FROM_PART)) PART_KIND[part] = 'action';
 for (const info of Object.values(BOXES)) PART_KIND[info.partName || ''] = 'action';
 delete PART_KIND[''];
 
-const COND_FLOW_IN = { Contact: 'in', PBox: 'in', NBox: 'in', Not: 'in', Eq: 'pre', Ne: 'pre', Gt: 'pre', Lt: 'pre', Ge: 'pre', Le: 'pre' };
+const COND_FLOW_IN = { Contact: 'in', PBox: 'in', NBox: 'in', PContact: 'pre', NContact: 'pre', Not: 'in', Eq: 'pre', Ne: 'pre', Gt: 'pre', Lt: 'pre', Ge: 'pre', Le: 'pre', InRange: 'pre', OutRange: 'pre' };
 const ACTION_FLOW_IN = {
-  Coil: 'in', SCoil: 'in', RCoil: 'in', Move: 'en',
-  Add: 'en', Sub: 'en', Mul: 'en', Div: 'en', Mod: 'en', Min: 'en', Max: 'en',
+  Coil: 'in', SCoil: 'in', RCoil: 'in', Move: 'en', Sel: 'en', SEL: 'en', Sr: LATCHES.SR.main, Rs: LATCHES.RS.main,
+  Add: 'en', Sub: 'en', Mul: 'en', Div: 'en', Mod: 'en', Min: 'en', Max: 'en', MIN: 'en', MAX: 'en',
+  And: 'en', Or: 'en', Xor: 'en', Shl: 'en', Shr: 'en',
 };
 for (const part of Object.values(UNARY_MATH)) ACTION_FLOW_IN[part] = 'en';
 for (const part of Object.keys(CONV_FROM_PART)) ACTION_FLOW_IN[part] = 'en';
@@ -149,8 +169,13 @@ const DEFAULT_TEMPLATES = {
   Mul: [['Card', 'Cardinality'], ['SrcType', 'Type']],
   Div: [['SrcType', 'Type']],
   Mod: [['SrcType', 'Type']],
-  Min: [['Card', 'Cardinality'], ['SrcType', 'Type']],
-  Max: [['Card', 'Cardinality'], ['SrcType', 'Type']],
+  Min: [['Card', 'Cardinality'], ['value_type', 'Type']],
+  Max: [['Card', 'Cardinality'], ['value_type', 'Type']],
+  And: [['Card', 'Cardinality'], ['SrcType', 'Type']],
+  Or: [['Card', 'Cardinality'], ['SrcType', 'Type']],
+  Xor: [['Card', 'Cardinality'], ['SrcType', 'Type']],
+  Shl: [['SrcType', 'Type']],
+  Shr: [['SrcType', 'Type']],
   Convert: [['SrcType', 'Type'], ['DestType', 'DestType']],
   Trunc: [['SrcType', 'Type'], ['DestType', 'DestType']],
   Round: [['SrcType', 'Type'], ['DestType', 'DestType']],
@@ -159,6 +184,7 @@ const DEFAULT_TEMPLATES = {
   Normalize: [['SrcType', 'Type'], ['DestType', 'DestType']],
   Scale_X: [['SrcType', 'Type'], ['DestType', 'DestType']],
   Limit: [['SrcType', 'Type']],
+  InRange: [['SrcType', 'Type']], OutRange: [['SrcType', 'Type']], Sel: [['value_type', 'Type']],
   TON: [['time_type', 'Type']], TOF: [['time_type', 'Type']], TP: [['time_type', 'Type']], TONR: [['time_type', 'Type']],
   CTU: [['value_type', 'Type']], CTD: [['value_type', 'Type']], CTUD: [['value_type', 'Type']],
 };
@@ -173,13 +199,14 @@ const DEFAULT_VERSION = {
 // Parts that never carry a Card template in TIA Portal V20 FlgNet.
 // Emitting Card on fixed-arity boxes makes TIA Portal XML import fail.
 const NO_CARD_PARTS = new Set([
-  'Sub', 'Div', 'Mod',
+  'Sub', 'Div', 'Mod', 'InRange', 'OutRange', 'Shl', 'Shr',
   ...Object.values(UNARY_MATH),
   ...Object.values(CONV_OPS).map(info => info.part),
 ]);
 const DUAL_TYPE_PARTS = new Set(Object.values(CONV_OPS).filter(info => info.dualType).map(info => info.part));
 const TIMER_PARTS = new Set(['TON', 'TOF', 'TP', 'TONR']);
 const COUNTER_PARTS = new Set(['CTU', 'CTD', 'CTUD']);
+const VALUE_TYPE_PARTS = new Set(['Sel', 'Min', 'Max']);
 
 function templatesFor(partName, ctx, learned) {
   const L = learned && learned.parts && learned.parts[partName];
@@ -188,12 +215,16 @@ function templatesFor(partName, ctx, learned) {
     // Mirror what this TIA installation really writes, but never propagate a
     // Card template onto fixed-arity parts (a stale learned Card breaks XML import).
     defs = L.templates
-      .filter(t => !(NO_CARD_PARTS.has(partName) && t.name === 'Card'))
+      .filter(t => !(NO_CARD_PARTS.has(partName) && t.name === 'Card')
+        && !(VALUE_TYPE_PARTS.has(partName) && (t.name === 'SrcType' || (partName === 'Sel' && t.name === 'Card'))))
       .map(t => [t.name, t.type, t.value]);
     if (NO_CARD_PARTS.has(partName) && !defs.some(d => d[0] === 'SrcType')) defs.push(['SrcType', 'Type']);
+    if (VARIADIC_MATH.has(MATH_FROM_PART[partName])) {
+      for (const template of DEFAULT_TEMPLATES[partName]) if (!defs.some(d => d[0] === template[0])) defs.push(template);
+    }
     if (DUAL_TYPE_PARTS.has(partName) && !defs.some(d => d[0] === 'DestType')) defs.push(['DestType', 'DestType']);
     if (TIMER_PARTS.has(partName) && !defs.some(d => d[0] === 'time_type')) defs.push(['time_type', 'Type']);
-    if (COUNTER_PARTS.has(partName) && !defs.some(d => d[0] === 'value_type')) defs.push(['value_type', 'Type']);
+    if ((COUNTER_PARTS.has(partName) || VALUE_TYPE_PARTS.has(partName)) && !defs.some(d => d[0] === 'value_type')) defs.push(['value_type', 'Type']);
   } else {
     defs = DEFAULT_TEMPLATES[partName] || [];
   }
@@ -214,7 +245,8 @@ function versionFor(partName, learned) {
 
 module.exports = {
   REL, REL_FROM_PART, REL_SYM,
-  MATH, MATH_FROM_PART, MATH_SYM,
+  MATH, MATH_FROM_PART, MATH_SYM, BITWISE_ALIASES, VARIADIC_MATH, SHIFT, SHIFT_FROM_PART, mathInputs, dataType,
+  RANGE, RANGE_FROM_PART, RANGE_PINS, LATCHES, LATCH_FROM_PART,
   UNARY_MATH, UNARY_FROM_PART,
   CONV_OPS, CONV_FROM_PART,
   COILS, BOXES, BOX_FROM_PART, MOTION_OUT_PINS, boxInstanceType,

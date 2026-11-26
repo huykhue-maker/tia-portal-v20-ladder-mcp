@@ -8,14 +8,33 @@
 const SIMPLE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const fmtName = n => (SIMPLE.test(n) ? n : '"' + n + '"');
 
-function local(path, idx) {
+const SLICE_LIMITS = { X: 63, B: 7, W: 3, D: 1 };
+const SLICE_TYPES = { X: 'Bool', B: 'Byte', W: 'Word', D: 'DWord' };
+function parseSlice(raw) {
+  if (!raw) return null;
+  const m = /^([XBWD])(\d+)$/i.exec(String(raw).trim());
+  if (!m) return null;
+  const kind = m[1].toUpperCase(), index = parseInt(m[2], 10);
+  if (index < 0 || index > SLICE_LIMITS[kind]) return null;
+  return { kind, index, text: kind + index };
+}
+function sliceType(raw) {
+  const s = parseSlice(raw);
+  return s ? SLICE_TYPES[s.kind] : null;
+}
+
+function local(path, idx, slice) {
   const op = { k: 'local', path: Array.isArray(path) ? path : [path] };
   if (idx && Object.keys(idx).length) op.idx = idx;
+  const s = parseSlice(slice);
+  if (s) op.slice = s.text;
   return op;
 }
-function global(path, idx) {
+function global(path, idx, slice) {
   const op = { k: 'global', path: Array.isArray(path) ? path : [path] };
   if (idx && Object.keys(idx).length) op.idx = idx;
+  const s = parseSlice(slice);
+  if (s) op.slice = s.text;
   return op;
 }
 const lit = (type, value) => ({ k: 'lit', type, value: String(value) });
@@ -36,9 +55,9 @@ function text(op) {
   if (!op) return '?';
   switch (op.k) {
     case 'local':
-      return '#' + op.path.map((p, i) => fmtComp(p, i, op.idx, false)).join('.');
+      return '#' + op.path.map((p, i) => fmtComp(p, i, op.idx, false)).join('.') + (op.slice ? '.%' + op.slice : '');
     case 'global':
-      return op.path.map((p, i) => fmtComp(p, i, op.idx, i === 0)).join('.');
+      return op.path.map((p, i) => fmtComp(p, i, op.idx, i === 0)).join('.') + (op.slice ? '.%' + op.slice : '');
     case 'abs': {
       const w = WIDTH_OF[op.type] || 'W';
       const letter = AREA_LETTER[op.area] || '?';
@@ -62,4 +81,4 @@ function literalType(op) {
   return null;
 }
 
-module.exports = { local, global, lit, abs, text, key, isLocal, literalType, fmtName, WIDTH_OF, DEFAULT_TYPE_OF_WIDTH, AREA_LETTER };
+module.exports = { local, global, lit, abs, text, key, isLocal, literalType, fmtName, parseSlice, sliceType, WIDTH_OF, DEFAULT_TYPE_OF_WIDTH, AREA_LETTER };

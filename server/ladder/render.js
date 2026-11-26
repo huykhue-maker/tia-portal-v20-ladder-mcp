@@ -2,6 +2,7 @@
 // ASCII ladder renderer (series / parallel layout) for readable previews.
 const O = require('./operand');
 const C = require('./catalog');
+const D = require('./dsl');
 
 const blk = (lines, mid) => ({ lines, mid, w: lines.reduce((m, l) => Math.max(m, l.length), 0), h: lines.length });
 const leaf = s => blk([s], 0);
@@ -47,6 +48,7 @@ function condLeaf(n) {
     case 'contact': return leaf(n.neg ? '[/ ' + O.text(n.op) + ' ]' : '[ ' + O.text(n.op) + ' ]');
     case 'rtrig': return leaf('[P_TRIG ' + O.text(n.mem) + ']');
     case 'ftrig': return leaf('[N_TRIG ' + O.text(n.mem) + ']');
+    case 'edgeContact': case 'range': return leaf('[' + D.printCond(n, 0) + ']');
     case 'not': return leaf('[NOT]');
     case 'cmp': return leaf('[' + O.text(n.a) + ' ' + C.REL_SYM[n.rel] + ' ' + O.text(n.b) + ']');
     case 'ref': return leaf('[<' + n.id + '.' + n.pin + '>]');
@@ -65,7 +67,9 @@ function actionText(a) {
   switch (a.t) {
     case 'coil': return ({ COIL: '( ', NCOIL: '(/ ', SET: '(S ', RESET: '(R ' })[a.kind] + O.text(a.op) + ' )';
     case 'move': return '[MOVE ' + O.text(a.src) + ' => ' + a.dst.map(O.text).join(',') + ']';
-    case 'math': return '[' + a.fn + ' ' + O.text(a.a) + ' ' + (C.MATH_SYM[a.fn] || ',') + ' ' + O.text(a.b) + ' => ' + O.text(a.dst) + ']';
+    case 'math': return '[' + a.fn + ' ' + C.mathInputs(a).map(O.text).join(' ' + (C.MATH_SYM[a.fn] || ',') + ' ') + ' => ' + O.text(a.dst) + ']';
+    case 'shift': return '[' + a.fn + ' ' + O.text(a.src) + ', ' + O.text(a.count) + ' => ' + O.text(a.dst) + ']';
+    case 'latch': case 'select': return '[' + D.printAction({ ...a, next: [] }) + ']';
     case 'unary': return '[' + a.fn + ' ' + O.text(a.src) + ' => ' + O.text(a.dst) + ']';
     case 'conv': return '[' + a.fn + ' ' + a.ins.map(O.text).join(', ') + ' => ' + O.text(a.out) + ']';
     case 'box': {
