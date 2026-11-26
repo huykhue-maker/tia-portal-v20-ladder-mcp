@@ -3,7 +3,7 @@ name: tia-ladder-engineer
 description: >-
   Closed-loop engineering workflow for Siemens TIA Portal V20 PLC development,
   reading half-finished projects, surgical Ladder (LAD) editing, static verification,
-  in-RAM scan-cycle dry-run simulation, compilation, and S7-PLCSIM V20 download.
+  in-RAM scan-cycle dry-run simulation, compilation, and carefully targeted S7-PLCSIM V20 download.
   Use whenever the user works with TIA Portal V20, S7-1200/S7-1500, Ladder Logic (LAD),
   or PLCSIM V20 via the `tia-portal-v20` MCP server.
 ---
@@ -16,9 +16,15 @@ description: >-
 1. `tia_status` -> `tia_open_project` -> `tia_project_blueprint`
 2. `tia_read_ladder(blockName, format="both")`
 3. `tia_patch_ladder_network` / `tia_create_ladder_block` / `tia_edit_block_interface`
-4. `tia_analyze_ladder` (quét Double Coil, Timer/Edge reuse, Cross-Reference)
+4. `tia_analyze_ladder` (quét Double Coil, Timer/Edge reuse, Cross-Reference; truyền `targetSymbol`/`targetBlock` và `manifestPath` để xem Impact Analysis trước khi sửa)
 5. `tia_dry_run_ladder` (mô phỏng chu kỳ quét PLC tức thì trong RAM với kịch bản test)
 6. `tia_compile(enableSimulation=true)` -> sửa nếu có lỗi
-7. `tia_sim_prepare` -> `tia_download_and_online(action="download")` -> `tia_save_project`
+7. `tia_sim_prepare` -> `tia_download_and_online(action="list_connections", plcName="...")` -> chọn tên `pcInterface` chính xác -> `tia_download_and_online(action="download", plcName="...", pcInterface="...")` -> `tia_save_project`
 
-Với bộ hồi quy nhiều block XML offline, gọi `tia_test_ladder_project` với `manifestPath` trỏ đến suite JSON. Dùng `format: "json"` để kiểm tra `ok`, từng assertion và timeline. Ví dụ hoàn chỉnh ở `examples/inspection/suite.json`.
+Khi thêm CPU **chỉ trong project thử nghiệm** bằng `tia_hardware_config(action="add_plc")`, bảo vệ được giữ nguyên theo mặc định. Nếu hardware compile báo thiếu cấu hình bảo vệ và đã được phép dùng cấu hình mô phỏng, truyền `disableSecurity: true` lúc `add_plc` hoặc `cpu_properties`, sau đó compile lại. Không áp dụng cờ này cho project sản xuất.
+
+Trước khi download, chạy `list_connections` để lấy tên `pcInterface` chính xác. `download` bắt buộc có `plcName` và `pcInterface`; PLC vật lý còn cần `targetAddress`. Mặc định chỉ nạp Software, không khởi động CPU, không dừng module đang chạy và không chấp nhận cấu hình đích khác. Chỉ bật `includeHardware`, `startAfterDownload`, `allowStopModules`, `allowDifferentTargetConfiguration` khi đúng mục đích và kiểm tra `configLog` trong kết quả.
+
+S7-PLCSIM V20 GUI dùng SIM Table CSV từ `tia_sim_prepare` để theo dõi/đổi tín hiệu. `tia_plcsim_runtime` dùng API của S7-PLCSIM Advanced và chỉ điều khiển được khi `status.runtimeAvailable` là `true`.
+
+Với bộ hồi quy nhiều block XML offline, gọi `tia_test_ladder_project` với `manifestPath` trỏ đến suite JSON. Truyền `targetSymbol` hoặc `targetBlock` để nhận các network bị ảnh hưởng và `suggestedCases`. Dùng `format: "json"` để kiểm tra `ok`, từng assertion và timeline. Ví dụ hoàn chỉnh ở `examples/inspection/suite.json`.

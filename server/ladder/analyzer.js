@@ -2,7 +2,66 @@
 // Static analysis over Ladder blocks: double coils, set/reset balance, undeclared / unused variables,
 // timer & edge-memory reuse, cross-reference.
 const A = require('./ast');
+const D = require('./dsl');
 const O = require('./operand');
+const S = require('./simulator');
+
+function canonicalSymbol(raw) {
+  if (!raw) return null;
+  const trimmed = String(raw).trim();
+  if (!trimmed) return null;
+  try {
+    const op = D.parseOperandString(trimmed);
+    return { key: O.text(op).toLowerCase(), isLocal: op.k === 'local' };
+  } catch {
+    return { key: trimmed.toLowerCase(), isLocal: trimmed.startsWith('#') };
+  }
+}
+
+function impactAnalysis(blockReads, opts) {
+  const targetSym = canonicalSymbol(opts.targetSymbol);
+  const targetBlock = opts.targetBlock && opts.targetBlock.toLowerCase();
+  if (!targetSym && !targetBlock) return null;
+  const edges = new Map(), direct = [], callSites = [], affected = new Set();
+  for (const r of blockReads) {
+    const name = r.block.name;
+    const isTargetBlock = !!(targetBlock && name.toLowerCase() === targetBlock);
+    edges.set(name, new Set());
+    if (isTargetBlock) affected.add(name);
+    for (const n of r.networks) {
+      if (!n.flows || n.dsl === null) continue;
+      const reasons = [];
+      const checkLocalScope = !targetSym || !targetSym.isLocal || !targetBlock || isTargetBlock;
+      if (targetSym && checkLocalScope) A.walkFlows(n.flows, op => {
+        if (op && op.k !== 'lit' && op.k !== 'raw' && O.text(op).toLowerCase() === targetSym.key && !reasons.includes('symbol')) reasons.push('symbol');
+      });
+      for (const call of S.calls(n.flows)) {
+        edges.get(name).add(call.name);
+        callSites.push({ block: name, nw: n.index, calls: call.name });
+        if (targetBlock && call.name.toLowerCase() === targetBlock) reasons.push('CALL ' + call.name);
+      }
+      if (reasons.length) { direct.push({ block: name, nw: n.index, reasons }); affected.add(name); }
+    }
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [name, callees] of edges) if (!affected.has(name) && [...callees].some(c => affected.has(c))) { affected.add(name); changed = true; }
+  }
+  for (const site of callSites) if (affected.has(site.calls) && !direct.some(n => n.block === site.block && n.nw === site.nw)) direct.push({ block: site.block, nw: site.nw, reasons: ['CALL affected ' + site.calls] });
+  direct.sort((a, b) => a.block.localeCompare(b.block) || a.nw - b.nw);
+  const callers = callSites.filter(site => affected.has(site.calls)).map(site => ({ block: site.block, nw: site.nw, calls: site.calls }));
+  const cases = (opts.cases || []).filter(test => {
+    const entry = test.entry || opts.entry;
+    if (affected.has(entry)) return true;
+    if (!targetSym) return false;
+    if (targetSym.isLocal && targetBlock && (!entry || entry.toLowerCase() !== targetBlock)) return false;
+    const maps = [test.init || {}, ...(test.steps || []).flatMap(step => [step.set || {}, step.expect || {}, step.until || {}])];
+    const names = [...Object.keys(Object.assign({}, ...maps)), ...(test.watch || [])];
+    return names.some(s => { const cs = canonicalSymbol(s); return cs && cs.key === targetSym.key; });
+  }).map(test => test.name);
+  return { targetSymbol: opts.targetSymbol || null, targetBlock: opts.targetBlock || null, networks: direct, affectedBlocks: [...affected].sort(), callers, suggestedCases: cases };
+}
 
 function analyze(blockReads, opts) {
   opts = opts || {};
@@ -77,6 +136,8 @@ function analyze(blockReads, opts) {
     out.xref = {};
     for (const [k, v] of xref) if (k.replace(/["#]/g, '').toLowerCase().includes(q)) out.xref[k] = v;
   } else out.xrefCount = xref.size;
+  const impact = impactAnalysis(blockReads, opts);
+  if (impact) out.impact = impact;
   return out;
 }
 
@@ -84,7 +145,12 @@ function formatAnalysis(a) {
   const lines = ['ANALYSIS: ' + a.summary.error + ' error(s), ' + a.summary.warning + ' warning(s), ' + a.summary.info + ' info'];
   for (const f of a.findings) lines.push('  [' + f.level.toUpperCase() + '] ' + f.code + ': ' + f.message + (f.where ? '  @ ' + f.where : ''));
   if (a.xref) for (const [k, v] of Object.entries(a.xref)) lines.push('XREF ' + k + ': ' + v.map(x => x.block + ' NW' + x.nw + ' (' + x.access + ')').join('; '));
+  if (a.impact) {
+    lines.push('IMPACT: ' + a.impact.affectedBlocks.join(', '));
+    for (const n of a.impact.networks) lines.push('  ' + n.block + ' NW' + n.nw + ': ' + n.reasons.join(', '));
+    lines.push('SUGGESTED CASES: ' + (a.impact.suggestedCases.join(', ') || '(none)'));
+  }
   return lines.join('\n');
 }
 
-module.exports = { analyze, formatAnalysis };
+module.exports = { analyze, impactAnalysis, formatAnalysis };

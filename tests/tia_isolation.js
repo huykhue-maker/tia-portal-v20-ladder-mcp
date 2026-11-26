@@ -44,10 +44,18 @@ module.exports = async function testTiaIsolation(withMcpServer) {
       await success('tia_connect', { mode: 'headless' });
       connected = true;
       await createProject('ProjectA');
-      await createPlc(plcA);
+      const createdA = await createPlc(plcA);
+      assert(!/Security settings applied:/.test(createdA), 'add_plc must preserve CPU security unless explicitly requested');
       await createBlock(); // Single PLC is unambiguous.
       const backupA = await edit();
       await createPlc(plcB);
+      const connections = await call('tia_download_and_online', { action: 'list_connections', plcName: plcA });
+      assert(!connections.isError);
+      const available = connections.structuredContent.modes.flatMap(mode => mode.pcInterfaces.map(pc => ({ ...pc, mode: mode.name }))).find(pc => pc.targetInterfaces.length);
+      if (available) {
+        await denied('tia_download_and_online', { action: 'download', plcName: plcA, mode: available.mode, pcInterface: available.name, targetInterfaceIndex: 9999, targetAddress: '127.0.0.1' }, /targetInterfaceIndex/);
+      }
+      await denied('tia_download_and_online', { action: 'go_online', plcName: plcA, pcInterface: 'No Such Interface' }, /Exact PC interface name/);
       await createBlock(plcB);
       await denied('tia_patch_ladder_network', patch, /specify plcName/);
       await denied('tia_rollback_block', rollback(undefined, backupA), /specify plcName/);

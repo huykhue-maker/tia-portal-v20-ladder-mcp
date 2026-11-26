@@ -1,6 +1,6 @@
 # TIA Portal V20 MCP Server (Ladder & SCL)
 
-Bộ công cụ Model Context Protocol (MCP) dành cho **Siemens TIA Portal V20** (S7-1200 / S7-1500), cung cấp khả năng tự chủ toàn diện cho AI Agent: từ tạo mới dự án, cấu hình phần cứng CPU/Module/Mạng PROFINET, lập trình chuyên sâu **Ladder Logic (LAD)** và nguồn văn bản **SCL**, quản lý **Watch Table**, **Cross-Reference**, đến mô phỏng khép kín qua **S7-PLCSIM V20 Runtime** và **Universal Escape Hatch** phản chiếu động Openness.
+Bộ công cụ Model Context Protocol (MCP) dành cho **Siemens TIA Portal V20** (S7-1200 / S7-1500), hỗ trợ tạo dự án, cấu hình CPU/Module/Mạng PROFINET, lập trình **Ladder Logic (LAD)** và **SCL**, quản lý **Watch Table**, **Cross-Reference**, mô phỏng LAD offline và kết nối **S7-PLCSIM Advanced Runtime** khi có Runtime Manager phù hợp.
 
 ---
 
@@ -10,10 +10,10 @@ Bộ công cụ Model Context Protocol (MCP) dành cho **Siemens TIA Portal V20*
 - **Hỗ trợ mã nguồn văn bản SCL/DB/UDT:** Xuất và biên dịch trực tiếp mã SCL vào khối chương trình trong TIA Portal qua External Text Sources (`tia_scl_source`).
 - **Quản lý Watch Table tự động:** Tự động tạo, đọc, cập nhật, xóa bảng giám sát Watch Table và mở trực tiếp lên màn hình TIA Portal (`tia_watch_table`, `tia_show_in_editor`).
 - **Tra cứu chéo Cross-Reference:** Quét toàn dự án hoặc từng khối để xác định chính xác các điểm đọc/ghi của từng biến, DB hoặc UDT (`tia_cross_reference`).
-- **Cấu hình phần cứng & Mạng tự động (Zero-to-Project):** Tạo mới project, tra cứu Hardware Catalog, thêm CPU/Module mở rộng theo preset mã đặt hàng, cấu hình System/Clock Memory, PUT/GET, IP, Subnet, PROFINET IO-System và OPC UA (`tia_hardware_config`, `tia_network_config`).
+- **Cấu hình phần cứng & Mạng tự động (Zero-to-Project):** Tạo mới project, tra cứu Hardware Catalog, thêm CPU/Module mở rộng theo preset mã đặt hàng, cấu hình System/Clock Memory, PUT/GET, IP, Subnet, PROFINET IO-System và OPC UA (`tia_hardware_config`, `tia_network_config`). Khi thêm CPU, MCP giữ nguyên cấu hình bảo vệ mặc định; `disableSecurity: true` chỉ dùng khi đã chủ động chọn cho project mô phỏng.
 - **Mô phỏng 2 tầng độc lập:**
   1. *Tầng 1 (Trong RAM Node.js):* `tia_dry_run_ladder` mô phỏng chu kỳ quét PLC tức thì trong RAM không cần bật TIA Portal hay PLC thật.
-  2. *Tầng 2 (Khép kín với S7-PLCSIM V20 Runtime API):* `tia_plcsim_runtime` kết nối trực tiếp vào `Siemens.Simatic.Simulation.Runtime.Api.x64.dll` để đăng ký CPU ảo, kích hoạt RUN/STOP, đọc/ghi biến I/O/DB và chạy kịch bản kiểm thử tự động với assertions & timeline watch trace.
+  2. *Tầng 2 (S7-PLCSIM Advanced Runtime API):* `tia_plcsim_runtime` dùng `Siemens.Simatic.Simulation.Runtime.Api.x64.dll` khi Runtime Manager của PLCSIM Advanced khả dụng. Chỉ chạy `register`, `read`, `write` và `run_sequence` sau khi `status` trả `runtimeAvailable: true`. S7-PLCSIM V20 GUI thông thường có thể chạy CPU nhưng không tự tạo kết nối Advanced Runtime Manager; trong trường hợp đó hãy dùng SIM Table trong GUI.
 - **Phân tích tĩnh (`tia_analyze_ladder`):** Phát hiện lỗi Double Coil, thiếu xung cạnh, mâu thuẫn Set/Reset, biến chưa khai báo trước khi nạp vào PLC.
 - **Universal Escape Hatch (`tia_escape_hatch`):** Cung cấp khả năng phản chiếu động (Dynamic Reflection) trên toàn bộ cây đối tượng Openness V20 (`inspect`, `get`, `set`, `invoke`, handle `obj:N`), loại bỏ hoàn toàn "vùng mù" API.
 
@@ -83,9 +83,9 @@ TIA_Portal_V20_MCP/
    - `tia_cross_reference`: Tra cứu chéo (Cross-Reference) toàn dự án hoặc theo khối để biết chính xác biến/DB/UDT đang được đọc/ghi ở đâu.
 
 6. **Phần cứng, Mạng công nghiệp, PLCSIM Runtime & Escape Hatch (4 tools mới):**
-   - `tia_hardware_config`: Tra cứu Hardware Catalog, xem preset mã đặt hàng, thêm CPU PLC (tự thiết lập cấu hình bảo mật sẵn sàng biên dịch/mô phỏng khi tạo mới), cắm module mở rộng vào slot, cấu hình System/Clock Memory Byte, PUT/GET và tạo Technological Object (`TO_PositioningAxis`, `PID_Compact`...).
+   - `tia_hardware_config`: Tra cứu Hardware Catalog, xem preset mã đặt hàng, thêm CPU PLC (giữ nguyên bảo vệ mặc định, trừ khi yêu cầu thay đổi rõ ràng), cắm module mở rộng vào slot, cấu hình System/Clock Memory Byte, PUT/GET và tạo Technological Object (`TO_PositioningAxis`, `PID_Compact`...).
    - `tia_network_config`: Kiểm tra giao diện mạng, đặt IP/Subnet Mask/Router, kết nối Subnet, tạo PROFINET IO-System và cấu hình OPC UA Server.
-   - `tia_plcsim_runtime`: Điều khiển vòng lặp khép kín S7-PLCSIM V20 / PLCSIM Advanced Runtime (đăng ký/gắn CPU ảo, Power/Run/Stop, đọc/ghi tín hiệu trực tiếp và chạy kịch bản test theo thời gian thực).
+   - `tia_plcsim_runtime`: Điều khiển CPU ảo qua S7-PLCSIM Advanced Runtime Manager khi có kết nối API (đăng ký/gắn CPU ảo, Power/Run/Stop, đọc/ghi tín hiệu và chạy kịch bản test).
    - `tia_escape_hatch`: Công cụ phản chiếu động vạn năng trên `IEngineeringObject` — cho phép soi thuộc tính/composition/service/method (`inspect`), đọc/ghi thuộc tính động (`get`/`set`), gọi phương thức (`invoke`) và quản lý handle `obj:N`.
 
 ---

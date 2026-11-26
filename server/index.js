@@ -435,6 +435,9 @@ const TOOLS = [
         xmlPaths: { type: 'array', items: { type: 'string' }, description: 'Optional list of offline XML file paths to analyze.' },
         plcName: { type: 'string' },
         symbol: { type: 'string', description: 'Optional variable/tag name to generate Cross-Reference for.' },
+        targetSymbol: { type: 'string', description: 'Exact variable/tag whose change should be assessed.' },
+        targetBlock: { type: 'string', description: 'Block whose signature is changing; lists CALL sites and transitive callers.' },
+        manifestPath: { type: 'string', description: 'Optional suite.json path for suggested regression cases.' },
       },
     },
   },
@@ -478,6 +481,8 @@ const TOOLS = [
       properties: {
         manifestPath: { type: 'string', description: 'Path to the suite JSON file.' },
         format: { type: 'string', enum: ['text', 'json', 'junit'] },
+        targetSymbol: { type: 'string', description: 'Exact variable/tag to assess before changing.' },
+        targetBlock: { type: 'string', description: 'Block signature to assess before changing.' },
       },
     },
   },
@@ -580,11 +585,13 @@ const TOOLS = [
         action: { type: 'string', enum: ['list_connections', 'download', 'station_upload', 'go_online', 'go_offline', 'online_status'] },
         plcName: { type: 'string' },
         mode: { type: 'string', description: 'Connection mode (default: PN/IE).' },
-        pcInterface: { type: 'string', description: 'Substring filter for PC interface (default: PLCSIM; optional for station_upload).' },
+        pcInterface: { type: 'string', description: 'Exact PC interface name; required for download.' },
         targetAddress: { type: 'string', description: 'Optional target PLC IP address (e.g. 192.168.0.1); required for station_upload.' },
         targetInterfaceIndex: { type: 'integer', description: 'Index of target interface (default: 0).' },
-        includeHardware: { type: 'boolean', description: 'Download Hardware + Software (default: true).' },
-        startAfterDownload: { type: 'boolean', description: 'Start CPU modules after download (default: true).' },
+        includeHardware: { type: 'boolean', description: 'Download Hardware + Software (default: false).' },
+        startAfterDownload: { type: 'boolean', description: 'Start CPU modules after download (default: false).' },
+        allowStopModules: { type: 'boolean', description: 'Permit stopping running CPU modules during download (default: false).' },
+        allowDifferentTargetConfiguration: { type: 'boolean', description: 'Explicitly accept a detected target hardware/configuration difference (default: false).' },
       },
     },
   },
@@ -693,7 +700,7 @@ const TOOLS = [
         enableClockMemory: { type: 'boolean' },
         clockMemoryAddress: { type: 'integer' },
         permitPutGet: { type: 'boolean' },
-        disableSecurity: { type: 'boolean', description: 'Configure no/full-access CPU protection and unprotect confidential config data so hardware compiles cleanly (defaults to true in add_plc).' },
+        disableSecurity: { type: 'boolean', description: 'Explicitly configure full-access CPU protection and unprotect confidential configuration data (default: false; intended only for authorized simulation projects).' },
         accessControl: { type: 'string', description: 'S7-1500 PlcAccessControlConfiguration enum, e.g. Disabled, EnabledWithAccessControl.' },
         accessLevel: { type: 'string', description: 'S7-1200 PlcProtectionAccessLevel enum, e.g. FullAccess, ReadAccess, HMIAccess, NoAccess.' },
         protectConfigData: { type: 'boolean', description: 'Whether confidential PLC configuration data uses a password (false calls Unprotect()).' },
@@ -730,7 +737,7 @@ const TOOLS = [
   },
   {
     name: 'tia_plcsim_runtime',
-    description: 'Closed-loop S7-PLCSIM V20 / PLCSIM Advanced runtime control: inspect/register virtual PLC instances, power/run/stop, list tags, read/write signals (absolute or symbolic), and run timed test sequences with assertions and samples.',
+    description: 'S7-PLCSIM Advanced Runtime API control. Requires a running Advanced Runtime Manager; the regular S7-PLCSIM V20 GUI does not expose this API. Inspect/register virtual PLC instances, control RUN/STOP, read/write signals, and run timed assertions.',
     inputSchema: {
       type: 'object',
       required: ['action'],
@@ -1141,7 +1148,9 @@ async function handleTool(name, args) {
         reads.push(B.readBlock(xml, { format: 'dsl', ctx: getLadderCtx() }));
       }
       if (!reads.length) throw new Error('Provide blocks[] or xmlPaths[] to analyze.');
-      const res = A.analyze(reads, { symbol: args.symbol });
+      let suite = {};
+      if (args.manifestPath) suite = JSON.parse(fs.readFileSync(args.manifestPath, 'utf8').replace(/^\uFEFF/, ''));
+      const res = A.analyze(reads, { symbol: args.symbol, targetSymbol: args.targetSymbol, targetBlock: args.targetBlock, cases: suite.cases, entry: suite.entry });
       return { text: A.formatAnalysis(res), json: res };
     }
 
@@ -1190,7 +1199,7 @@ async function handleTool(name, args) {
     }
 
     case 'tia_test_ladder_project': {
-      const report = project.runProject(args.manifestPath);
+      const report = project.runProject(args.manifestPath, { targetSymbol: args.targetSymbol, targetBlock: args.targetBlock });
       return { text: project.formatReport(report, args.format), json: report };
     }
     case 'tia_dry_run_ladder': {
@@ -1283,20 +1292,27 @@ async function handleTool(name, args) {
         return { text: lines.join('\n'), json: r };
       }
       if (act === 'download') {
+        if (!args.plcName || !args.pcInterface) throw new Error('Download requires explicit plcName and exact pcInterface. Use list_connections first.');
+        if (!/PLCSIM/i.test(args.pcInterface) && !args.targetAddress) throw new Error('Physical PLC download requires targetAddress.');
+        if (args.targetInterfaceIndex !== undefined && (!Number.isInteger(args.targetInterfaceIndex) || args.targetInterfaceIndex < 0)) throw new Error('targetInterfaceIndex must be a non-negative integer.');
         const r = await bridge.call('download', {
           plcName: args.plcName || '',
           mode: args.mode || 'PN/IE',
-          pcInterface: args.pcInterface || 'PLCSIM',
+          pcInterface: args.pcInterface,
           targetAddress: args.targetAddress || '',
-          targetInterfaceIndex: args.targetInterfaceIndex || 0,
-          includeHardware: args.includeHardware !== false,
-          startAfterDownload: args.startAfterDownload !== false,
+          targetInterfaceIndex: args.targetInterfaceIndex ?? 0,
+          includeHardware: args.includeHardware === true,
+          startAfterDownload: args.startAfterDownload === true,
+          allowStopModules: args.allowStopModules === true,
+          allowDifferentTargetConfiguration: args.allowDifferentTargetConfiguration === true,
         });
         const lines = [
           'DOWNLOAD to "' + r.plc + '" via ' + r.pcInterface + ' (' + r.targetInterface +
             (r.targetAddress ? ' @ ' + r.targetAddress : '') + '): ' + r.state,
           'Errors: ' + r.errorCount + ', Warnings: ' + r.warningCount,
+          'Scope: ' + r.scope + '; startAfterDownload=' + r.startAfterDownload + '; allowStopModules=' + r.allowStopModules + '; allowDifferentTargetConfiguration=' + r.allowDifferentTargetConfiguration,
         ];
+        for (const entry of (r.configLog || [])) lines.push('  CONFIG: ' + entry);
         for (const m of r.messages) lines.push('  [' + m.state + '] ' + m.message);
         return { text: lines.join('\n'), json: r };
       }
@@ -1316,11 +1332,12 @@ async function handleTool(name, args) {
         return { text: lines.join('\n'), json: r };
       }
       const onlineAct = act === 'online_status' ? 'status' : act;
+      if (onlineAct === 'go_online' && args.pcInterface !== undefined && !args.pcInterface) throw new Error('go_online pcInterface must be an exact non-empty name from list_connections.');
       const r = await bridge.call('online', {
         plcName: args.plcName || '',
         action: onlineAct,
         mode: args.mode || 'PN/IE',
-        pcInterface: args.pcInterface || 'PLCSIM',
+        pcInterface: args.pcInterface || '',
       });
       return { text: 'PLC "' + r.plc + '" Online State: ' + r.state, json: r };
     }
@@ -1514,7 +1531,7 @@ async function handleTool(name, args) {
           lines.push('  - ' + it.name + ' [' + it.typeIdentifier + ']' + (it.isPlc ? ' (PLC software: ' + it.plcSoftwareName + ')' : ''));
         }
         if ((r.securityApplied || []).length) {
-          lines.push('  Security defaults applied: ' + r.securityApplied.join(', '));
+          lines.push('  Security settings applied: ' + r.securityApplied.join(', '));
         }
         if ((r.securityWarnings || []).length) {
           lines.push('  Security warnings: ' + r.securityWarnings.join('; '));

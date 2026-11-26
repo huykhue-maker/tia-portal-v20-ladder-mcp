@@ -1197,24 +1197,30 @@ namespace TiaBridge
 
         private object CmdDownload(Dictionary<string, object> args)
         {
+            string requestedPlc = GetStr(args, "plcName", "");
+            if (string.IsNullOrWhiteSpace(requestedPlc)) throw new ArgumentException("Download requires an explicit plcName.");
+            string requestedPc = GetStr(args, "pcInterface", "");
+            if (string.IsNullOrWhiteSpace(requestedPc)) throw new ArgumentException("Download requires an explicit pcInterface.");
+            bool simTarget = requestedPc.IndexOf("PLCSIM", StringComparison.OrdinalIgnoreCase) >= 0;
+            if (!simTarget && string.IsNullOrWhiteSpace(GetStr(args, "targetAddress", ""))) throw new ArgumentException("Physical PLC download requires targetAddress.");
             PlcTarget plc = ResolvePlc(args, true);
             DownloadProvider dp = plc.CpuItem.GetService<DownloadProvider>();
             if (dp == null) throw new InvalidOperationException("DownloadProvider not available.");
 
             string modeName = GetStr(args, "mode", "PN/IE");
-            string pcFilter = GetStr(args, "pcInterface", "PLCSIM");
+            string pcFilter = requestedPc;
             string targetAddrStr = GetStr(args, "targetAddress", "");
             int targetIdx = GetInt(args, "targetInterfaceIndex", 0);
-            bool startAfter = GetBool(args, "startAfterDownload", true);
-            bool includeHardware = GetBool(args, "includeHardware", true);
+            bool startAfter = GetBool(args, "startAfterDownload", false);
+            bool includeHardware = GetBool(args, "includeHardware", false);
 
             ConfigurationMode mode = dp.Configuration.Modes.Find(modeName);
             if (mode == null) throw new InvalidOperationException("Connection mode '" + modeName + "' not found. Available: " + string.Join(", ", dp.Configuration.Modes.Select(m => m.Name).ToArray()));
 
-            ConfigurationPcInterface pc = mode.PcInterfaces.FirstOrDefault(p => p.Name.IndexOf(pcFilter, StringComparison.OrdinalIgnoreCase) >= 0);
+            ConfigurationPcInterface pc = mode.PcInterfaces.FirstOrDefault(p => string.Equals(p.Name, pcFilter, StringComparison.OrdinalIgnoreCase));
             if (pc == null)
             {
-                throw new InvalidOperationException("PC interface matching '" + pcFilter + "' not found. Available: " + string.Join(", ", mode.PcInterfaces.Select(x => x.Name).ToArray()));
+                throw new InvalidOperationException("Exact PC interface name '" + pcFilter + "' not found. Available: " + string.Join(", ", mode.PcInterfaces.Select(x => x.Name).ToArray()));
             }
             if (pc.TargetInterfaces.Count == 0 && pc.Subnets.Count == 0) throw new InvalidOperationException("No target interface or subnet on " + pc.Name);
 
@@ -1224,7 +1230,8 @@ namespace TiaBridge
 
             if (pc.TargetInterfaces.Count > 0)
             {
-                ConfigurationTargetInterface ti = pc.TargetInterfaces[Math.Min(targetIdx, pc.TargetInterfaces.Count - 1)];
+                if (targetIdx < 0 || targetIdx >= pc.TargetInterfaces.Count) throw new ArgumentOutOfRangeException("targetInterfaceIndex", "Select an existing target interface index.");
+                ConfigurationTargetInterface ti = pc.TargetInterfaces[targetIdx];
                 targetCfg = ti;
                 targetName = ti.Name;
                 if (!string.IsNullOrEmpty(targetAddrStr))
@@ -1235,36 +1242,41 @@ namespace TiaBridge
             else if (pc.Subnets.Count > 0)
             {
                 // ConfigurationSubnet is not an IConfiguration in the V20 Openness API, so it
-                // cannot be passed to DownloadProvider.Download. Resolve the address for logging
-                // and fall back to the first target interface when the mode exposes one.
-                ConfigurationSubnet sub = pc.Subnets[0];
-                targetName = sub.Name;
-                if (!string.IsNullOrEmpty(targetAddrStr))
-                {
-                    cfgAddr = sub.Addresses.Find(targetAddrStr) ?? sub.Addresses.Create(targetAddrStr);
-                }
-                if (pc.TargetInterfaces.Count > 0) targetCfg = pc.TargetInterfaces[0];
-                else throw new InvalidOperationException("Download through a subnet-only PC interface ('" + pc.Name + "') is not supported by TIA Openness V20. Select a PN/IE target interface instead.");
+                // cannot be passed to DownloadProvider.Download.
+                throw new InvalidOperationException("Download through a subnet-only PC interface ('" + pc.Name + "') is not supported by TIA Openness V20. Select a PN/IE target interface instead.");
             }
 
             List<string> log = new List<string>();
+            bool allowStop = GetBool(args, "allowStopModules", false);
+            bool allowDifferent = GetBool(args, "allowDifferentTargetConfiguration", false);
             DownloadConfigurationDelegate pre = delegate(DownloadConfiguration cfg)
             {
                 log.Add("pre: " + cfg.GetType().Name + " (" + cfg.Message + ")");
                 StopModules sm = cfg as StopModules;
-                if (sm != null) { sm.CurrentSelection = StopModulesSelections.StopAll; return; }
+                if (sm != null) {
+                    if (!allowStop) throw new InvalidOperationException("Download requires stopping running modules. Set allowStopModules=true explicitly if intended.");
+                    sm.CurrentSelection = StopModulesSelections.StopAll; log.Add("selected: StopAll (allowStopModules=true)"); return;
+                }
                 ConsistentBlocksDownload cb = cfg as ConsistentBlocksDownload;
                 if (cb != null) { cb.CurrentSelection = ConsistentBlocksDownloadSelections.ConsistentDownload; return; }
                 AllBlocksDownload ab = cfg as AllBlocksDownload;
                 if (ab != null) { ab.CurrentSelection = AllBlocksDownloadSelections.DownloadAllBlocks; return; }
                 OverwriteSystemData osd = cfg as OverwriteSystemData;
-                if (osd != null) { osd.CurrentSelection = OverwriteSystemDataSelections.Overwrite; return; }
+                if (osd != null) {
+                    if (!includeHardware) throw new InvalidOperationException("Download requires overwriting system data. Set includeHardware=true explicitly if intended.");
+                    osd.CurrentSelection = OverwriteSystemDataSelections.Overwrite; log.Add("selected: OverwriteSystemData (includeHardware=true)"); return;
+                }
                 AlarmTextLibrariesDownload atl = cfg as AlarmTextLibrariesDownload;
                 if (atl != null) { atl.CurrentSelection = AlarmTextLibrariesDownloadSelections.ConsistentDownload; return; }
                 CheckBeforeDownload chk = cfg as CheckBeforeDownload;
                 if (chk != null) { chk.Checked = true; return; }
                 DifferentTargetConfiguration dtc = cfg as DifferentTargetConfiguration;
-                if (dtc != null) { dtc.CurrentSelection = DifferentTargetConfigurationSelections.AcceptAll; return; }
+                if (dtc != null)
+                {
+                    if (!allowDifferent) throw new InvalidOperationException("Target configuration differs. Inspect the target and explicitly set allowDifferentTargetConfiguration=true only if this difference is expected.");
+                    dtc.CurrentSelection = DifferentTargetConfigurationSelections.AcceptAll;
+                    return;
+                }
             };
             DownloadConfigurationDelegate post = delegate(DownloadConfiguration cfg)
             {
@@ -1288,6 +1300,11 @@ namespace TiaBridge
                 { "pcInterface", pc.Name },
                 { "targetInterface", targetName },
                 { "targetAddress", targetAddrStr },
+                { "scope", includeHardware ? "Hardware+Software" : "Software only" },
+                { "includeHardware", includeHardware },
+                { "startAfterDownload", startAfter },
+                { "allowStopModules", allowStop },
+                { "allowDifferentTargetConfiguration", allowDifferent },
                 { "state", res.State.ToString() },
                 { "errorCount", res.ErrorCount },
                 { "warningCount", res.WarningCount },
@@ -1318,15 +1335,15 @@ namespace TiaBridge
             if (action == "go_online" || action == "online")
             {
                 string modeName = GetStr(args, "mode", "PN/IE");
-                string pcFilter = GetStr(args, "pcInterface", "PLCSIM");
+                string pcFilter = GetStr(args, "pcInterface", "");
                 ConfigurationMode mode = op.Configuration.Modes.Find(modeName);
-                if (mode != null)
+                if (mode == null) throw new InvalidOperationException("Connection mode '" + modeName + "' not found. Available: " + string.Join(", ", op.Configuration.Modes.Select(m => m.Name).ToArray()));
+                if (!string.IsNullOrWhiteSpace(pcFilter))
                 {
-                    ConfigurationPcInterface pc = mode.PcInterfaces.FirstOrDefault(p => p.Name.IndexOf(pcFilter, StringComparison.OrdinalIgnoreCase) >= 0);
-                    if (pc != null && pc.TargetInterfaces.Count > 0)
-                    {
-                        op.Configuration.ApplyConfiguration(pc.TargetInterfaces[0]);
-                    }
+                    ConfigurationPcInterface pc = mode.PcInterfaces.FirstOrDefault(p => string.Equals(p.Name, pcFilter, StringComparison.OrdinalIgnoreCase));
+                    if (pc == null) throw new InvalidOperationException("Exact PC interface name '" + pcFilter + "' not found. Available: " + string.Join(", ", mode.PcInterfaces.Select(p => p.Name).ToArray()));
+                    if (pc.TargetInterfaces.Count == 0) throw new InvalidOperationException("PC interface '" + pc.Name + "' has no target interface for go_online.");
+                    op.Configuration.ApplyConfiguration(pc.TargetInterfaces[0]);
                 }
                 op.GoOnline();
             }

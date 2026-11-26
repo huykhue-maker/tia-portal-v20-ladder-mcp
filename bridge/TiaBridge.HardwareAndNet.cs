@@ -124,7 +124,7 @@ namespace TiaBridge
                     CollectPlcItems(dev, dev.DeviceItems, devPlcs);
                     if (devPlcs.Count > 0)
                     {
-                        bool defaultDisableSec = !args.ContainsKey("disableSecurity") || GetBool(args, "disableSecurity", true);
+                        bool defaultDisableSec = GetBool(args, "disableSecurity", false);
                         ConfigureCpuSecurity(devPlcs[0].CpuItem, args, defaultDisableSec, secApplied, secWarnings);
                     }
                 }

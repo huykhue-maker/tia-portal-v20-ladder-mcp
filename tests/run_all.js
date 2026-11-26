@@ -141,6 +141,43 @@ async function main() {
     });
   });
 
+  await test('Impact analysis: exact symbol, CALL sites, transitive callers and suite cases', async () => {
+    const manifestPath = path.join(__dirname, '..', 'examples', 'inspection', 'suite.json');
+    const P = require('../server/ladder/project');
+    const report = P.runProject(manifestPath, { targetBlock: 'FC_Eligible', targetSymbol: '#Present' });
+    assert(report.ok);
+    assert.deepStrictEqual(report.analysis.impact.affectedBlocks, ['FB_Inspection', 'FC_Eligible']);
+    assert(report.analysis.impact.networks.some(n => n.block === 'FB_Inspection' && n.nw === 1 && n.reasons.includes('CALL FC_Eligible')));
+    assert.strictEqual(report.analysis.impact.suggestedCases.length, 3);
+    const exact = P.runProject(manifestPath, { targetSymbol: '#PresentExtra' });
+    assert.deepStrictEqual(exact.analysis.impact.networks, []);
+    // Local #Var and global "Var" stay isolated; Global DB members normalize cleanly with or without quotes
+    const scopedBlocks = ['FB_Target', 'FB_Unrelated', 'OB_Caller'].map(name => {
+      if (name === 'OB_Caller') {
+        return B.readBlock(B.createBlockXml({
+          name, type: 'OB',
+          networks: [{ dsl: 'NO("Shared") => MOVE("DB_Cfg".Speed, "DB_Cfg".Speed)' }],
+        }).xml, { simulationOnly: true });
+      }
+      return B.readBlock(B.createBlockXml({
+        name, type: 'FB',
+        interface: { Input: [{ name: 'Flag', type: 'Bool' }], Output: [{ name: 'Out', type: 'Bool' }] },
+        networks: [{ dsl: 'NO(#Flag) => COIL(#Out)' }],
+      }).xml, { simulationOnly: true });
+    });
+    const localScoped = A.analyze(scopedBlocks, { targetBlock: 'FB_Target', targetSymbol: '#Flag' }).impact;
+    assert.deepStrictEqual(localScoped.affectedBlocks, ['FB_Target'], 'Local #Flag in FB_Target must not bleed into FB_Unrelated');
+    const globalOnly = A.analyze(scopedBlocks, { targetSymbol: 'Flag' }).impact;
+    assert.deepStrictEqual(globalOnly.affectedBlocks, [], 'Global "Flag" must not falsely match local #Flag');
+    const dbMember = A.analyze(scopedBlocks, { targetSymbol: 'DB_Cfg.Speed' }).impact;
+    assert.deepStrictEqual(dbMember.affectedBlocks, ['OB_Caller'], 'Unquoted DB_Cfg.Speed must match "DB_Cfg".Speed');
+    await withMcpServer(async rpc => {
+      const result = (await rpc('tools/call', { name: 'tia_test_ladder_project', arguments: { manifestPath, format: 'json', targetBlock: 'FC_Eligible' } })).result;
+      assert(!result.isError);
+      assert.strictEqual(result.structuredContent.analysis.impact.suggestedCases.length, 3);
+    });
+  });
+
   await test('Online backup identity and checksum isolation', async () => {
     const { OnlineBackups } = require('../server/online_backups');
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'backup-scope-'));
@@ -322,6 +359,23 @@ async function main() {
       for (const nt of newTools) {
         assert(toolNames.has(nt), 'Missing newly added MCP tool in tools/list: ' + nt);
       }
+      for (const arguments_ of [
+        { action: 'download' },
+        { action: 'download', plcName: 'Conveyor_PLC', pcInterface: 'PN/IE' },
+        { action: 'download', plcName: 'Conveyor_PLC', pcInterface: 'PLCSIM', targetInterfaceIndex: -1 },
+      ]) {
+        const denied = await rpc('tools/call', { name: 'tia_download_and_online', arguments: arguments_ });
+        assert(denied.result.isError, 'Ambiguous download must fail before reaching TIA');
+      }
+      const hardwareSchema = listed.result.tools.find(t => t.name === 'tia_hardware_config').inputSchema;
+      assert(!Object.hasOwn(hardwareSchema.properties.disableSecurity, 'default') || hardwareSchema.properties.disableSecurity.default === false);
+      assert.match(hardwareSchema.properties.disableSecurity.description, /default: false/);
+      const downloadSchema = listed.result.tools.find(t => t.name === 'tia_download_and_online').inputSchema;
+      assert.strictEqual(downloadSchema.properties.allowDifferentTargetConfiguration.type, 'boolean');
+      assert.strictEqual(downloadSchema.properties.allowStopModules.type, 'boolean');
+      const onlineBad = await rpc('tools/call', { name: 'tia_download_and_online', arguments: { action: 'go_online', plcName: 'Conveyor_PLC', pcInterface: '' } });
+      assert(onlineBad.result.isError);
+      assert.match(onlineBad.result.content[0].text, /exact non-empty name/);
 
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tia-mcp-'));
       const tmpXml = path.join(dir, 'FB_McpTest.xml');
@@ -410,6 +464,11 @@ async function main() {
 
       const simRt = await rpc('tools/call', { name: 'tia_plcsim_runtime', arguments: { action: 'status' } });
       assert(!simRt.result.isError, 'tia_plcsim_runtime(status) failed: ' + simRt.result.content[0].text);
+      if (simRt.result.structuredContent.runtimeAvailable === false) {
+        const unavailable = await rpc('tools/call', { name: 'tia_plcsim_runtime', arguments: { action: 'read', instanceName: 'Instance_1', signals: ['%I0.0'] } });
+        assert(unavailable.result.isError);
+        assert.match(unavailable.result.content[0].text, /Advanced Runtime (Manager|API)/);
+      }
 
       const hwPresets = await rpc('tools/call', { name: 'tia_hardware_config', arguments: { action: 'presets' } });
       assert(!hwPresets.result.isError, 'tia_hardware_config(presets) should work offline without tia_connect: ' + hwPresets.result.content[0].text);

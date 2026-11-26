@@ -497,6 +497,7 @@ namespace TiaBridge
             if (string.IsNullOrEmpty(instName))
             {
                 if (regs == null || regs.Length == 0) throw new InvalidOperationException("No registered PLCSIM virtual PLC instance found. Use action='register' first or start a virtual PLC in S7-PLCSIM V20 / PLCSIM Advanced.");
+                if (regs.Length != 1) throw new InvalidOperationException("Multiple PLCSIM instances are registered. Specify instanceName explicitly: " + string.Join(", ", regs.Select(x => x.Name).ToArray()));
                 instName = regs[0].Name;
             }
             IInstance inst = SimulationRuntimeManager.CreateInterface(instName);
@@ -675,10 +676,20 @@ namespace TiaBridge
                 catch (Exception ex)
                 {
                     res["runtimeAvailable"] = false;
-                    res["runtimeNote"] = ex.GetType().Name + ": " + ex.Message + " (Start a virtual PLC instance in S7-PLCSIM V20 or PLCSIM Advanced to initialize the Simulation Runtime bus).";
+                    res["runtimeNote"] = ex.GetType().Name + ": " + ex.Message + ". This DLL is the S7-PLCSIM Advanced Runtime API; the regular S7-PLCSIM V20 GUI alone does not establish an Advanced Runtime Manager connection. Check that PLCSIM Advanced Runtime Manager is installed and running in this Windows session.";
                     res["instances"] = new object[0];
                 }
                 return res;
+            }
+
+            try
+            {
+                if (!SimulationRuntimeManager.IsRuntimeManagerAvailable)
+                    throw new InvalidOperationException("S7-PLCSIM Advanced Runtime Manager is unavailable. Start PLCSIM Advanced and verify action=status before using " + action + ". The regular PLCSIM V20 GUI does not provide this API connection.");
+            }
+            catch (SimulationInitializationException ex)
+            {
+                throw new InvalidOperationException("S7-PLCSIM Advanced Runtime API could not initialize. The regular PLCSIM V20 GUI alone is insufficient; install/start the Advanced Runtime Manager and retry action=status. Details: " + ex.Message, ex);
             }
 
             if (action == "register")

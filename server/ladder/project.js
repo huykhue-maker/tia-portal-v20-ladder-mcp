@@ -104,12 +104,12 @@ function validateScenario(test, entry) {
   }
 }
 
-function runProject(manifestPath) {
+function runProject(manifestPath, opts = {}) {
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8').replace(/^\uFEFF/, ''));
   if (!manifest || !Array.isArray(manifest.cases) || !manifest.cases.length) throw new Error('Expected non-empty cases in project manifest');
   const reads = loadBlocks(path.resolve(path.dirname(manifestPath), manifest.blockDir || 'blocks'));
   const blocks = [...reads.values()];
-  const analysis = A.analyze(blocks);
+  const analysis = A.analyze(blocks, { ...opts, cases: manifest.cases, entry: manifest.entry });
   const program = S.buildProgram(blocks, manifest.entry);
   const cases = [];
   const names = new Set();
