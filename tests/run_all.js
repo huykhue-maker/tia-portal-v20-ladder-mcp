@@ -42,9 +42,9 @@ function test(name, fn, group = 'offline') {
   });
 }
 
-async function withMcpServer(run, timeoutMs = 15000, preload) {
+async function withMcpServer(run, timeoutMs = 15000, preload, env = {}) {
   const serverPath = path.join(__dirname, '..', 'server', 'index.js');
-  const child = spawn(process.execPath, [...(preload ? ['--require', preload] : []), serverPath], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, [...(preload ? ['--require', preload] : []), serverPath], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, TIA_PORTAL_VERSION: '20', ...env } });
   const pending = new Map();
   let buf = '';
   child.stdout.setEncoding('utf8');
@@ -70,7 +70,7 @@ async function withMcpServer(run, timeoutMs = 15000, preload) {
 
   try {
     const init = await rpc('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '1.0' } });
-    assert.strictEqual(init.result.serverInfo.name, 'tia-portal-v20-mcp');
+    assert.strictEqual(init.result.serverInfo.name, 'tia-portal-v' + (env.TIA_PORTAL_VERSION || '20') + '-mcp');
 
     await run(rpc);
   } finally {
@@ -84,6 +84,10 @@ async function main() {
     require('./project')(withMcpServer));
   await test('Typed LAD project: DB defaults, tag table and strict symbol diagnostics', () =>
     require('./project_symbols')(withMcpServer));
+  await test('Offline baseline comparison: intermediate divergence, initial state, CLI, MCP and JUnit', () =>
+    require('./project_compare')(withMcpServer));
+  await test('TIA V16 profile: matching bridge, V16 XML, patching and offline simulation', () =>
+    require('./tia_v16_profile')(withMcpServer));
 
   await test('Offline MCP: until obeys the simulated deadline', async () => {
     await withMcpServer(async rpc => {
@@ -667,6 +671,16 @@ async function main() {
       assert.strictEqual(back.complete, true, 'Expected complete roundtrip for: ' + dsl + ' notes=' + JSON.stringify(back.notes));
       assert.strictEqual(back.dsl, dsl, 'Roundtrip mismatch:\n  in : ' + dsl + '\n  out: ' + back.dsl);
     }
+
+    const indexed = S.buildProgram([{
+      block: { name: 'FB_Index', type: 'FB' }, interface: {},
+      networks: [{ dsl: cases[6], flows: D.parseNetwork(cases[6]).flows }],
+    }], 'FB_Index');
+    const indexedResult = S.runScenario(indexed, {
+      init: { '#En': 1, '#Arr[0]': 11, '#Arr[1]': 22 },
+      steps: [{ run: 1, expect: { '#OutVal': 11 } }, { set: { '#Idx': 1 }, expect: { '#OutVal': 22 } }],
+    });
+    assert(indexedResult.ok, S.formatResults(indexedResult));
 
     // 6c. In-RAM scan-cycle simulation of CONV, NORM_X, SCALE_X, SIN, COS, SUB & OR
     const mathBlock = B.createBlockXml({

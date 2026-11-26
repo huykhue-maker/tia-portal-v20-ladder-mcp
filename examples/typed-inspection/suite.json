@@ -5,6 +5,10 @@
   "cases": [
     {
       "name": "Use DB and UDT start values",
+      "watch": [
+        "#Ready",
+        "\"DB_Settings\".Inspection.Threshold"
+      ],
       "init": {
         "\"PartPresent\"": 1
       },
@@ -21,6 +25,10 @@
     },
     {
       "name": "Override the threshold",
+      "watch": [
+        "#Ready",
+        "\"DB_Settings\".Inspection.Threshold"
+      ],
       "init": {
         "\"PartPresent\"": 1,
         "\"db_settings\".inspection.threshold": 5
@@ -37,6 +45,10 @@
     },
     {
       "name": "Start fresh in the next case",
+      "watch": [
+        "#Ready",
+        "\"DB_Settings\".Inspection.Threshold"
+      ],
       "init": {
         "\"PartPresent\"": 1
       },

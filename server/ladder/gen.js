@@ -417,7 +417,7 @@ class Gen {
     const wireNodes = wires.map(w => E('Wire', { UId: this.nid() }, w));
     const content = [E('Parts', {}, this.items)];
     if (wireNodes.length) content.push(E('Wires', {}, wireNodes));
-    return E('FlgNet', { xmlns: FLG_NS }, content);
+    return E('FlgNet', { xmlns: this.ctx.flgNamespace || FLG_NS }, content);
   }
 }
 

@@ -135,6 +135,20 @@ Kết quả JSON gồm phát hiện phân tích tĩnh, từng phép so sánh, ti
 
 Phạm vi kiểm tra là mô hình LAD trong RAM. Compile/import project Siemens và xác minh đặc tính CPU vẫn cần TIA Portal hoặc PLCSIM phù hợp.
 
+#### So sánh hành vi LAD trước và sau thay đổi
+
+Dùng một `suite.json` và hai thư mục XML xuất của cùng PLC. `blockDir` trỏ đến bản hiện tại. Thêm `"baselineBlockDir": "blocks-before"` vào suite hoặc chỉ định thư mục gốc trên CLI. Đường dẫn tương đối được tính từ file suite.
+
+```powershell
+node server/test-project.js suite.json --baseline blocks-before --format json
+```
+
+Có thể thử đối chiếu thư mục mẫu với chính nó bằng `node server/test-project.js examples/typed-inspection/suite.json --baseline blocks`. Kết quả mong đợi là ba case trùng khớp.
+
+Mỗi case cần `watch` liệt kê các tín hiệu muốn đối chiếu. Hai bản chạy cùng `init`, các bước và phép kiểm tra trong suite. Trình chạy so sánh trạng thái sau `init`, giá trị đã lấy mẫu sau mỗi chu kỳ quét, kết quả phép kiểm tra và trạng thái cuối. Báo cáo nêu điểm phân kỳ đầu tiên của mỗi case. Có thể đặt `"compareTolerance": 0.001` để cho phép sai số tuyệt đối cho giá trị số. Mặc định là so sánh chính xác. Thời điểm và kết quả đạt/trượt của phép kiểm tra vẫn đối chiếu chính xác.
+
+Với MCP, gọi `tia_test_ladder_project` và truyền thêm `baselineBlockDir`. JSON trả kết quả so sánh trong `comparison`. JUnit có thêm testcase cho phân tích tĩnh của bản gốc và từng phép so sánh. CLI trả mã `1` nếu một trong hai bản có lỗi kiểm thử hoặc phát hiện phân kỳ. Hai giá trị có thể trùng ở cuối case dù tín hiệu đã phân kỳ giữa hai lần kiểm tra.
+
 #### Kiểm thử thư mục XML có DB, UDT và bảng tag
 
 ```powershell
@@ -146,6 +160,30 @@ node server/test-project.js examples/typed-inspection/suite.json --format junit
 Đặt `"strictSymbols": true` trong `suite.json` để kiểm tra biến trong LAD và trong `init`, `set`, `watch`, `expect`, `until`. Công cụ kiểm tra tên biến, thành viên lồng nhau, số chiều và phạm vi của chỉ số mảng hằng, cùng giá trị test cho các kiểu vô hướng được hỗ trợ. Khi bỏ trường này, các case cũ vẫn dùng được biến toàn cục tự do. Giữ đúng cách viết tên biến cục bộ theo khai báo.
 
 Mỗi case đọc lại `StartValue` vô hướng có trong XML GlobalDB hoặc trong UDT mà DB sử dụng. `init` ghi đè trong phạm vi của case. Có thể dùng `init` để cung cấp giá trị ban đầu cho từng phần tử mảng. Phần mô phỏng FB tạo vùng nhớ instance từ khai báo FB.
+
+### Cấu hình TIA Portal V16
+
+Trên máy Windows có STEP 7 V16 và TIA Portal Openness V16, chọn bản V16 bằng biến môi trường `TIA_PORTAL_VERSION` của tiến trình MCP. Sau đó build bridge đúng phiên bản. Nếu cài Siemens ở thư mục khác, đặt `TIA_PUBLIC_API_DIR` trỏ tới thư mục `PublicAPI\V16` chứa `Siemens.Engineering.dll` cho cả lúc build và lúc chạy MCP.
+
+```powershell
+$env:TIA_PORTAL_VERSION = '16'
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -PortalVersion 16
+node server/index.js
+```
+
+Nếu dùng MCP client, thêm `"TIA_PORTAL_VERSION": "16"` vào `env` trong cấu hình server. Cấu hình mặc định là V20. Hai bridge có thể nằm cạnh nhau trong thư mục `bridge`. Bản V16 chạy `TiaBridge.V16.exe` và nhận dự án native `.ap16`.
+
+- Phạm vi V16 gồm kết nối Openness, mở/lưu dự án, liệt kê block, tag và UDT, xuất/nhập SimaticML, cập nhật LAD và compile. Các lệnh tải chương trình xuống PLC, cấu hình phần cứng/mạng và PLCSIM Runtime thuộc cấu hình V20 hiện tại.
+- Tạo hoặc thay network LAD trong V16 hiện hỗ trợ chuỗi tiếp điểm và cuộn dây cơ bản. Dùng XML xuất trực tiếp từ V16 để đọc và mô phỏng các lệnh được Ladder engine hỗ trợ. Khi tạo XML offline, có thể truyền `portalVersion: "16"` cho `tia_create_ladder_block`.
+- Bản import V16 chấp nhận XML SimaticML có thông tin phiên bản V16 và namespace tương thích. Dùng Openness V16 để xuất XML từ dự án nguồn.
+
+Bài kiểm thử tích hợp dùng bản sao dự án V16 có một PLC đã cấu hình. Truyền thêm tên PLC nếu dự án có nhiều PLC. Bài test mở bản sao ở chế độ headless, import một FB tạm, xuất lại, compile phần mềm, xóa FB tạm và đóng phiên TIA. Dùng bản sao dành riêng cho kiểm thử vì bài test có sửa project trong phiên chạy.
+
+```powershell
+npm run test:tia-v16 -- "D:\Test\Copy\Copy.ap16" "PLC_1"
+```
+
+Xem yêu cầu DLL theo phiên bản và định dạng import/export trong [tài liệu Siemens Openness V16](https://support.industry.siemens.com/cs/attachments/109773802/TIAPortalOpenness_en-US.pdf).
 
 ### Bước 1: Thêm tài khoản vào nhóm Siemens TIA Openness (1 lần duy nhất)
 Mở PowerShell bằng quyền Administrator và chạy:

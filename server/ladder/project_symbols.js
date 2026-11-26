@@ -65,7 +65,7 @@ function createSymbols() {
         if (i === op.path.length - 1 && !op.idx?.[i] && !op.slice && Object.hasOwn(pins, name)) return { type: pins[name], op };
         return { error: 'Unknown ' + (i ? 'member' : global ? 'global' : 'local') };
       }
-      node = own ? { ...base, ...own } : base;
+      node = base && own ? { ...base, ...own } : own || base;
       inheritedStart = base?.startValue;
       names.push(node.name);
       if (!node.type) return { error: 'Missing member type' };

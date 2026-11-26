@@ -69,6 +69,7 @@ class Simulator {
     this.root = this.createFrame(this.program.blocks[this.entry]);
     this.warnings = new Set(); this.types = opts.types || (() => null);
     this.operands = new Map();
+    this.bindings = new WeakMap();
     this.prev = new Map(); this.timeline = [];
   }
   createFrame(block) {
@@ -86,10 +87,33 @@ class Simulator {
     }
     return op.k === 'local' ? O.local(op.path, resolvedIdx, op.slice) : O.global(op.path, resolvedIdx, op.slice);
   }
-  resolveKey(op, f) {
-    const resolved = this.resolveOperand(op, f);
+  bindOperand(op, resolved) {
     const symbol = resolved.k === 'global' ? this.program.resolveGlobal?.(resolved) : null;
-    return O.text(symbol?.op || resolved);
+    const binding = {
+      key: O.text(symbol?.op || resolved),
+      defaultValue: symbol?.start === undefined ? undefined : startValue({ type: symbol.type, startValue: symbol.start }),
+    };
+    if (op.path?.length >= 2 && !op.idx) {
+      binding.instanceKey = O.text({ k: op.k, path: op.path.slice(0, -1) });
+      binding.field = op.path.at(-1);
+    }
+    return binding;
+  }
+
+  operandBinding(op, frame) {
+    const resolved = this.resolveOperand(op, frame);
+    // An indexed operand can point at another address after every write or scan.
+    if (resolved !== op) return this.bindOperand(op, resolved);
+    let binding = this.bindings.get(op);
+    if (!binding) {
+      binding = this.bindOperand(op, op);
+      this.bindings.set(op, binding);
+    }
+    return binding;
+  }
+
+  resolveKey(op, frame) {
+    return this.operandBinding(op, frame).key;
   }
 
   getAxis(axisName) {
@@ -125,22 +149,22 @@ class Simulator {
         if (s.kind === 'D') return s.index === 0 ? raw : 0;
       }
     }
-    if (op.path && op.path.length >= 2 && (!op.idx || !Object.keys(op.idx).length)) {
-      const base = { k: op.k, path: op.path.slice(0, -1) }, field = op.path[op.path.length - 1];
-      const st = this.storeOf(base, f), bk = O.text(base);
-      const t = st.timers.get(bk);
+    const binding = this.operandBinding(op, f);
+    if (binding.instanceKey !== undefined) {
+      const key = binding.instanceKey;
+      const field = binding.field;
+      const timers = op.k === 'local' ? f.timers : this.gTimers;
+      const t = timers.get(key);
       if (t) return ({ ET: t.et, Q: t.q, PT: t.pt, IN: t.inp })[field];
-      const c = st.counters.get(bk);
+      const counters = op.k === 'local' ? f.counters : this.gCounters;
+      const c = counters.get(key);
       if (c) return ({ CV: c.cv, QU: c.qu, QD: c.qd, PV: c.pv })[field];
-      const mc = this.mcInst.get(bk);
+      const mc = this.mcInst.get(key);
       if (mc && field in mc.pins) return mc.pins[field];
     }
-    const resolved = this.resolveOperand(op, f);
-    const symbol = resolved.k === 'global' ? this.program.resolveGlobal?.(resolved) : null;
     const store = this.mapOf(op, f);
-    const key = O.text(symbol?.op || resolved);
-    if (store.has(key)) return store.get(key);
-    if (symbol?.start !== undefined) return startValue({ type: symbol.type, startValue: symbol.start });
+    if (binding.defaultValue === undefined) return store.get(binding.key);
+    return store.has(binding.key) ? store.get(binding.key) : binding.defaultValue;
   }
   write(op, v, f) {
     if (op.k === 'lit') return;
@@ -169,8 +193,12 @@ class Simulator {
     this.write(op, v, this.root);
   }
   get(key) {
-    if (!this.operands.has(key)) this.operands.set(key, D.parseOperandString(key));
-    return this.read(this.operands.get(key), this.root);
+    let op = this.operands.get(key);
+    if (!op) {
+      op = D.parseOperandString(key);
+      this.operands.set(key, op);
+    }
+    return this.read(op, this.root);
   }
 
   // ---------------------------------------------------------------- conditions
@@ -553,10 +581,11 @@ class Simulator {
   sample() {
     for (const k of (this.watch && this.watch.length ? this.watch : this.watchKeys())) {
       let v; try { v = this.get(k); } catch (e) { continue; }
-      const old = this.prev.get(k);
-      const normV = x => (typeof x === 'boolean' ? (x ? 1 : 0) : x === undefined ? 0 : x);
-      if (!this.prev.has(k) ? normV(v) !== 0 : normV(old) !== normV(v)) this.timeline.push({ t: this.time, key: k, from: normV(old), to: normV(v) });
-      this.prev.set(k, v);
+      const previous = this.prev.get(k);
+      const old = previous === undefined ? 0 : previous;
+      const value = traceValue(v);
+      if (old !== value) this.timeline.push({ t: this.time, key: k, from: old, to: value });
+      this.prev.set(k, value);
     }
   }
 }
@@ -603,11 +632,16 @@ function expectedValue(value) {
   return norm(typeof value === 'string' && /^(?:L?(?:TIME|T)|S5TIME|S5T)#/i.test(value) ? parseTime(value) : value);
 }
 
-function runScenario(program, scenario, types) {
+function runScenario(program, scenario, types, { traceFromInit = false } = {}) {
   const sim = new Simulator(program, { entry: program.entry, scanMs: scenario.scanMs, types });
   sim.watch = (scenario.watch || []).map(k => O.text(D.parseOperandString(k)));
   const results = { expects: [], ok: true, scans: 0 };
   for (const [k, v] of Object.entries(scenario.init || {})) sim.setInput(k, v);
+  if (traceFromInit) {
+    results.scanMs = sim.scanMs;
+    results.initial = Object.fromEntries(sim.watch.map(key => [key, traceValue(sim.get(key))]));
+    sim.prev = new Map(Object.entries(results.initial));
+  }
   const runTime = ms => { const n = ms === 0 ? 0 : Math.max(1, Math.round(ms / sim.scanMs)); for (let i = 0; i < n; i++) sim.scan(); };
   let stepNo = 0;
   for (const st of (scenario.steps || [])) {
@@ -648,9 +682,10 @@ function runScenario(program, scenario, types) {
   results.scans = sim.scans; results.time = sim.time;
   results.timeline = sim.timeline; results.warnings = [...sim.warnings]; results.skipped = Object.values(program.blocks).filter(b => b.skipped.length).map(b => b.name + ': NW' + b.skipped.join(',NW') + ' not Ladder (skipped)');
   results.final = {};
-  for (const k of sim.watchKeys(sim.watch)) { const v = sim.get(k); results.final[k] = typeof v === 'boolean' ? (v ? 1 : 0) : v === undefined ? 0 : v; }
+  for (const k of sim.watchKeys(sim.watch)) { const v = sim.get(k); results.final[k] = traceValue(v); }
   return results;
 }
+const traceValue = value => typeof value === 'boolean' ? Number(value) : value === undefined ? 0 : value;
 const norm = x => (typeof x === 'boolean' ? (x ? 1 : 0) : x === undefined ? 0 : (typeof x === 'string' && !Number.isNaN(Number(x)) ? Number(x) : x));
 
 function formatResults(r) {

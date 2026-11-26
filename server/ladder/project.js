@@ -8,6 +8,7 @@ const D = require('./dsl');
 const S = require('./simulator');
 const X = require('./xml');
 const AST = require('./ast');
+const { compareCase, formatDifference } = require('./project_compare');
 const { createSymbols, membersOf, validateOperand, acceptsValue } = require('./project_symbols');
 
 function* xmlFiles(directory) {
@@ -136,7 +137,48 @@ function runProject(manifestPath, opts = {}) {
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8').replace(/^\uFEFF/, ''));
   if (!manifest || !Array.isArray(manifest.cases) || !manifest.cases.length) throw new Error('Expected non-empty cases in project manifest');
   if (manifest.strictSymbols !== undefined && typeof manifest.strictSymbols !== 'boolean') throw new Error('strictSymbols must be a boolean');
-  const { reads, symbols, sourceFiles } = loadBlocks(path.resolve(path.dirname(manifestPath), manifest.blockDir || 'blocks'));
+  const baseDir = path.dirname(path.resolve(manifestPath));
+  const baselineDir = opts.baselineBlockDir === undefined ? manifest.baselineBlockDir : opts.baselineBlockDir;
+  const tolerance = manifest.compareTolerance ?? 0;
+  if (manifest.compareTolerance !== undefined && (!Number.isFinite(manifest.compareTolerance) || tolerance < 0)) {
+    throw new Error('compareTolerance must be a finite non-negative number');
+  }
+  const compare = baselineDir !== undefined;
+  if (compare) {
+    if (typeof baselineDir !== 'string' || !baselineDir.trim()) throw new Error('baselineBlockDir must be a non-empty path');
+    for (const test of manifest.cases) {
+      if (!Array.isArray(test?.watch) || !test.watch.length) throw new Error('Baseline comparison requires a non-empty watch list in case ' + JSON.stringify(test?.name));
+    }
+  }
+
+  const blockDir = path.resolve(baseDir, manifest.blockDir || 'blocks');
+  const report = runCaseSet(blockDir, manifest, opts, compare);
+  if (compare) {
+    let baseline;
+    try {
+      baseline = runCaseSet(path.resolve(baseDir, baselineDir), manifest, opts, true);
+    } catch (error) {
+      throw new Error('Could not load baseline ' + baselineDir + ': ' + error.message, { cause: error });
+    }
+    const cases = report.cases.map((candidate, i) => {
+      const original = baseline.cases[i];
+      const verdict = compareCase(original, candidate, tolerance);
+      if (original.status === 'failed') verdict.baselineMessage = caseDetails(original);
+      return verdict;
+    });
+    const ok = baseline.ok && cases.every(test => test.status === 'matched');
+    report.comparison = {
+      ok, baselineBlockDir: baselineDir, tolerance,
+      baseline: { ok: baseline.ok, blocks: baseline.blocks, analysis: baseline.analysis },
+      cases,
+    };
+    report.ok = report.ok && ok;
+  }
+  return report;
+}
+
+function runCaseSet(directory, manifest, opts, compare) {
+  const { reads, symbols, sourceFiles } = loadBlocks(directory);
   const blocks = [...reads.values()];
   const resolvers = new Map();
   if (manifest.strictSymbols) {
@@ -168,7 +210,7 @@ function runProject(manifestPath, opts = {}) {
     try {
       if (!reads.has(entry)) throw new Error('Unknown entry block: ' + entry);
       validateScenario(test, reads.get(entry), resolvers.get(entry));
-      const result = S.runScenario({ ...program, entry }, test);
+      const result = S.runScenario({ ...program, entry }, test, undefined, { traceFromInit: compare });
       if (!result.expects.length) throw new Error('Case needs at least one expect or until assertion');
       cases.push({ name: test.name, entry, status: result.ok ? 'passed' : 'failed', result });
     } catch (error) {
@@ -185,11 +227,28 @@ function caseDetails(c) {
   return lines.concat(c.result.warnings).join('\n');
 }
 
+function comparisonDetails(test) {
+  return [
+    test.firstDifference && formatDifference(test.firstDifference),
+    test.baselineMessage && 'Baseline: ' + test.baselineMessage,
+    test.candidateMessage && 'Candidate: ' + test.candidateMessage,
+  ].filter(Boolean).join('\n');
+}
+
 function formatReport(report, format = 'text') {
   if (format === 'json') return JSON.stringify(report, null, 2);
   if (format === 'junit') {
     const tests = [{ name: 'Static analysis', status: report.analysis.summary.error ? 'failed' : 'passed', details: A.formatAnalysis(report.analysis) },
       ...report.cases.map(c => ({ name: c.name, status: c.status, details: caseDetails(c) }))];
+    if (report.comparison) {
+      const baseline = report.comparison.baseline.analysis;
+      tests.push({ name: 'Baseline static analysis', status: baseline.summary.error ? 'failed' : 'passed', details: A.formatAnalysis(baseline) });
+      for (const test of report.comparison.cases) {
+        const status = test.status === 'error' ? 'error' :
+          test.status === 'different' || test.baselineStatus === 'failed' ? 'failed' : 'passed';
+        tests.push({ name: 'Compare: ' + test.name, status, details: comparisonDetails(test) });
+      }
+    }
     const count = status => tests.filter(t => t.status === status).length;
     return '<testsuite name="LAD offline" tests="' + tests.length + '" failures="' + count('failed') + '" errors="' + count('error') + '">\n' +
       tests.map(t => {
@@ -203,6 +262,16 @@ function formatReport(report, format = 'text') {
     lines.push(c.status.toUpperCase() + ' ' + c.name + ' (' + c.entry + ')' + (c.result ? ' - ' + c.result.scans + ' scans, ' + c.result.time + ' ms' : ''));
     const details = caseDetails(c);
     if (details) lines.push(details);
+  }
+  if (report.comparison) {
+    const comparison = report.comparison;
+    lines.push('BASELINE ' + (comparison.ok ? 'PASS' : 'FAIL') + ' | ' + comparison.baselineBlockDir +
+      ' | ' + comparison.cases.filter(c => c.status === 'matched').length + '/' + comparison.cases.length + ' cases matched');
+    if (comparison.baseline.analysis.summary.error) lines.push(A.formatAnalysis(comparison.baseline.analysis));
+    for (const test of comparison.cases) {
+      const details = comparisonDetails(test);
+      if (details) lines.push(test.name + ': ' + details);
+    }
   }
   return lines.join('\n');
 }

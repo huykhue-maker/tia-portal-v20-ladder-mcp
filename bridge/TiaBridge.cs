@@ -6,45 +6,61 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Security;
 using System.Security.Principal;
 using System.Text;
 using System.Web.Script.Serialization;
 using Siemens.Engineering;
 using Siemens.Engineering.Compiler;
+#if !TIA_V16
 using Siemens.Engineering.Connection;
 using Siemens.Engineering.Download;
 using Siemens.Engineering.Download.Configurations;
+using Siemens.Engineering.Online;
+using Siemens.Engineering.SW.TechnologicalObjects;
+#else
+using System.Xml;
+#endif
 using Siemens.Engineering.HW;
 using Siemens.Engineering.HW.Features;
-using Siemens.Engineering.Online;
 using Siemens.Engineering.SW;
 using Siemens.Engineering.SW.Blocks;
 using Siemens.Engineering.SW.Tags;
-using Siemens.Engineering.SW.TechnologicalObjects;
 using Siemens.Engineering.SW.Types;
 
 namespace TiaBridge
 {
     public static class Program
     {
-        private static string PublicApiDir = @"C:\Program Files\Siemens\Automation\Portal V20\PublicAPI\V20";
+#if TIA_V16
+        internal const string PortalVersion = "16";
+#else
+        internal const string PortalVersion = "20";
+#endif
+        private static string PublicApiDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+            @"Siemens\Automation\Portal V" + PortalVersion + @"\PublicAPI\V" + PortalVersion);
+#if !TIA_V16
         private static string PlcsimRuntimeDir = @"C:\Program Files\Siemens\Automation\PLCSIM_V20\resources\bin\wwwroot\assets\lib\runtime";
+
+#endif
 
         [STAThread]
         public static int Main(string[] args)
         {
             string envDir = Environment.GetEnvironmentVariable("TIA_PUBLIC_API_DIR");
-            if (!string.IsNullOrEmpty(envDir) && Directory.Exists(envDir))
+            if (!string.IsNullOrEmpty(envDir))
             {
                 PublicApiDir = envDir;
             }
+#if !TIA_V16
             string envSimDir = Environment.GetEnvironmentVariable("TIA_PLCSIM_RUNTIME_DIR");
             if (!string.IsNullOrEmpty(envSimDir) && Directory.Exists(envSimDir))
             {
                 PlcsimRuntimeDir = envSimDir;
             }
             PrependNativePaths();
+#endif
             AppDomain.CurrentDomain.AssemblyResolve += ResolveOpennessAssembly;
 
             Console.InputEncoding = new UTF8Encoding(false);
@@ -52,8 +68,11 @@ namespace TiaBridge
 
             try
             {
-                BridgeHost host = new BridgeHost();
-                return host.RunLoop();
+                string assemblyPath = Path.Combine(PublicApiDir, "Siemens.Engineering.dll");
+                AssemblyName api = AssemblyName.GetAssemblyName(assemblyPath);
+                if (api.Name != "Siemens.Engineering" || api.Version.Major.ToString(CultureInfo.InvariantCulture) != PortalVersion)
+                    throw new InvalidOperationException("Expected Siemens.Engineering V" + PortalVersion + " at " + assemblyPath + "; found " + api.FullName + ".");
+                return RunHost();
             }
             catch (Exception ex)
             {
@@ -62,6 +81,14 @@ namespace TiaBridge
             }
         }
 
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static int RunHost()
+        {
+            BridgeHost host = new BridgeHost();
+            return host.RunLoop();
+        }
+
+#if !TIA_V16
         private static void PrependNativePaths()
         {
             string[] extraDirs = new string[]
@@ -84,6 +111,8 @@ namespace TiaBridge
             }
         }
 
+#endif
+
         private static Assembly ResolveOpennessAssembly(object sender, ResolveEventArgs args)
         {
             AssemblyName requested = new AssemblyName(args.Name);
@@ -92,11 +121,13 @@ namespace TiaBridge
             {
                 return Assembly.LoadFrom(candidate);
             }
+#if !TIA_V16
             string simCandidate = Path.Combine(PlcsimRuntimeDir, requested.Name + ".dll");
             if (File.Exists(simCandidate))
             {
                 return Assembly.LoadFrom(simCandidate);
             }
+#endif
             return null;
         }
     }
@@ -108,8 +139,7 @@ namespace TiaBridge
         private Project _project;
         private bool _attachedExisting;
         private string _mode = "none";
-        private readonly Dictionary<string, object> _handles = new Dictionary<string, object>();
-        private int _nextHandleId = 1;
+        partial void ClearHandles();
 
         public BridgeHost()
         {
@@ -201,6 +231,7 @@ namespace TiaBridge
                 case "import_type": return CmdImportType(args);
                 case "delete_type": return CmdDeleteType(args);
                 case "compile": return CmdCompile(args);
+#if !TIA_V16
                 case "sim_launch": return CmdSimLaunch(args);
                 case "list_connections": return CmdListConnections(args);
                 case "download": return CmdDownload(args);
@@ -215,7 +246,10 @@ namespace TiaBridge
                 case "plcsim_runtime": return CmdPlcsimRuntime(args);
                 case "sim_codec_self_test": return CmdSimCodecSelfTest();
                 case "escape_hatch": return CmdEscapeHatch(args);
-                default: throw new InvalidOperationException("Unknown bridge command: " + cmd);
+#else
+                case "sim_codec_self_test": return new { skipped = true, reason = "V16 bridge profile" };
+#endif
+                default: throw new NotSupportedException("Bridge command '" + cmd + "' is unavailable in the TIA V" + Program.PortalVersion + " profile.");
             }
         }
 
@@ -273,7 +307,7 @@ namespace TiaBridge
 
         private void EnsureConnected()
         {
-            if (_tia == null) throw new InvalidOperationException("Not connected to TIA Portal V20. Call tia_connect first.");
+            if (_tia == null) throw new InvalidOperationException("Not connected to TIA Portal V" + Program.PortalVersion + ". Call tia_connect first.");
         }
 
         private void EnsureProject()
@@ -363,6 +397,7 @@ namespace TiaBridge
         private object CmdStatus()
         {
             Dictionary<string, object> res = new Dictionary<string, object>();
+            res["portalVersion"] = Program.PortalVersion;
             res["user"] = Environment.UserDomainName + "\\" + Environment.UserName;
             res["inOpennessGroup"] = IsInOpennessGroup();
             res["connected"] = _tia != null;
@@ -412,9 +447,11 @@ namespace TiaBridge
             }
             res["runningTiaProcesses"] = procs;
 
+#if !TIA_V16
             Process[] simProcs = Process.GetProcessesByName("S7PLCSIMV20");
             res["plcsimV20Running"] = simProcs.Length > 0;
             res["plcsimV20Pids"] = simProcs.Select(x => x.Id).ToArray();
+#endif
             return res;
         }
 
@@ -462,7 +499,7 @@ namespace TiaBridge
                 }
                 if (mode == "attach")
                 {
-                    throw new InvalidOperationException("No running TIA Portal V20 instance found to attach. Use mode='ui' or mode='headless' to launch a new instance.");
+                    throw new InvalidOperationException("No running TIA Portal V" + Program.PortalVersion + " instance found to attach. Use mode='ui' or mode='headless' to launch a new instance.");
                 }
                 // auto falls back to UI so user can see TIA Portal
                 mode = "ui";
@@ -506,6 +543,10 @@ namespace TiaBridge
             string path = GetStr(args, "path", "");
             if (string.IsNullOrEmpty(path)) throw new ArgumentException("path is required.");
             FileInfo fi = new FileInfo(path);
+#if TIA_V16
+            if (!string.Equals(fi.Extension, ".ap16", StringComparison.OrdinalIgnoreCase) || GetBool(args, "upgrade", false))
+                throw new ArgumentException("The TIA V16 profile opens native .ap16 projects. Select a matching project and omit upgrade.");
+#endif
             if (!fi.Exists) throw new FileNotFoundException("TIA Portal project file not found: " + fi.FullName);
 
             if (_tia == null)
@@ -671,11 +712,13 @@ namespace TiaBridge
 
             object hwId = ReadOptionalAttribute(item, "HardwareIdentifier");
             List<long> hwIds = new List<long>();
+#if !TIA_V16
             try
             {
                 foreach (HwIdentifier id in item.HwIdentifiers) hwIds.Add(id.Identifier);
             }
             catch (EngineeringException) { }
+#endif
             hwIds = hwIds.Distinct().ToList();
             if (hwId == null && hwIds.Count == 1) hwId = hwIds[0];
             if (isPlc || !string.IsNullOrEmpty(item.TypeIdentifier) || addresses.Count > 0 || hwId != null || hwIds.Count > 0)
@@ -717,7 +760,9 @@ namespace TiaBridge
                 else if (b is FC) kind = "FC";
                 else if (b is GlobalDB) kind = "GlobalDB";
                 else if (b is InstanceDB) kind = "InstanceDB";
+#if !TIA_V16
                 else if (b is ArrayDB) kind = "ArrayDB";
+#endif
 
                 outList.Add(new Dictionary<string, object>
                 {
@@ -947,13 +992,16 @@ namespace TiaBridge
         {
             PlcTarget plc = ResolvePlc(args);
             List<object> tos = new List<object>();
+#if !TIA_V16
             if (plc.Software.TechnologicalObjectGroup != null)
             {
                 WalkTechGroup(plc.Software.TechnologicalObjectGroup, "", tos);
             }
-            return new Dictionary<string, object> { { "plc", plc.CpuItem.Name }, { "technologicalObjects", tos } };
+#endif
+            return new Dictionary<string, object> { { "plc", plc.CpuItem.Name }, { "technologicalObjects", tos }, { "enumerationSupported", Program.PortalVersion == "20" } };
         }
 
+#if !TIA_V16
         private void WalkTechGroup(TechnologicalInstanceDBGroup grp, string path, List<object> outList)
         {
             foreach (TechnologicalInstanceDB to in grp.TechnologicalObjects)
@@ -972,6 +1020,8 @@ namespace TiaBridge
                 WalkTechGroup(sub, subPath, outList);
             }
         }
+
+#endif
 
         // Resolve and use the same live object in this bridge request, including its actual folder.
         private object CmdExistingObject(Dictionary<string, object> args)
@@ -1025,9 +1075,42 @@ namespace TiaBridge
             var expected = GetDict(args, "expectedScope");
             if (scope.Any(kv => !expected.ContainsKey(kv.Key) || !object.Equals(kv.Value, expected[kv.Key])))
                 throw new InvalidOperationException("The project, PLC or object has changed since the snapshot. Import cancelled.");
+            ValidateImportXml(file);
             if (block != null) blockGroup.Blocks.Import(file, ImportOptions.Override);
             else typeGroup.Types.Import(file, ImportOptions.Override);
             return new { imported = true, name = scope["name"] };
+        }
+
+        private static void ValidateImportXml(FileInfo file)
+        {
+#if TIA_V16
+            using (XmlReader reader = XmlReader.Create(file.FullName))
+            {
+                reader.MoveToContent();
+                if (reader.Name != "Document") throw new InvalidOperationException("Expected a SimaticML Document.");
+                bool nativeV16 = false;
+                const string nsRoot = "http://www.siemens.com/automation/Openness/SW/";
+                while (reader.Read())
+                {
+                    if (reader.NodeType != XmlNodeType.Element) continue;
+                    if (reader.Depth == 1 && reader.Name == "Engineering")
+                    {
+                        if (reader.GetAttribute("version") != "V16")
+                            throw new InvalidOperationException("TIA V16 import requires native V16 SimaticML XML. Export the source from TIA V16.");
+                        nativeV16 = true;
+                    }
+                    string ns = reader.NamespaceURI;
+                    foreach (string prefix in new[] { nsRoot + "Interface/v", nsRoot + "NetworkSource/FlgNet/v" })
+                    {
+                        if (!ns.StartsWith(prefix, StringComparison.Ordinal)) continue;
+                        int revision;
+                        if (!int.TryParse(ns.Substring(prefix.Length), out revision) || revision < 1 || revision > 4)
+                            throw new InvalidOperationException("XML namespace is not supported by the V16 profile: " + ns);
+                    }
+                }
+                if (!nativeV16) throw new InvalidOperationException("Missing Engineering version V16 in SimaticML XML.");
+            }
+#endif
         }
 
         private object CmdExportBlock(Dictionary<string, object> args)
@@ -1042,6 +1125,9 @@ namespace TiaBridge
             PlcBlock blk = FindBlock(plc.Software.BlockGroup, blockName, out owner);
             if (blk == null) throw new InvalidOperationException("Block '" + blockName + "' not found in PLC '" + plc.CpuItem.Name + "'.");
 
+#if TIA_V16
+            if (format != "xml") throw new NotSupportedException("TIA V16 exports SimaticML XML only. Use format=xml.");
+#else
             if (format == "s7dcl")
             {
                 DirectoryInfo dir = new DirectoryInfo(outPath);
@@ -1058,6 +1144,7 @@ namespace TiaBridge
                 };
             }
             else
+#endif
             {
                 FileInfo fi = new FileInfo(outPath);
                 if (fi.Directory != null && !fi.Directory.Exists) fi.Directory.Create();
@@ -1081,18 +1168,24 @@ namespace TiaBridge
             string groupPath = GetStr(args, "group", "");
             string format = GetStr(args, "format", "xml").ToLowerInvariant();
 
-            PlcBlockGroup targetGrp = FindOrCreateBlockGroup(plc.Software.BlockGroup, groupPath, true);
+#if TIA_V16
+            if (format != "xml") throw new NotSupportedException("TIA V16 imports SimaticML XML only.");
+#else
             if (format == "s7dcl")
             {
                 string docName = GetStr(args, "docName", "");
                 DirectoryInfo dir = new DirectoryInfo(xmlPath);
-                DocumentImportResultForBlocks res = targetGrp.Blocks.ImportFromDocuments(dir, docName, ImportDocumentOptions.Override);
+                PlcBlockGroup documentGroup = FindOrCreateBlockGroup(plc.Software.BlockGroup, groupPath, true);
+                DocumentImportResultForBlocks res = documentGroup.Blocks.ImportFromDocuments(dir, docName, ImportDocumentOptions.Override);
                 return new Dictionary<string, object> { { "imported", true }, { "state", res.State.ToString() } };
             }
             else
+#endif
             {
                 FileInfo fi = new FileInfo(xmlPath);
                 if (!fi.Exists) throw new FileNotFoundException("Import XML not found: " + fi.FullName);
+                ValidateImportXml(fi);
+                PlcBlockGroup targetGrp = FindOrCreateBlockGroup(plc.Software.BlockGroup, groupPath, true);
                 IList<PlcBlock> imported = targetGrp.Blocks.Import(fi, ImportOptions.Override);
                 return new Dictionary<string, object>
                 {
@@ -1133,6 +1226,7 @@ namespace TiaBridge
             string xmlPath = GetStr(args, "xmlPath", "");
             FileInfo fi = new FileInfo(xmlPath);
             if (!fi.Exists) throw new FileNotFoundException("UDT XML not found: " + fi.FullName);
+            ValidateImportXml(fi);
             PlcTypeGroup target = plc.Software.TypeGroup;
             foreach (string part in GetStr(args, "group", "").Replace('\\', '/').Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries))
                 target = target.Groups.Find(part) ?? target.Groups.Create(part);
@@ -1221,6 +1315,7 @@ namespace TiaBridge
             }
         }
 
+#if !TIA_V16
         private object CmdSimLaunch(Dictionary<string, object> args)
         {
             string exe = GetStr(args, "exePath", @"C:\Program Files\Siemens\Automation\PLCSIM_V20\S7PLCSIMV20.exe");
@@ -1478,5 +1573,6 @@ namespace TiaBridge
                 { "state", op.State.ToString() }
             };
         }
+#endif
     }
 }
